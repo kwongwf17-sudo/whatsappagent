@@ -150,6 +150,20 @@ const outboundQueues = new Map();
 let testCustomerGenerationActive = false;
 let simulatedOutboxBuffer = null;
 let followupRunPromise = null;
+const webhookDiagnostics = {
+  received: 0,
+  invalidSignature: 0,
+  processed: 0,
+  messages: 0,
+  statuses: 0,
+  lastAt: "",
+  lastSignature: "",
+  lastObject: "",
+  lastField: "",
+  lastMessageFrom: "",
+  lastMessageType: "",
+  lastError: "",
+};
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DASHBOARD_DEMO_ORDER_IDS = new Set([
   "ord_1781332861319",
@@ -509,7 +523,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === config.webhookPath) {
       const rawBody = await readBody(req);
+      noteWebhookReceived(req.headers, rawBody);
       if (!isValidSignature(req.headers, rawBody)) {
+        noteWebhookInvalidSignature();
+        await store.appendAuditLog({
+          action: "webhook_invalid_signature",
+          result: "rejected",
+        }).catch(() => {});
         return sendText(res, 403, "Invalid signature");
       }
 
@@ -1068,6 +1088,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         embeddingModel: config.embeddingModel,
         ragProvider: "openai_vector_store",
         ragEnabled: Boolean(config.openaiApiKey && config.vectorStoreId),
+        webhookDiagnostics,
         products: catalog.products.map((product) => ({ id: product.id, name: product.name })),
       });
     }
@@ -1115,39 +1136,78 @@ function handleVerification(url, res) {
   return sendText(res, 403, "Verification failed");
 }
 
-async function handleWebhookPayload(rawBody) {
-  const payload = JSON.parse(rawBody.toString("utf8"));
-  for (const status of extractOutboundStatuses(payload)) {
-    noteOutboundStatus(status);
-  }
-  const messages = extractInboundMessages(payload);
+function noteWebhookReceived(headers, rawBody) {
+  webhookDiagnostics.received += 1;
+  webhookDiagnostics.lastAt = new Date().toISOString();
+  webhookDiagnostics.lastSignature = headers["x-hub-signature-256"] ? "present" : "missing";
+  webhookDiagnostics.lastError = "";
+  console.log(`Webhook POST received (${rawBody.length} bytes, signature ${webhookDiagnostics.lastSignature})`);
+}
 
-  for (const message of messages) {
-    if (alreadyProcessed(message.id)) continue;
-    const text = getMessageText(message);
-    if (!text) {
-      const blocked = await liveAutomationBlock();
-      if (blocked) {
-        await store.appendAuditLog({
-          action: "live_reply_suppressed",
-          customerId: message.from,
-          result: blocked.code,
-        });
-        continue;
-      }
-      await sendOutbound(message.from, [
-        textMessage("Thanks for your message. I can help fastest with text questions, or our team can review this shortly."),
-      ]);
-      continue;
+function noteWebhookInvalidSignature() {
+  webhookDiagnostics.invalidSignature += 1;
+  webhookDiagnostics.lastError = "invalid_signature";
+  console.warn("Webhook POST rejected: invalid signature");
+}
+
+function noteWebhookPayload(payload, { statuses = [], messages = [] } = {}) {
+  webhookDiagnostics.processed += 1;
+  webhookDiagnostics.statuses += statuses.length;
+  webhookDiagnostics.messages += messages.length;
+  webhookDiagnostics.lastObject = String(payload?.object || "");
+  const firstChange = payload?.entry?.[0]?.changes?.[0];
+  webhookDiagnostics.lastField = String(firstChange?.field || "");
+  const firstMessage = messages[0];
+  webhookDiagnostics.lastMessageFrom = String(firstMessage?.from || "");
+  webhookDiagnostics.lastMessageType = String(firstMessage?.type || "");
+  console.log(`Webhook payload processed: ${messages.length} message(s), ${statuses.length} status update(s)`);
+}
+
+function noteWebhookError(error) {
+  webhookDiagnostics.lastError = error?.message || String(error);
+  console.error("Webhook payload processing failed:", webhookDiagnostics.lastError);
+}
+
+async function handleWebhookPayload(rawBody) {
+  try {
+    const payload = JSON.parse(rawBody.toString("utf8"));
+    const statuses = extractOutboundStatuses(payload);
+    const messages = extractInboundMessages(payload);
+    noteWebhookPayload(payload, { statuses, messages });
+    for (const status of statuses) {
+      noteOutboundStatus(status);
     }
 
-    await processInboundMessage({
-      id: message.id,
-      from: message.from,
-      text,
-      source: extractMessageSource(message),
-      live: true,
-    });
+    for (const message of messages) {
+      if (alreadyProcessed(message.id)) continue;
+      const text = getMessageText(message);
+      if (!text) {
+        const blocked = await liveAutomationBlock();
+        if (blocked) {
+          await store.appendAuditLog({
+            action: "live_reply_suppressed",
+            customerId: message.from,
+            result: blocked.code,
+          });
+          continue;
+        }
+        await sendOutbound(message.from, [
+          textMessage("Thanks for your message. I can help fastest with text questions, or our team can review this shortly."),
+        ]);
+        continue;
+      }
+
+      await processInboundMessage({
+        id: message.id,
+        from: message.from,
+        text,
+        source: extractMessageSource(message),
+        live: true,
+      });
+    }
+  } catch (error) {
+    noteWebhookError(error);
+    throw error;
   }
 }
 
