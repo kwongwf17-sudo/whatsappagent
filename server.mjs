@@ -1072,6 +1072,14 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/privacy") {
+      return sendHtml(res, 200, publicPrivacyHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/data-deletion") {
+      return sendHtml(res, 200, publicDataDeletionHtml());
+    }
+
     if (req.method === "GET" && url.pathname === "/demo/chat") {
       return sendHtml(res, 200, demoChatHtml());
     }
@@ -3426,6 +3434,93 @@ function sendJsonDownload(res, filename, body) {
 function sendHtml(res, statusCode, body) {
   res.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8" });
   res.end(body);
+}
+
+function publicPrivacyHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy | ${escapeHtml(config.businessName)}</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; color: #1f2328; line-height: 1.55; }
+    h1 { font-size: 32px; margin-bottom: 8px; }
+    h2 { margin-top: 28px; font-size: 22px; }
+    p, li { font-size: 16px; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <h1>Privacy Policy</h1>
+  <p class="muted">Last updated: ${escapeHtml(new Date().toISOString().slice(0, 10))}</p>
+  <p>${escapeHtml(config.businessName)} uses WhatsApp to answer customer enquiries, provide product support, process orders, arrange delivery, and send approved follow-up messages.</p>
+
+  <h2>Information We Collect</h2>
+  <ul>
+    <li>WhatsApp phone number and profile name.</li>
+    <li>Messages you send to us, including enquiries, order details, delivery address, and support requests.</li>
+    <li>Product, package, order status, and conversation history needed to serve you.</li>
+  </ul>
+
+  <h2>How We Use Information</h2>
+  <ul>
+    <li>To reply to your WhatsApp messages.</li>
+    <li>To process and update customer orders.</li>
+    <li>To arrange delivery and customer support.</li>
+    <li>To improve our product replies and service quality.</li>
+  </ul>
+
+  <h2>Sharing</h2>
+  <p>We do not sell customer personal data. We may share necessary order and delivery details with staff, delivery partners, or service providers only when needed to complete your request.</p>
+
+  <h2>Retention</h2>
+  <p>We keep customer conversation and order records only as long as needed for business, support, dispute handling, legal, or accounting purposes.</p>
+
+  <h2>Your Choices</h2>
+  <p>You may reply <strong>stop</strong> on WhatsApp to opt out of follow-up messages. You may also request deletion of your data using the data deletion page.</p>
+
+  <h2>Contact</h2>
+  <p>For privacy questions, contact us through our official WhatsApp business number.</p>
+</body>
+</html>`;
+}
+
+function publicDataDeletionHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Deletion | ${escapeHtml(config.businessName)}</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; color: #1f2328; line-height: 1.55; }
+    h1 { font-size: 32px; margin-bottom: 8px; }
+    h2 { margin-top: 28px; font-size: 22px; }
+    p, li { font-size: 16px; }
+    .card { border: 1px solid #d8dee4; border-radius: 12px; padding: 18px; background: #f6f8fa; }
+  </style>
+</head>
+<body>
+  <h1>Data Deletion Instructions</h1>
+  <p>If you want ${escapeHtml(config.businessName)} to delete your WhatsApp customer data, please contact us through our official WhatsApp business number.</p>
+
+  <div class="card">
+    <h2>How To Request Deletion</h2>
+    <ol>
+      <li>Send a WhatsApp message to our business number.</li>
+      <li>Write: <strong>Delete my data</strong>.</li>
+      <li>Include the WhatsApp number you used to contact us.</li>
+    </ol>
+  </div>
+
+  <h2>What We Delete</h2>
+  <p>We will delete or anonymise customer conversation records, support notes, and order enquiry records linked to your WhatsApp number, unless we are required to keep certain records for legal, accounting, dispute, fraud prevention, or compliance reasons.</p>
+
+  <h2>Processing Time</h2>
+  <p>We aim to process deletion requests within a reasonable time after verifying the request.</p>
+</body>
+</html>`;
 }
 
 function redirectToLogin(res, next) {
