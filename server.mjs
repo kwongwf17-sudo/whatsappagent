@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
@@ -56,6 +57,21 @@ await loadEnvFile(path.join(__dirname, ".env"));
 await loadEnvFile();
 
 const demoMode = parseBool(getEnv("DEMO_MODE", "true"));
+function resolveSeedPath(envName, fileName) {
+  const bundledPath = path.join(__dirname, "data", fileName);
+  const configuredPath = path.resolve(getEnv(envName, bundledPath));
+  if (existsSync(configuredPath)) {
+    return configuredPath;
+  }
+  if (existsSync(bundledPath)) {
+    if (configuredPath !== path.resolve(bundledPath)) {
+      console.warn(`${envName} points to missing file ${configuredPath}; using ${bundledPath}`);
+    }
+    return bundledPath;
+  }
+  return configuredPath;
+}
+
 const config = {
   demoMode,
   port: Number(getEnv("PORT", "3000")),
@@ -79,9 +95,9 @@ const config = {
   storeBackend: getEnv("WHATSAPP_STORE", "json").toLowerCase(),
   sqlitePath: getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"),
   assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
-  catalogPath: path.resolve(getEnv("PRODUCT_CATALOG_PATH", path.join(__dirname, "data", "product_catalog.json"))),
-  generalFaqsPath: path.resolve(getEnv("GENERAL_FAQS_PATH", path.join(__dirname, "data", "general_faqs.json"))),
-  salesRepliesPath: path.resolve(getEnv("SALES_REPLIES_PATH", path.join(__dirname, "data", "sales_replies.json"))),
+  catalogPath: resolveSeedPath("PRODUCT_CATALOG_PATH", "product_catalog.json"),
+  generalFaqsPath: resolveSeedPath("GENERAL_FAQS_PATH", "general_faqs.json"),
+  salesRepliesPath: resolveSeedPath("SALES_REPLIES_PATH", "sales_replies.json"),
   publicBaseUrl: getEnv("PUBLIC_BASE_URL", ""),
   followupAutorun: parseBool(getEnv("FOLLOWUP_AUTORUN", "false")),
   followupIntervalMinutes: Number(getEnv("FOLLOWUP_INTERVAL_MINUTES", "15")),
@@ -110,7 +126,7 @@ const FOLLOWUP_TEMPLATE_BY_KEY = {
   day_10_followup: "dayten_followup",
 };
 
-const catalog = JSON.parse(await readFile(config.catalogPath, "utf8"));
+const catalog = JSON.parse(await readSeedFile(config.catalogPath, "product_catalog.json"));
 const faqLibrary = await loadFaqLibrary();
 const salesReplyLibrary = await loadSalesReplyLibrary();
 const sqliteAdapter = config.storeBackend === "sqlite"
@@ -139,12 +155,30 @@ const DASHBOARD_DEMO_ORDER_IDS = new Set([
   "ord_1781332861319",
   "ord_1781332388644",
 ]);
+
+async function readSeedFile(configuredPath, fileName) {
+  try {
+    return await readFile(configuredPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+
+    const bundledPath = path.join(__dirname, "data", fileName);
+    if (path.resolve(configuredPath) === path.resolve(bundledPath)) {
+      throw error;
+    }
+
+    console.warn(`Seed file not found at ${configuredPath}; falling back to ${bundledPath}`);
+    return readFile(bundledPath, "utf8");
+  }
+}
 const OPT_OUT_PATTERN =
   /\b(stop|unsubscribe|remove|jangan message|jangan msg|jgn message|jgn msg|nda minat|ndak minat|tidak minat|tak minat|no longer interested|do not message|dont message)\b/i;
 
 async function loadFaqLibrary() {
   try {
-    const parsed = JSON.parse(await readFile(config.generalFaqsPath, "utf8"));
+    const parsed = JSON.parse(await readSeedFile(config.generalFaqsPath, "general_faqs.json"));
     return {
       approved_faqs: Array.isArray(parsed.approved_faqs) ? parsed.approved_faqs : [],
     };
@@ -172,7 +206,7 @@ async function persistFaqLibrary() {
 
 async function loadSalesReplyLibrary() {
   try {
-    const parsed = JSON.parse(await readFile(config.salesRepliesPath, "utf8"));
+    const parsed = JSON.parse(await readSeedFile(config.salesRepliesPath, "sales_replies.json"));
     return {
       sales_replies: Array.isArray(parsed.sales_replies) ? parsed.sales_replies : [],
     };
