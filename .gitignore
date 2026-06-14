@@ -1,0 +1,31 @@
+.env
+.env.*
+!.env.example
+
+# Runtime logs and process files
+*.log
+*.pid
+*.jobid
+server.jobid
+
+# Local databases and SQLite runtime files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Customer/runtime data. Keep only deploy seed/config libraries.
+data/*
+!data/product_catalog.json
+!data/general_faqs.json
+!data/sales_replies.json
+!data/order_parser_regression_cases.json
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+.railway/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

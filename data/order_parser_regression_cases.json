@@ -1,0 +1,26 @@
+{
+  "orders": [
+    {
+      "id": "regression_labelled_package_a",
+      "customerId": "regression_customer_a",
+      "productId": "blackhead-remover",
+      "packageId": "A",
+      "quantity": 2,
+      "name": "wong",
+      "phone": "016",
+      "address": "jb",
+      "rawMessage": "Can you help me fill up this details for hold promo? \n\nFull name : wong\nFull address : jb\nPhone number :016\n\nOrder Package :A"
+    },
+    {
+      "id": "regression_labelled_package_b",
+      "customerId": "regression_customer_b",
+      "productId": "blackhead-remover",
+      "packageId": "B",
+      "quantity": 4,
+      "name": "Nur Aisyah",
+      "phone": "6738123456",
+      "address": "No. 18, Kg Kiulap, Bandar Seri Begawan",
+      "rawMessage": "Full name: Nur Aisyah\nFull address: No. 18, Kg Kiulap, Bandar Seri Begawan\nPhone number: 6738123456\nOrder Package: Package B"
+    }
+  ]
+}

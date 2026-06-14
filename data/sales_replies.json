@@ -1,0 +1,30 @@
+{
+    "sales_replies":  [
+                          {
+                              "id":  "sales_fear-concern",
+                              "objection_type":  "fear_concern",
+                              "intent":  "Customers feel unsure",
+                              "example_messages":  [
+                                                       "Produk ni effective?"
+                                                   ],
+                              "approved_reply":  "Effective ya. Bnyk customers bagi good feedback.",
+                              "followup_prompt":  "",
+                              "active":  true,
+                              "scope":  "business",
+                              "productId":  ""
+                          },
+                          {
+                              "id":  "blackhead_remover_sales_tanya_dulu",
+                              "objection_type":  "Tanya dulu",
+                              "intent":  "Customer gives this sales response or hesitation: Tanya dulu",
+                              "example_messages":  [
+                                                       "Tanya dulu"
+                                                   ],
+                              "approved_reply":  "Buleh tau apa yg kita fikir? Ada rasa nak tunggu payday?",
+                              "followup_prompt":  "",
+                              "active":  true,
+                              "scope":  "business",
+                              "productId":  ""
+                          }
+                      ]
+}

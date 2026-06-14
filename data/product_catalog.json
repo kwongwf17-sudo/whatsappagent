@@ -1,0 +1,1076 @@
+{
+  "default_product_id": "blackhead-remover",
+  "approved_faqs": [],
+  "standard_replies": [
+    {
+      "type": "faq",
+      "customer_messages": [
+        "Business location kat mana?"
+      ],
+      "reply": "Warehouse at bandar. Tapi skrg buleh proceed delivery dgn MP service saja"
+    },
+    {
+      "type": "faq",
+      "customer_messages": [
+        "Delivery ada caj?",
+        "Delivery ada caj tak?",
+        "Ada delivery caj tak?",
+        "Ada caj delivery?",
+        "Delivery free ke?"
+      ],
+      "reply": "nda ya"
+    },
+    {
+      "type": "faq",
+      "customer_messages": [
+        "Ada delivery?"
+      ],
+      "reply": "ada"
+    },
+    {
+      "type": "faq",
+      "customer_messages": [
+        "Buleh bayar hujung bulan?"
+      ],
+      "reply": "Buleh"
+    },
+    {
+      "type": "faq",
+      "customer_messages": [
+        "Berapa hari barang baru sampai?"
+      ],
+      "reply": "15-18 days."
+    },
+    {
+      "type": "faq",
+      "customer_messages": [
+        "nanti if barang sampai kita deliver or pickup sendiri?"
+      ],
+      "reply": "Kami akan deliver ya."
+    }
+  ],
+  "products": [
+    {
+      "id": "blackhead-remover",
+      "name": "Blackhead Remover",
+      "aliases": [
+        "blackhead remover",
+        "blackhead",
+        "pembersih blackhead",
+        "komedo",
+        "sedut pori",
+        "cleaner pores"
+      ],
+      "price": "Package A B$39, Package B B$70, Package C B$105",
+      "stock_status": "preorder",
+      "ad_keywords": [
+        "facebook ad",
+        "blackhead remover",
+        "pembersih blackhead",
+        "komedo",
+        "hidung bersih"
+      ],
+      "packages": [
+        {
+          "id": "A",
+          "name": "Package A",
+          "price": "B$39",
+          "paid_units": 1,
+          "free_units": 1,
+          "total_units": 2,
+          "savings": "B$117"
+        },
+        {
+          "id": "B",
+          "name": "Package B",
+          "price": "B$70",
+          "paid_units": 2,
+          "free_units": 2,
+          "total_units": 4,
+          "savings": "B$273",
+          "recommended": true
+        },
+        {
+          "id": "C",
+          "name": "Package C",
+          "price": "B$105",
+          "paid_units": 3,
+          "free_units": 3,
+          "total_units": 6,
+          "savings": "B$351"
+        }
+      ],
+      "order_options": [
+        {
+          "id": "package-a",
+          "name": "Package A",
+          "price": "B$39",
+          "quantity": 2,
+          "aliases": [
+            "package a",
+            "pakej a",
+            "pkg a"
+          ],
+          "requires_add_on": false,
+          "add_ons": []
+        },
+        {
+          "id": "package-b",
+          "name": "Package B",
+          "price": "B$70",
+          "quantity": 4,
+          "aliases": [
+            "package b",
+            "pakej b",
+            "pkg b"
+          ],
+          "requires_add_on": false,
+          "add_ons": []
+        },
+        {
+          "id": "package-c",
+          "name": "Package C",
+          "price": "B$105",
+          "quantity": 6,
+          "aliases": [
+            "package c",
+            "pakej c",
+            "pkg c"
+          ],
+          "requires_add_on": false,
+          "add_ons": []
+        }
+      ],
+      "images": [
+        {
+          "url": "/assets/blackhead-remover/product-1.png",
+          "caption": "Product info photo 1"
+        },
+        {
+          "url": "/assets/blackhead-remover/product-2.png",
+          "caption": "Product info photo 2"
+        },
+        {
+          "url": "/assets/blackhead-remover/product-3.png",
+          "caption": "Product info photo 3"
+        },
+        {
+          "url": "/assets/blackhead-remover/testimonial-1.png",
+          "caption": "Testimonial photo 1"
+        },
+        {
+          "url": "/assets/blackhead-remover/testimonial-2.png",
+          "caption": "Testimonial photo 2"
+        },
+        {
+          "url": "/assets/blackhead-remover/testimonial-3.png",
+          "caption": "Testimonial photo 3"
+        },
+        {
+          "url": "/assets/blackhead-remover/testimonial-4.png",
+          "caption": "Testimonial photo 4"
+        },
+        {
+          "url": "/assets/blackhead-remover/price.jpeg",
+          "caption": "Price photo"
+        },
+        {
+          "url": "/assets/blackhead-remover/sales.png",
+          "caption": "Optional sales photo"
+        }
+      ],
+      "opening_flow": [
+        {
+          "type": "text",
+          "body": "Assalamualaikum kita nama saya Fadilah, skrg saya share info utk Blackhead remover🥰"
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/product-1.png",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/product-2.png",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/product-3.png",
+          "caption": ""
+        },
+        {
+          "type": "text",
+          "body": "✨ Blackhead Remover ✨\nPembersih blackhead mudah alih untuk hidung lebih bersih bila-bila masa, di mana sahaja ✨\n\nTekan sekali terus sedut – cepat, mudah & senang guna!\n\nTak perlu picit kuat. Tak perlu pergi salon. Bersihkan pori sendiri di rumah dalam beberapa minit!\n\n✅ 60KPA Strong Suction\nSedutan kuat bantu tarik keluar blackhead, minyak & kotoran pori\n\n✅ 3 Suction Heads\nPilih kepala ikut kawasan muka – hidung, dagu, pipi & T-zone\n\n✅ 3 Suction Modes\nNormal, Intermediate & Strong – boleh pilih ikut kesesuaian kulit\n\n✅ USB-C Rechargeable\nSenang cas, mudah bawa dan sesuai untuk penggunaan harian\n\n✅ Easy Home Care\nJaga pori sendiri di rumah, lebih jimat masa & kos salon"
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/testimonial-1.png",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/testimonial-2.png",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/testimonial-3.png",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/testimonial-4.png",
+          "caption": ""
+        },
+        {
+          "type": "text",
+          "body": "Dgn sini adalah customer Ujian peribadi + feedback selepas menggunakan Blackhead remover"
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/price.jpeg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/blackhead-remover/sales.png",
+          "caption": ""
+        },
+        {
+          "type": "text",
+          "body": "HARGA ASAL Blackhead remover ⚡️B̶N̶D̶̶78\n\n🔥PACKAGE A\n💎1 UNIT = B$39 + FREE 1 UNIT LAGI JADI TOTAL = 2 UNIT\n( JIMAT $117）\n\n🔥PACKAGE B\n💎2 UNIT = B$70+ FREE 2 UNIT LAGI JADI TOTAL = 4 UNIT\n( JIMAT $273)\n\n🔥PACKAGE C\n💎3 UNIT = B$105+ FREE 3 UNIT LAGI JADI TOTAL = 6 UNIT\n( JIMAT $351)\n\n🔥 7HARI ROSAK— 100% FULLY REFUND 🔥\n\nCOD TO ALL 🇧🇳BRUNEI !!!"
+        },
+        {
+          "type": "text",
+          "body": "Ada kita rasa minat nak ambil Package B = 2 FREE 2？🥰"
+        }
+      ],
+      "approved_faqs": [
+        {
+          "id": "blackhead_usage",
+          "topic": "How to use the Blackhead Remover safely",
+          "example_questions": [
+            "Macam mana guna Blackhead Remover?",
+            "Cara pakai blackhead remover macam mana?",
+            "How to use this blackhead remover?"
+          ],
+          "approved_reply": "Tekan sekali untuk hidupkan, pilih suction mode ikut kesesuaian kulit, kemudian gerakkan perlahan di kawasan hidung, dagu, pipi atau T-zone. Jangan tahan terlalu lama di satu tempat.",
+          "active": true
+        },
+        {
+          "id": "blackhead_package_price",
+          "topic": "Available packages, package prices and number of units",
+          "example_questions": [
+            "Apa package yang ada?",
+            "Package A berapa?",
+            "Package B dapat berapa unit?",
+            "Harga package macam mana?"
+          ],
+          "approved_reply": "Package A: B$39 dapat 2 unit. Package B: B$70 dapat 4 unit. Package C: B$105 dapat 6 unit. Package B paling kami recommend sebab 2 unit + free 2 unit.",
+          "active": true
+        },
+        {
+          "id": "blackhead_refund",
+          "topic": "Refund coverage for damaged Blackhead Remover",
+          "example_questions": [
+            "Ada refund?",
+            "Kalau rosak ada refund?",
+            "Warranty atau refund ada?"
+          ],
+          "approved_reply": "Ada, 7 hari rosak boleh 100% full refund.",
+          "active": true
+        },
+        {
+          "id": "blackhead_cod",
+          "topic": "Cash on delivery availability for Blackhead Remover in Brunei",
+          "example_questions": [
+            "Boleh COD?",
+            "Blackhead remover dapat COD kah?",
+            "Boleh bayar masa barang sampai?"
+          ],
+          "approved_reply": "Boleh, COD to all Brunei.",
+          "active": true
+        },
+        {
+          "id": "blackhead_skin_type",
+          "topic": "Suitable skin type and suction modes for Blackhead Remover",
+          "example_questions": [
+            "Sesuai untuk kulit apa?",
+            "Kulit sensitive boleh guna kah?",
+            "Ada mode untuk sensitive skin?"
+          ],
+          "approved_reply": "Ada 3 suction modes: Normal, Intermediate dan Strong. Pilih ikut kesesuaian kulit. Untuk kulit sensitif, mula dari Normal dulu.",
+          "active": true
+        }
+      ],
+      "faqs": [
+        {
+          "question": "Macam mana guna Blackhead Remover?",
+          "answer": "Tekan sekali untuk hidupkan, pilih suction mode ikut kesesuaian kulit, kemudian gerakkan perlahan di kawasan hidung, dagu, pipi atau T-zone. Jangan tahan terlalu lama di satu tempat."
+        },
+        {
+          "question": "Apa package yang ada?",
+          "answer": "Package A: B$39 dapat 2 unit. Package B: B$70 dapat 4 unit. Package C: B$105 dapat 6 unit. Package B paling kami recommend sebab 2 unit + free 2 unit."
+        },
+        {
+          "question": "Ada refund?",
+          "answer": "Ada, 7 hari rosak boleh 100% full refund."
+        },
+        {
+          "question": "Boleh COD?",
+          "answer": "Boleh, COD to all Brunei."
+        },
+        {
+          "question": "Sesuai untuk kulit apa?",
+          "answer": "Ada 3 suction modes: Normal, Intermediate dan Strong. Pilih ikut kesesuaian kulit. Untuk kulit sensitif, mula dari Normal dulu."
+        }
+      ],
+      "standard_replies": [],
+      "followups": {
+        "first_day_followup": {
+          "send_hour": 20,
+          "first_chat_cutoff_hour": 19,
+          "day_offset": 0,
+          "message": "Salam😊,Kita masih minat harga promo ni kh? Klu minat, sy bulih terus bantu lock skrg sblm promo ani habis\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_1_followup": {
+          "send_hour": 20,
+          "day_offset": 1,
+          "message": "Hi Dear, slot tinggal sikit sja.\nKlu ready, sy bulih terus bantu lock promo ya.\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_3_followup": {
+          "send_hour": 20,
+          "day_offset": 3,
+          "message": "Ramai dh beli, sy tau u masih pikir.Kalau tdk bagus, biar Allah hukum sy.🤲🏽\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_4_followup": {
+          "send_hour": 20,
+          "day_offset": 4,
+          "message": "Sy baru check, promo ani tinggal sikit sja.\nMau sy bantu simpan satu utk kita?\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_5_followup": {
+          "send_hour": 20,
+          "day_offset": 5,
+          "message": "Bh~ just nak remind sja 🥰\nPromo ani masih jalan, tp tinggal sikit stock.\nKita masih minat kh？Klu minat, sy bulih terus bantu lock skrg🙈\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_6_followup": {
+          "send_hour": 20,
+          "day_offset": 6,
+          "message": "Hi dear 💕\nRamai dh lock promo ani pasal harga jauh murah dari normal price.\nKlu kita pikir mau ambil, better grab skrg bh sblm naik harga 😅\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_7_followup": {
+          "send_hour": 20,
+          "day_offset": 7,
+          "message": "Kita masih pikir kh? 😘\nSy takut nnti bila stock baru masuk, promo dh habis 😭\nKlu kita mau, sy bulih bantu lock harga promo ani dlu bh~\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_8_followup": {
+          "send_hour": 20,
+          "day_offset": 8,
+          "message": "Ramai org dh feedback pasal produk ani,sbb resultnya memang bagus banar 😍\nSy pun dh bantu ramai customer di area kita dptkan produk ani~\nMun kita reply, sy bulih terus bantu proses order kita 😇\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_9_followup": {
+          "send_hour": 20,
+          "day_offset": 9,
+          "message": "Saya bagi tau kita ya 🥺\nSlot promo tinggal 2 sja sekarang.\nKlu kita ready, terus bgi saya maklumat sja utk bulih lock harga sblm promo habis 🙏🏻\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_10_followup": {
+          "send_hour": 20,
+          "day_offset": 10,
+          "message": "Last call 🥲 Promo tamat malam ani.\nKlu kita ready, terus bgi maklumat  skrg~\nKlu belum nda apa 😊\nBila kita dh bersedia nnti, saya tetap di sini bantu sis ❤️\n\nReply stop if you do not want to receive message from this business again."
+        }
+      },
+      "shopping_link": "https://my.shp.ee/8X9Xk7Xd",
+      "openingFlowEnabled": true,
+      "sales_replies": [],
+      "sales_photo_url": "/assets/blackhead-remover/sales.png",
+      "extracted_knowledge": {
+        "pending": [],
+        "approved": [],
+        "lastExtraction": {
+          "status": "completed",
+          "imageChunksAdded": 0,
+          "factsFound": 0,
+          "factsAdded": 0,
+          "imagesProcessed": 5,
+          "imagesCompleted": 4,
+          "imagesFailed": 1,
+          "at": "2026-06-13T06:35:31.054Z",
+          "batch": true,
+          "results": [
+            {
+              "slot": "infoPhoto1",
+              "url": "/assets/blackhead-remover/product-1.png",
+              "status": "completed",
+              "imageChunkAdded": false,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-13T06:35:15.925Z",
+              "sourceSlot": "infoPhoto1",
+              "sourceImageUrl": "/assets/blackhead-remover/product-1.png",
+              "sourceFilename": "product-1.png"
+            },
+            {
+              "slot": "infoPhoto2",
+              "url": "/assets/blackhead-remover/product-2.png",
+              "status": "completed",
+              "imageChunkAdded": false,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-13T06:35:21.779Z",
+              "sourceSlot": "infoPhoto2",
+              "sourceImageUrl": "/assets/blackhead-remover/product-2.png",
+              "sourceFilename": "product-2.png"
+            },
+            {
+              "slot": "infoPhoto3",
+              "url": "/assets/blackhead-remover/product-3.png",
+              "status": "completed",
+              "imageChunkAdded": false,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-13T06:35:27.137Z",
+              "sourceSlot": "infoPhoto3",
+              "sourceImageUrl": "/assets/blackhead-remover/product-3.png",
+              "sourceFilename": "product-3.png"
+            },
+            {
+              "slot": "pricePhoto",
+              "url": "/assets/blackhead-remover/price.jpeg",
+              "status": "completed",
+              "imageChunkAdded": false,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-13T06:35:31.053Z",
+              "sourceSlot": "pricePhoto",
+              "sourceImageUrl": "/assets/blackhead-remover/price.jpeg",
+              "sourceFilename": "price.jpeg"
+            },
+            {
+              "slot": "salesPhoto",
+              "url": "/assets/blackhead-remover/sales.png",
+              "status": "failed",
+              "reason": "ENOENT: no such file or directory, open 'C:\\Users\\User\\Documents\\New project\\whatsapp_agent\\assets\\blackhead-remover\\sales.png'"
+            }
+          ]
+        },
+        "pendingImages": [],
+        "approvedImages": [
+          {
+            "id": "image_1781188476808",
+            "kind": "image_chunk",
+            "category": "benefit_claim",
+            "title": "Before and after blackhead remover results",
+            "summary": "Promotional before-and-after image showing a nose comparison. The visible text says 'See The Difference' and 'Cleaner pores. Smoother look.' The before side lists stubborn blackheads, oily T-zone, clogged pores, and rough texture. The after side lists cleaner pores, less oil shine, smoother look, and fresh skin. A blackhead remover device is shown at the bottom right.",
+            "extracted_text": "See The Difference\nCleaner pores. Smoother look.\nBefore\nAfter\nStubborn Blackheads\nOily T-Zone\nClogged Pores\nRough Texture\nCleaner Pores\nLess Oil Shine\nSmoother Look\nFresh Skin",
+            "embedding_text": "Blackhead Remover product info photo 1 before after benefit_claim see the difference cleaner pores smoother look before after stubborn blackheads oily t-zone clogged pores rough texture cleaner pores less oil shine smoother look fresh skin nose comparison device shown",
+            "customer_safe": true,
+            "approval_note": "Visible in image",
+            "question_examples": [
+              "what does the image show?",
+              "what benefits are written?",
+              "what are the before and after labels?"
+            ],
+            "sourceSlot": "infoPhoto1",
+            "sourceLabel": "Product info photo 1",
+            "sourceImageUrl": "/assets/blackhead-remover/product-1.png",
+            "sourceFilename": "product-1.png",
+            "extractedAt": "2026-06-11T14:34:36.807Z",
+            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Info gambar ada menunjukkan harga atau promo produk.",
+            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Blackhead remover ani untuk apa?",
+              "Macam mana alat ani bantu blackhead?",
+              "Berapa harga?",
+              "Ada promo kah?",
+              "Combo berapa?",
+              "Ada add-on apa?"
+            ],
+            "approvedAt": "2026-06-13T06:35:46.049Z"
+          },
+          {
+            "id": "image_1781188484199",
+            "kind": "image_chunk",
+            "category": "feature",
+            "title": "4 Key Functions blackhead remover product info",
+            "summary": "Product info image showing a blackhead remover with 4 key functions: blackhead removal, deep pore clean, targeted suction, and oil build-up care. The image also shows 60KPA strong suction, USB rechargeable, 3 suction probe heads, and safe for all skin types. It illustrates use on cheeks, nose, forehead, and chin.",
+            "extracted_text": "4 Key Functions. Cleaner pores. Smoother skin. More confidence. 01 Blackhead Removal – Lifts trapped impurities. 02 Deep Pore Clean – Clears clogged pores. 03 Targeted Suction – Fits every area. Cheeks, Nose, Forehead, Chin. 04 Oil Build-Up Care – Reduces excess oil. 60KPA Strong Suction. USB Rechargeable. 3 Suction Probe Heads. Safe for All Skin Types.",
+            "embedding_text": "Blackhead Remover product info photo 2 product-2.png feature 4 Key Functions cleaner pores smoother skin more confidence blackhead removal deep pore clean targeted suction oil build-up care 60KPA strong suction USB rechargeable 3 suction probe heads safe for all skin types cheeks nose forehead chin",
+            "customer_safe": true,
+            "approval_note": "Visible text and product illustrations in image",
+            "question_examples": [
+              "what are the main functions?",
+              "does it have rechargeable USB?",
+              "how many probe heads are included?"
+            ],
+            "sourceSlot": "infoPhoto2",
+            "sourceLabel": "Product info photo 2",
+            "sourceImageUrl": "/assets/blackhead-remover/product-2.png",
+            "sourceFilename": "product-2.png",
+            "extractedAt": "2026-06-11T14:34:44.199Z",
+            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Dalam info gambar ada disebut gentle formula atau sesuai untuk kulit sensitif. Info gambar menunjukkan fungsi device seperti suction head/mode, cas USB dan butang kawalan jika berkaitan.",
+            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | kulit sensitif kah sensitive skin gentle formula sesuai kulit sensitive | macam mana cara guna cara pakai mode kepala alat suction cas usb rechargeable button",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Blackhead remover ani untuk apa?",
+              "Macam mana alat ani bantu blackhead?",
+              "Sesuai untuk kulit sensitif kah?",
+              "Kulit sensitive boleh pakai kah?",
+              "Macam mana cara guna?",
+              "Cara pakai macam mana?",
+              "Ada berapa mode?"
+            ],
+            "approvedAt": "2026-06-13T06:35:46.669Z"
+          },
+          {
+            "id": "image_1781188492603",
+            "kind": "image_chunk",
+            "category": "feature",
+            "title": "Built With Smart Features",
+            "summary": "Product info image for a blackhead remover showing 5 visible feature sections: Microcrystal Extractor with deep pore suction, 3 suction heads for different areas, 3 suction modes (Normal, Intermediate, Strong), USB-C rechargeable, and a physical button to adjust suction intensity. Bottom icons show Power On/Off (long press), Mode Select (short press), and Suction Intensity levels.",
+            "extracted_text": "Built With Smart Features; ADVANCED TECHNOLOGY FOR CLEARER, SMOOTHER SKIN; 1 Microcrystal Extractor; Deep pore suction; 2 3 Suction Heads; For different areas; Large Round Head; Small Round Head; Oval-Shaped Head; 3 3 Suction Modes; Normal • Intermediate • Strong; 4 USB-C Rechargeable; Fast and convenient; 5 Physical Button; Adjust suction intensity; Power On/Off Long press; Mode Select Short press; Suction Intensity Normal / Intermediate / Strong",
+            "embedding_text": "Blackhead Remover product info photo 3 feature built with smart features advanced technology for clearer smoother skin microcrystal extractor deep pore suction 3 suction heads for different areas large round head small round head oval-shaped head 3 suction modes normal intermediate strong USB-C rechargeable fast and convenient physical button adjust suction intensity power on/off long press mode select short press suction intensity",
+            "customer_safe": true,
+            "approval_note": "Visible in image",
+            "question_examples": [
+              "what features does it have?",
+              "what suction modes are shown?"
+            ],
+            "sourceSlot": "infoPhoto3",
+            "sourceLabel": "Product info photo 3",
+            "sourceImageUrl": "/assets/blackhead-remover/product-3.png",
+            "sourceFilename": "product-3.png",
+            "extractedAt": "2026-06-11T14:34:52.603Z",
+            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Info gambar menunjukkan fungsi device seperti suction head/mode, cas USB dan butang kawalan jika berkaitan.",
+            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | macam mana cara guna cara pakai mode kepala alat suction cas usb rechargeable button",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Blackhead remover ani untuk apa?",
+              "Macam mana alat ani bantu blackhead?",
+              "Macam mana cara guna?",
+              "Cara pakai macam mana?",
+              "Ada berapa mode?"
+            ],
+            "approvedAt": "2026-06-13T06:35:47.019Z"
+          },
+          {
+            "id": "image_1781188498201",
+            "kind": "image_chunk",
+            "category": "price",
+            "title": "Blackhead Remover price photo",
+            "summary": "Price poster for a blackhead remover showing the product name, claimed effects, package deals, cash on delivery, and refund text.",
+            "extracted_text": "BLACKHEAD REMOVER; BERSIH PORI | KURANG KOMEDO | KULIT LEBIH LICIN; HARGA ASAL B$78; PACKAGE A 2 UNIT = B$39; PACKAGE B 4 UNIT = B$70; PACKAGE C 6 UNIT = B$105; BARANG SAMPAI BARU BAYAR; 7 HARI ROSAK - 100% FULLY REFUND; COD TO ALL BRUNEI",
+            "embedding_text": "price photo, Blackhead Remover, price, package deals, product poster, BLACKHEAD REMOVER, BERSIH PORI, KURANG KOMEDO, KULIT LEBIH LICIN, HARGA ASAL B$78, PACKAGE A 2 UNIT = B$39, PACKAGE B 4 UNIT = B$70, PACKAGE C 6 UNIT = B$105, BARANG SAMPAI BARU BAYAR, 7 HARI ROSAK - 100% FULLY REFUND, COD TO ALL BRUNEI",
+            "customer_safe": true,
+            "approval_note": "Visible text from the image",
+            "question_examples": [
+              "berapa harga?",
+              "ada package apa saja?",
+              "boleh COD?"
+            ],
+            "sourceSlot": "pricePhoto",
+            "sourceLabel": "Price photo",
+            "sourceImageUrl": "/assets/blackhead-remover/price.jpeg",
+            "sourceFilename": "price.jpeg",
+            "extractedAt": "2026-06-11T14:34:58.201Z",
+            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Info gambar ada menunjukkan harga atau promo produk. COD ada, barang sampai baru bayar, tertakluk kepada info delivery yang tersedia. Info gambar menyebut 7 hari rosak boleh 100% refund jika syarat berkenaan dipenuhi.",
+            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1 | cod ada bayar masa barang sampai barang sampai baru bayar delivery hantar runner brunei | refund warranty rosak 7 hari rosak return tukar barang",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Blackhead remover ani untuk apa?",
+              "Macam mana alat ani bantu blackhead?",
+              "Berapa harga?",
+              "Ada promo kah?",
+              "Combo berapa?",
+              "Ada add-on apa?",
+              "COD ada?",
+              "Boleh bayar masa barang sampai?",
+              "Ada delivery kah?",
+              "Ada warranty kah?",
+              "Kalau rosak macam mana?",
+              "Ada refund kah?"
+            ],
+            "approvedAt": "2026-06-13T06:35:47.920Z"
+          }
+        ]
+      },
+      "package_question": "Ada kita rasa minat nak ambil Package B = 2 FREE 2？🥰"
+    },
+    {
+      "id": "p08-ilso-super-melting-sebum-softener",
+      "name": "P08 ilso super melting sebum softener",
+      "aliases": [
+        "p08 ilso super melting sebum softener"
+      ],
+      "price": "",
+      "stock_status": "preorder",
+      "shopping_link": "https://qr.1688.com/s/d6EK49UU",
+      "ad_keywords": [
+        "p08 ilso super melting sebum softener"
+      ],
+      "packages": [],
+      "order_options": [
+        {
+          "id": "single-unit",
+          "name": "Single Unit",
+          "price": "B$39",
+          "quantity": 1,
+          "aliases": [
+            "1 unit",
+            "single",
+            "satu unit"
+          ],
+          "requires_add_on": false,
+          "add_ons": []
+        },
+        {
+          "id": "special-combo",
+          "name": "Special Combo",
+          "price": "B$55",
+          "quantity": 1,
+          "aliases": [
+            "combo",
+            "special combo",
+            "add-on combo"
+          ],
+          "requires_add_on": true,
+          "add_ons": [
+            "ilso Scrub Tool",
+            "Bio Collagen Mask x 5",
+            "Green Mask Stick x 2",
+            "Pore-Reducing Toner",
+            "CeraVe Cleanser"
+          ]
+        }
+      ],
+      "images": [
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/product-1.jpg",
+          "caption": "Product info photo 1"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/product-2.jpg",
+          "caption": "Product info photo 2"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/product-3.jpg",
+          "caption": "Product info photo 3"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-1.jpg",
+          "caption": "Testimonial photo 1"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-2.jpg",
+          "caption": "Testimonial photo 2"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-3.jpg",
+          "caption": "Testimonial photo 3"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-4.jpg",
+          "caption": "Testimonial photo 4"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/price.jpg",
+          "caption": "Price photo"
+        },
+        {
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
+          "caption": "Optional sales photo"
+        }
+      ],
+      "openingFlowEnabled": true,
+      "opening_flow": [
+        {
+          "type": "text",
+          "body": "Assalamualaikum kita nama saya Fadilah, skrg saya share info utk ilso super melting sebum softener 🥰"
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/product-1.jpg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/product-2.jpg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/product-3.jpg",
+          "caption": ""
+        },
+        {
+          "type": "text",
+          "body": "✨ ilso Super Melting Sebum Softener ✨\n\nSebum softener untuk bantu lembutkan minyak tersumbat, blackhead & whitehead supaya pori nampak lebih bersih dan mudah dijaga setiap hari ✨\n\n✅ Sebum Softening Care\nBantu lembutkan sebum keras dalam pori supaya lebih mudah dibersihkan\n\n✅ Blackhead & Whitehead Care\nBantu kurangkan penampilan blackhead dan whitehead di kawasan hidung\n\n✅ Pore Cleaning Support\nBantu bersihkan kotoran pori dan lebihan minyak yang tersumbat\n\n✅ Gentle Water Type Texture\nTekstur ringan, tak melekit dan selesa digunakan sebelum pore extraction"
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-1.jpg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-2.jpg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-3.jpg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/testimonial-4.jpg",
+          "caption": ""
+        },
+        {
+          "type": "text",
+          "body": "Dgn sini adalah customer Ujian peribadi + feedback selepas menggunakan ilso super melting sebum softener"
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/price.jpg",
+          "caption": ""
+        },
+        {
+          "type": "image",
+          "url": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
+          "caption": ""
+        },
+        {
+          "type": "text",
+          "body": "HARGA ilso Super Melting Sebum Softener\n⚡ 1 UNIT = B$39\n\n🔥 SPECIAL COMBO DEAL\n💎 ANY 1 ADD-ON COMBO = B$55\n\nAdd-on :\n\n✅ ilso Scrub Tool\n✅ Bio Collagen Mask x 5\n✅ Green Mask Stick x 2\n✅ Pore-Reducing Toner\n✅ CeraVe Cleanser\n\n🔥 7 HARI ROSAK — 100% FULLY REFUND 🔥\n\nCOD TO ALL 🇧🇳 BRUNEI !!!"
+        },
+        {
+          "type": "text",
+          "body": "Ada kita rasa minat nak ambil special combo?🥰"
+        }
+      ],
+      "faqs": [],
+      "sales_replies": [],
+      "standard_replies": [],
+      "followups": {
+        "first_day_followup": {
+          "send_hour": 20,
+          "first_chat_cutoff_hour": 19,
+          "day_offset": 0,
+          "message": "Salam😊,Kita masih minat harga promo ni kh? Klu minat, sy bulih terus bantu lock skrg sblm promo ani habis\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_1_followup": {
+          "send_hour": 20,
+          "day_offset": 1,
+          "message": "Hi Dear, slot tinggal sikit sja.\nKlu ready, sy bulih terus bantu lock promo ya.\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_3_followup": {
+          "send_hour": 20,
+          "day_offset": 3,
+          "message": "Ramai dh beli, sy tau u masih pikir.Kalau tdk bagus, biar Allah hukum sy.🤲🏽\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_4_followup": {
+          "send_hour": 20,
+          "day_offset": 4,
+          "message": "Sy baru check, promo ani tinggal sikit sja.\nMau sy bantu simpan satu utk kita?\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_5_followup": {
+          "send_hour": 20,
+          "day_offset": 5,
+          "message": "Bh~ just nak remind sja 🥰\nPromo ani masih jalan, tp tinggal sikit stock.\nKita masih minat kh？Klu minat, sy bulih terus bantu lock skrg🙈\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_6_followup": {
+          "send_hour": 20,
+          "day_offset": 6,
+          "message": "Hi dear 💕\nRamai dh lock promo ani pasal harga jauh murah dari normal price.\nKlu kita pikir mau ambil, better grab skrg bh sblm naik harga 😅\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_7_followup": {
+          "send_hour": 20,
+          "day_offset": 7,
+          "message": "Kita masih pikir kh? 😘\nSy takut nnti bila stock baru masuk, promo dh habis 😭\nKlu kita mau, sy bulih bantu lock harga promo ani dlu bh~\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_8_followup": {
+          "send_hour": 20,
+          "day_offset": 8,
+          "message": "Ramai org dh feedback pasal produk ani,sbb resultnya memang bagus banar 😍\nSy pun dh bantu ramai customer di area kita dptkan produk ani~\nMun kita reply, sy bulih terus bantu proses order kita 😇\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_9_followup": {
+          "send_hour": 20,
+          "day_offset": 9,
+          "message": "Saya bagi tau kita ya 🥺\nSlot promo tinggal 2 sja sekarang.\nKlu kita ready, terus bgi saya maklumat sja utk bulih lock harga sblm promo habis 🙏🏻\n\nReply stop if you do not want to receive message from this business again."
+        },
+        "day_10_followup": {
+          "send_hour": 20,
+          "day_offset": 10,
+          "message": "Last call 🥲 Promo tamat malam ani.\nKlu kita ready, terus bgi maklumat  skrg~\nKlu belum nda apa 😊\nBila kita dh bersedia nnti, saya tetap di sini bantu sis ❤️\n\nReply stop if you do not want to receive message from this business again."
+        }
+      },
+      "sales_photo_url": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
+      "extracted_knowledge": {
+        "pending": [],
+        "approved": [],
+        "pendingImages": [],
+        "approvedImages": [
+          {
+            "id": "image_1781189906679",
+            "kind": "image_chunk",
+            "category": "benefit_claim",
+            "title": "Blackheads out in 5 minutes comparison",
+            "summary": "Promotional comparison image for ilso super melting sebum softener showing 'WITHOUT ILSO' vs 'WITH ILSO' on a nose area. The visible text claims blackheads out in 5 minutes and lists softer sebum, easier removal, cleaner pores, and smoother skin, alongside the problem side with hard blackheads, difficult to remove, clogged pores, and rough skin.",
+            "extracted_text": "BLACKHEADS OUT IN 5 MINUTES; WITHOUT ILSO; WITH ILSO; VS; Hard Blackheads; Difficult to Remove; Clogged Pores; Rough Skin; Softened Sebum; Easier Removal; Cleaner Pores; Smoother Skin; ilso",
+            "embedding_text": "Product info photo 1 | product-1.jpg | P08 ilso super melting sebum softener | category: benefit_claim | Blackheads out in 5 minutes comparison. Promotional before-and-after style image showing without ilso vs with ilso on a nose area. Visible text includes: BLACKHEADS OUT IN 5 MINUTES, Hard Blackheads, Difficult to Remove, Clogged Pores, Rough Skin, Softened Sebum, Easier Removal, Cleaner Pores, Smoother Skin, ilso.",
+            "customer_safe": true,
+            "approval_note": "Visible comparison and text in image; claims kept as written without strengthening.",
+            "question_examples": [
+              "what benefits are shown?",
+              "what does the image claim?",
+              "apa klaim yang terlihat?"
+            ],
+            "sourceSlot": "infoPhoto1",
+            "sourceLabel": "Product info photo 1",
+            "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-1.jpg",
+            "sourceFilename": "product-1.jpg",
+            "extractedAt": "2026-06-11T14:58:26.679Z",
+            "approvedAt": "2026-06-11T15:00:55.555Z",
+            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Info gambar ada menunjukkan harga atau promo produk.",
+            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Produk ani untuk apa?",
+              "Apa benefit produk ani?",
+              "Buleh bantu blackhead kah?",
+              "Berapa harga?",
+              "Ada promo kah?",
+              "Combo berapa?",
+              "Ada add-on apa?"
+            ]
+          },
+          {
+            "id": "image_1781189909194",
+            "kind": "image_chunk",
+            "category": "benefit_claim",
+            "title": "After using ilso nose care results",
+            "summary": "Marketing image showing claimed results after using ILSO: cleaner nose area, less visible blackheads, better makeup application, and fresher looking skin. The visual is a close-up of a nose with sparkles and check-mark bullets.",
+            "extracted_text": "AFTER USING ILSO\nCLEANER NOSE AREA\nLESS VISIBLE BLACKHEADS\nBETTER MAKEUP APPLICATION\nFRESHER LOOKING SKIN",
+            "embedding_text": "Product image info photo 2 product-2.jpg. Category: benefit_claim. After using ilso. Cleaner nose area. Less visible blackheads. Better makeup application. Fresher looking skin. Close-up nose image with sparkles and check marks.",
+            "customer_safe": true,
+            "approval_note": "Visible promotional text and nose close-up are shown in the image.",
+            "question_examples": [
+              "what results are shown after using it?",
+              "apa manfaat yang ditampilkan?",
+              "does it claim less visible blackheads?"
+            ],
+            "sourceSlot": "infoPhoto2",
+            "sourceLabel": "Product info photo 2",
+            "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-2.jpg",
+            "sourceFilename": "product-2.jpg",
+            "extractedAt": "2026-06-11T14:58:29.194Z",
+            "approvedAt": "2026-06-11T15:00:56.435Z",
+            "brunei_malay_summary": "Info gambar berkaitan P08 ilso super melting sebum softener.",
+            "brunei_malay_search_text": "produk ani P08 ilso super melting sebum softener info gambar soalan customer",
+            "brunei_malay_question_examples": []
+          },
+          {
+            "id": "image_1781189912007",
+            "kind": "image_chunk",
+            "category": "benefit_claim",
+            "title": "Why choose ilso? product benefits",
+            "summary": "Promotional image for ilso super melting sebum softener showing four visible benefit points: no painful squeezing, visible results, 5-minute care, and gentle formula. The bottle is centered with the product name visible.",
+            "extracted_text": "WHY CHOOSE ILSO?\nNO PAINFUL SQUEEZING\nNo more hurting your skin\nVISIBLE RESULTS\nSee blackheads come out\n5-MINUTE CARE\nQuick and easy at home\nGENTLE FORMULA\nSuitable for sensitive skin\nSUPER MELTING SEBUM SOFTENER\nilso",
+            "embedding_text": "Product info photo 3 | product-3.jpg | category: benefit_claim | Why choose ilso? product benefits. ilso super melting sebum softener promo image with visible text: WHY CHOOSE ILSO? NO PAINFUL SQUEEZING, No more hurting your skin, VISIBLE RESULTS, See blackheads come out, 5-MINUTE CARE, Quick and easy at home, GENTLE FORMULA, Suitable for sensitive skin, SUPER MELTING SEBUM SOFTENER, ilso.",
+            "customer_safe": true,
+            "approval_note": "Visible promotional text and product bottle in image.",
+            "question_examples": [
+              "what benefits are shown?",
+              "is it gentle for sensitive skin?",
+              "what does the image say about results?"
+            ],
+            "sourceSlot": "infoPhoto3",
+            "sourceLabel": "Product info photo 3",
+            "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-3.jpg",
+            "sourceFilename": "product-3.jpg",
+            "extractedAt": "2026-06-11T14:58:32.007Z",
+            "approvedAt": "2026-06-11T15:00:56.929Z",
+            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Dalam info gambar ada disebut gentle formula atau sesuai untuk kulit sensitif. Info gambar ada menunjukkan harga atau promo produk.",
+            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | kulit sensitif kah sensitive skin gentle formula sesuai kulit sensitive | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Produk ani untuk apa?",
+              "Apa benefit produk ani?",
+              "Buleh bantu blackhead kah?",
+              "Sesuai untuk kulit sensitif kah?",
+              "Kulit sensitive boleh pakai kah?",
+              "Berapa harga?",
+              "Ada promo kah?",
+              "Combo berapa?",
+              "Ada add-on apa?"
+            ]
+          },
+          {
+            "id": "image_1781189915497",
+            "kind": "image_chunk",
+            "category": "price",
+            "title": "ilso Super Melting Sebum Softener pricing and promo",
+            "summary": "Price promo image for ilso Super Melting Sebum Softener. It shows the main product name, claims on the image such as softening sebum, clearing pores, and blackhead extraction, plus the listed prices and bundle/add-on options. Main price shown is 1 unit = $39, and best seller combo is $55 with sebum softener + scrub tool for stubborn blackheads. The image also mentions other add-ons available and delivery/refund messages.",
+            "extracted_text": "ilso\nSUPER MELTING SEBUM SOFTENER\nSOFTEN SEBUM | CLEAR PORES | BLACKHEAD EXTRACTION\n1 UNIT = $39\nBEST SELLER COMBO: $55\nSebum Softener + Scrub Tool For Stubborn Blackheads\nOther Add-ons Available\nBio Collagen Mask x5\nGreen Mask Stick x2\nPore-Reducing Toner\nCerave Cleanser\nBARANG SAMPAI BARU BAYAR\n7 HARI ROSAK - 100% FULLY REFUND\nCOD TO ALL BRUNEI!!!",
+            "embedding_text": "Price photo | price.jpg | category: price | ilso Super Melting Sebum Softener pricing promo image. Visible text includes SUPER MELTING SEBUM SOFTENER, soften sebum, clear pores, blackhead extraction, 1 unit = $39, best seller combo $55, sebum softener + scrub tool for stubborn blackheads, other add-ons available: Bio Collagen Mask x5, Green Mask Stick x2, Pore-Reducing Toner, Cerave Cleanser, barang sampai baru bayar, 7 hari rosak - 100% fully refund, COD to all Brunei.",
+            "customer_safe": true,
+            "approval_note": "Visible price and promo text in image",
+            "question_examples": [
+              "what is the price?",
+              "what combo is available?",
+              "ada add-on apa?"
+            ],
+            "sourceSlot": "pricePhoto",
+            "sourceLabel": "Price photo",
+            "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/price.jpg",
+            "sourceFilename": "price.jpg",
+            "extractedAt": "2026-06-11T14:58:35.497Z",
+            "approvedAt": "2026-06-11T15:00:57.810Z",
+            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Harga/promo yang ditunjukkan: 1 unit = $39, and best seller combo is $55 with sebum softener + scrub tool for stubborn blackheads. 1 UNIT = $39. BEST SELLER COMBO: $55. 1 unit = $39, best seller combo $55, sebum softener + scrub tool for stubborn blackheads, other add-ons available: Bio Collagen Mask x5, Green Mask Stick x2, Pore-Reducing Toner, Cerave Cleanser, barang sampai baru bayar, 7 hari rosak - 100% fully refund, COD to all Brunei. COD ada, barang sampai baru bayar, tertakluk kepada info delivery yang tersedia. Info gambar menyebut 7 hari rosak boleh 100% refund jika syarat berkenaan dipenuhi.",
+            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1 | cod ada bayar masa barang sampai barang sampai baru bayar delivery hantar runner brunei | refund warranty rosak 7 hari rosak return tukar barang",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Produk ani untuk apa?",
+              "Apa benefit produk ani?",
+              "Buleh bantu blackhead kah?",
+              "Berapa harga?",
+              "Ada promo kah?",
+              "Combo berapa?",
+              "Ada add-on apa?",
+              "COD ada?",
+              "Boleh bayar masa barang sampai?",
+              "Ada delivery kah?",
+              "Ada warranty kah?",
+              "Kalau rosak macam mana?",
+              "Ada refund kah?"
+            ]
+          },
+          {
+            "id": "image_1781189918937",
+            "kind": "image_chunk",
+            "category": "feature",
+            "title": "Complete pore care routine with ilso Super Melting Sebum Softener",
+            "summary": "Promotional sales image for ilso Super Melting Sebum Softener showing it as the main product in a “Complete Pore Care Routine.” Visible feature callouts include Sebum Care, Gentle Formula, Fresh Water Type, and 150ml. The image also shows recommended add-ons: Bio Collagen Mask, Sebum Care Tool, Green Mask Stick, Hydrating Cleanser, and Pore-Reducing Toner, with a bottom banner saying to use together for a clearer, smoother skincare routine.",
+            "extracted_text": "Complete Pore Care Routine\nMain Product + Recommended Add-Ons\nilso SUPER MELTING SEBUM SOFTENER\nMAIN PRODUCT\nSebum Care\nGentle Formula\nFresh Water Type\n150ml\nADD-ON\nBio Collagen Mask\nHydrating & Firming\nSebum Care Tool\nHelps remove softened sebum\nGreen Mask Stick\nDeep cleansing for pores\nHydrating Cleanser\nGentle daily cleansing\nPore-Reducing Toner\nRefreshes & balances skin\nUse together for a clearer, smoother skincare routine",
+            "embedding_text": "feature, product: P08 ilso super melting sebum softener, sales photo, Complete Pore Care Routine, Main Product + Recommended Add-Ons, ilso SUPER MELTING SEBUM SOFTENER, main product, Sebum Care, Gentle Formula, Fresh Water Type, 150ml, add-ons: Bio Collagen Mask, Sebum Care Tool, Green Mask Stick, Hydrating Cleanser, Pore-Reducing Toner, use together for a clearer, smoother skincare routine",
+            "customer_safe": true,
+            "approval_note": "Visible in image",
+            "question_examples": [
+              "what features are shown?",
+              "what add-ons are recommended?",
+              "berapa ml?"
+            ],
+            "sourceSlot": "salesPhoto",
+            "sourceLabel": "Optional sales photo",
+            "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
+            "sourceFilename": "sales.jpg",
+            "extractedAt": "2026-06-11T14:58:38.937Z",
+            "approvedAt": "2026-06-11T15:00:58.589Z",
+            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Dalam info gambar ada disebut gentle formula atau sesuai untuk kulit sensitif. Isi produk yang ditunjukkan ialah 150ml. Info gambar ada menunjukkan harga atau promo produk.",
+            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | kulit sensitif kah sensitive skin gentle formula sesuai kulit sensitive | berapa ml isi botol volume 150ml | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1",
+            "brunei_malay_question_examples": [
+              "Apa fungsi produk ani?",
+              "Produk ani untuk apa?",
+              "Apa benefit produk ani?",
+              "Buleh bantu blackhead kah?",
+              "Sesuai untuk kulit sensitif kah?",
+              "Kulit sensitive boleh pakai kah?",
+              "Berapa ml?",
+              "Satu botol berapa ml?",
+              "Berapa harga?",
+              "Ada promo kah?",
+              "Combo berapa?",
+              "Ada add-on apa?"
+            ]
+          }
+        ],
+        "lastExtraction": {
+          "status": "completed",
+          "imageChunksAdded": 5,
+          "factsFound": 0,
+          "factsAdded": 0,
+          "imagesProcessed": 5,
+          "imagesCompleted": 5,
+          "imagesFailed": 0,
+          "at": "2026-06-11T14:58:38.937Z",
+          "batch": true,
+          "results": [
+            {
+              "slot": "infoPhoto1",
+              "url": "/assets/p08-ilso-super-melting-sebum-softener/product-1.jpg",
+              "status": "completed",
+              "imageChunkAdded": true,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-11T14:58:26.679Z",
+              "sourceSlot": "infoPhoto1",
+              "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-1.jpg",
+              "sourceFilename": "product-1.jpg"
+            },
+            {
+              "slot": "infoPhoto2",
+              "url": "/assets/p08-ilso-super-melting-sebum-softener/product-2.jpg",
+              "status": "completed",
+              "imageChunkAdded": true,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-11T14:58:29.194Z",
+              "sourceSlot": "infoPhoto2",
+              "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-2.jpg",
+              "sourceFilename": "product-2.jpg"
+            },
+            {
+              "slot": "infoPhoto3",
+              "url": "/assets/p08-ilso-super-melting-sebum-softener/product-3.jpg",
+              "status": "completed",
+              "imageChunkAdded": true,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-11T14:58:32.007Z",
+              "sourceSlot": "infoPhoto3",
+              "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-3.jpg",
+              "sourceFilename": "product-3.jpg"
+            },
+            {
+              "slot": "pricePhoto",
+              "url": "/assets/p08-ilso-super-melting-sebum-softener/price.jpg",
+              "status": "completed",
+              "imageChunkAdded": true,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-11T14:58:35.497Z",
+              "sourceSlot": "pricePhoto",
+              "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/price.jpg",
+              "sourceFilename": "price.jpg"
+            },
+            {
+              "slot": "salesPhoto",
+              "url": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
+              "status": "completed",
+              "imageChunkAdded": true,
+              "factsFound": 0,
+              "factsAdded": 0,
+              "factsSkipped": 0,
+              "at": "2026-06-11T14:58:38.937Z",
+              "sourceSlot": "salesPhoto",
+              "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
+              "sourceFilename": "sales.jpg"
+            }
+          ]
+        }
+      },
+      "package_question": "Ada kita rasa minat nak ambil special combo?🥰"
+    }
+  ],
+  "sales_replies": []
+}

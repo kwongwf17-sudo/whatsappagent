@@ -1,0 +1,72 @@
+{
+  "approved_faqs": [
+    {
+      "id": "general_business_location",
+      "topic": "Business or warehouse location and how delivery is arranged",
+      "example_questions": [
+        "Business location kat mana?",
+        "Warehouse di mana?",
+        "Kedai kamu di mana?"
+      ],
+      "approved_reply": "Warehouse at bandar. Tapi skrg buleh proceed delivery dgn MP service saja",
+      "active": true
+    },
+    {
+      "id": "general_delivery_fee",
+      "topic": "Whether customer needs to pay a delivery charge or whether delivery is free",
+      "example_questions": [
+        "Delivery ada caj?",
+        "Delivery ada caj tak?",
+        "Ada delivery caj tak?",
+        "Ada caj delivery?",
+        "Delivery free ke?",
+        "Kalau hantar rumah perlu bayar?"
+      ],
+      "approved_reply": "nda ya",
+      "active": true
+    },
+    {
+      "id": "general_delivery_available",
+      "topic": "Whether delivery service is available",
+      "example_questions": [
+        "Ada delivery?",
+        "Buleh hantar rumah?",
+        "Ada service hantar barang?"
+      ],
+      "approved_reply": "ada",
+      "active": true
+    },
+    {
+      "id": "general_pay_end_month",
+      "topic": "Whether customer may pay at the end of the month",
+      "example_questions": [
+        "Buleh bayar hujung bulan?",
+        "Boleh bayar masa hujung bulan?"
+      ],
+      "approved_reply": "Buleh",
+      "active": true
+    },
+    {
+      "id": "general_stock_arrival_time",
+      "topic": "How many days new stock takes to arrive",
+      "example_questions": [
+        "Berapa hari barang baru sampai?",
+        "Stock sampai berapa hari?",
+        "Bila new stock arrive?"
+      ],
+      "approved_reply": "15-18 days.",
+      "active": true
+    },
+    {
+      "id": "general_delivery_or_pickup",
+      "topic": "Whether the business delivers the arrived item or customer must collect it",
+      "example_questions": [
+        "nanti if barang sampai kita deliver or pickup sendiri?",
+        "Barang sampai nanti deliver kah pickup?",
+        "Saya mesti ambil sendiri kah?"
+      ],
+      "approved_reply": "Kami akan deliver ya.",
+      "active": true
+    }
+  ]
+}

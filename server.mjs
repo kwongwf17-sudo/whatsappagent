@@ -1,0 +1,8948 @@
+import crypto from "node:crypto";
+import http from "node:http";
+import path from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import {
+  buildConversationPlan,
+  approvedFaqRecordsForProduct,
+  approvedProductFactRecordsForProduct,
+  classifyFaqSalesPromptResponse,
+  findApprovedFaqLocalMatch,
+  findProduct,
+  isGeneralBusinessQuestion,
+  isProductNameMessage,
+  findSalesReplyExactMatch,
+  formatStockArrivalMessage,
+  salesReplyRecordsForProduct,
+  textMessage,
+  usesFixedOpeningFlow,
+} from "./lib/conversation.mjs";
+import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
+import {
+  createEmbeddings,
+  createProductFactReply,
+  detectComplaintIntent,
+  detectOrderStatusIntent,
+  extractProductKnowledgeFromImage,
+  rerankProductFacts,
+  selectApprovedFaq,
+  selectProductFact,
+  selectSalesReply,
+} from "./lib/openai.mjs";
+import {
+  retrieveFaqRecords,
+  retrieveProductFactRecords,
+  retrieveSalesReplyRecords,
+} from "./lib/retrieval.mjs";
+import { JsonStore } from "./lib/store.mjs";
+import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
+import { AdminAccountStore } from "./lib/admin_accounts.mjs";
+import { OperationsStore } from "./lib/operations.mjs";
+import {
+  customerOrderStatusReply,
+  isLikelyOrderStatusQuestion,
+  ORDER_STATUS_OPTIONS,
+  orderStatusDisplay,
+} from "./lib/order_tracking.mjs";
+import {
+  complaintCategoryDisplay,
+  detectObviousComplaint,
+} from "./lib/complaints.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+await loadEnvFile(path.join(__dirname, ".env"));
+await loadEnvFile();
+
+const demoMode = parseBool(getEnv("DEMO_MODE", "true"));
+const config = {
+  demoMode,
+  port: Number(getEnv("PORT", "3000")),
+  webhookPath: normalizePath(getEnv("WHATSAPP_WEBHOOK_PATH", "/webhook")),
+  verifyToken: getEnv("WHATSAPP_VERIFY_TOKEN", "demo_verify_token"),
+  appSecret: process.env.WHATSAPP_APP_SECRET,
+  graphVersion: getEnv("WHATSAPP_GRAPH_VERSION", "v25.0"),
+  phoneNumberId: demoMode ? getEnv("WHATSAPP_PHONE_NUMBER_ID", "") : requireEnv("WHATSAPP_PHONE_NUMBER_ID"),
+  accessToken: demoMode ? getEnv("WHATSAPP_ACCESS_TOKEN", "") : requireEnv("WHATSAPP_ACCESS_TOKEN"),
+  adminWhatsAppNumber: getEnv("ADMIN_WHATSAPP_NUMBER", ""),
+  openaiApiKey: usableEnv("OPENAI_API_KEY"),
+  openaiModel: getEnv("OPENAI_MODEL", "gpt-5.4-mini"),
+  extractionModel: getEnv("OPENAI_EXTRACTION_MODEL", "gpt-5.4-mini"),
+  embeddingModel: getEnv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+  vectorStoreId: usableEnv("OPENAI_VECTOR_STORE_ID"),
+  accountId: getEnv("ACCOUNT_ID", "demo"),
+  businessName: getEnv("BUSINESS_NAME", "our store"),
+  supportLanguage: getEnv("SUPPORT_LANGUAGE", "the customer's language when possible"),
+  maxReplyChars: Number(getEnv("MAX_REPLY_CHARS", "3500")),
+  dataDir: path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data"))),
+  storeBackend: getEnv("WHATSAPP_STORE", "json").toLowerCase(),
+  sqlitePath: getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"),
+  assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
+  catalogPath: path.resolve(getEnv("PRODUCT_CATALOG_PATH", path.join(__dirname, "data", "product_catalog.json"))),
+  generalFaqsPath: path.resolve(getEnv("GENERAL_FAQS_PATH", path.join(__dirname, "data", "general_faqs.json"))),
+  salesRepliesPath: path.resolve(getEnv("SALES_REPLIES_PATH", path.join(__dirname, "data", "sales_replies.json"))),
+  publicBaseUrl: getEnv("PUBLIC_BASE_URL", ""),
+  followupAutorun: parseBool(getEnv("FOLLOWUP_AUTORUN", "false")),
+  followupIntervalMinutes: Number(getEnv("FOLLOWUP_INTERVAL_MINUTES", "15")),
+  followupSendsPerMinute: Number(getEnv("FOLLOWUP_SENDS_PER_MINUTE", "10")),
+  followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
+  messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
+  deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
+  noReplyAlertMinutes: Number(getEnv("NO_REPLY_ALERT_MINUTES", "2")),
+  adminPassword: getEnv("ADMIN_PASSWORD", "admin123"),
+  adminSessionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "demo_session_secret")),
+  superAdminPassword: usableSecretEnv("SUPER_ADMIN_PASSWORD"),
+  appVersion: getEnv("APP_VERSION", "0.1.0-demo"),
+};
+
+const FOLLOWUP_TEMPLATE_LANGUAGE = "en";
+const FOLLOWUP_TEMPLATE_BY_KEY = {
+  first_day_followup: "dayone_followup",
+  day_1_followup: "daytwo_followup",
+  day_3_followup: "daythree_followup",
+  day_4_followup: "dayfour_followup",
+  day_5_followup: "dayfive_followup",
+  day_6_followup: "daysix_followup",
+  day_7_followup: "dayseven_followup",
+  day_8_followup: "dayeight_followup",
+  day_9_followup: "daynine_followup",
+  day_10_followup: "dayten_followup",
+};
+
+const catalog = JSON.parse(await readFile(config.catalogPath, "utf8"));
+const faqLibrary = await loadFaqLibrary();
+const salesReplyLibrary = await loadSalesReplyLibrary();
+const sqliteAdapter = config.storeBackend === "sqlite"
+  ? new SqliteJsonAdapter(config.dataDir, config.sqlitePath)
+  : null;
+const store = new JsonStore(config.dataDir, { adapter: sqliteAdapter });
+const adminAccounts = new AdminAccountStore(config.dataDir, { adapter: sqliteAdapter });
+const operations = new OperationsStore(config.dataDir, { adapter: sqliteAdapter });
+await adminAccounts.ensureInitialAccount({
+  id: config.accountId,
+  name: config.businessName,
+  password: config.adminPassword,
+});
+await operations.ensureState({ version: config.appVersion });
+let catalogWriteQueue = Promise.resolve();
+const processedMessageIds = new Map();
+const deliveredOutboundMessages = new Map();
+const submittedOutboundMessages = new Map();
+const outboundDeliveryWaiters = new Map();
+const outboundQueues = new Map();
+let testCustomerGenerationActive = false;
+let simulatedOutboxBuffer = null;
+let followupRunPromise = null;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DASHBOARD_DEMO_ORDER_IDS = new Set([
+  "ord_1781332861319",
+  "ord_1781332388644",
+]);
+const OPT_OUT_PATTERN =
+  /\b(stop|unsubscribe|remove|jangan message|jangan msg|jgn message|jgn msg|nda minat|ndak minat|tidak minat|tak minat|no longer interested|do not message|dont message)\b/i;
+
+async function loadFaqLibrary() {
+  try {
+    const parsed = JSON.parse(await readFile(config.generalFaqsPath, "utf8"));
+    return {
+      approved_faqs: Array.isArray(parsed.approved_faqs) ? parsed.approved_faqs : [],
+    };
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const migrated = migrateCatalogGeneralFaqs();
+    await writeFile(config.generalFaqsPath, `${JSON.stringify(migrated, null, 2)}\n`, "utf8");
+    return migrated;
+  }
+}
+
+function migrateCatalogGeneralFaqs() {
+  const byId = new Map();
+  for (const faq of catalog.approved_faqs || []) {
+    const id = String(faq.id || "").trim();
+    if (!id || byId.has(id)) continue;
+    byId.set(id, faq);
+  }
+  return { approved_faqs: [...byId.values()] };
+}
+
+async function persistFaqLibrary() {
+  await writeFile(config.generalFaqsPath, `${JSON.stringify(faqLibrary, null, 2)}\n`, "utf8");
+}
+
+async function loadSalesReplyLibrary() {
+  try {
+    const parsed = JSON.parse(await readFile(config.salesRepliesPath, "utf8"));
+    return {
+      sales_replies: Array.isArray(parsed.sales_replies) ? parsed.sales_replies : [],
+    };
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const migrated = migrateCatalogSalesReplies();
+    await writeFile(config.salesRepliesPath, `${JSON.stringify(migrated, null, 2)}\n`, "utf8");
+    return migrated;
+  }
+}
+
+function migrateCatalogSalesReplies() {
+  const replies = [
+    ...(catalog.sales_replies || []).map((reply) => ({
+      ...reply,
+      scope: reply.scope || "business",
+      productId: "",
+    })),
+    ...catalog.products.flatMap((product) =>
+      (product.sales_replies || []).map((reply) => ({
+        ...reply,
+        scope: "product",
+        productId: product.id,
+      }))
+    ),
+  ];
+  const byId = new Map();
+  for (const reply of replies) {
+    const id = String(reply.id || "").trim();
+    if (!id || byId.has(id)) continue;
+    byId.set(id, reply);
+  }
+  return { sales_replies: [...byId.values()] };
+}
+const OPT_OUT_INTENT_PATTERNS = [
+  /\b(jangan|jgn|inda|nda|ndak|tidak|tak)\b.*\b(message|msg|mesej|contact|hubungi|whatsapp|wa|chat|follow\s*up|kacau)\b/i,
+  /\b(jangan|jgn)\b.*\b(lagi|again)\b/i,
+  /\b(inda|nda|ndak|tidak|tak)\b.*\b(mau|mahu|nak|want)\b.*\b(contact|hubungi|message|msg|mesej|whatsapp|wa)\b/i,
+  /\b(stop|berhenti)\b.*\b(message|msg|mesej|contact|hubungi|whatsapp|wa|follow\s*up)\b/i,
+  /\b(remove|delete|padam|buang)\b.*\b(number|nombor|contact|list|database|data)\b/i,
+  /\b(not|no|bukan|nda|ind?a|tidak|tak)\b.*\b(interested|minat|berminat)\b/i,
+  /\b(sudah|suda)\b.*\b(tidak|tak|nda|ind?a)\b.*\b(minat|berminat)\b/i,
+  /\b(no need|dont need|don't need|x payah|tak payah|nda payah|inda payah)\b/i,
+  /\b(jangan kacau|stop kacau|nda mau kana contact|inda mau kana contact|inda mahu kana contact)\b/i,
+];
+const OPT_OUT_UNCERTAIN_PATTERNS = [
+  /\b(kacau|annoying|spam|terlalu banyak|banyak message|banyak msg)\b/i,
+  /\b(saya fikir dulu|fikir dulu|later dulu|nanti dulu)\b/i,
+];
+const DEMO_ACCOUNT_ID = "__demo__";
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/admin/login") {
+      return sendHtml(res, 200, loginHtml(url.searchParams.get("next") || "/admin/dashboard", "", config.accountId));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/login") {
+      const body = await readFormBody(req);
+      const next = String(body.get("next") || "/admin/dashboard");
+      const accountId = String(body.get("accountId") || config.accountId).trim();
+      const account = await adminAccounts.authenticate(accountId, String(body.get("password") || ""), "business_admin");
+      if (!account) {
+        return sendHtml(res, 401, loginHtml(next, "Wrong account ID or password.", accountId));
+      }
+      return sendLoginSession(res, next, account);
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/logout") {
+      res.writeHead(303, {
+        Location: "/admin/login",
+        "Set-Cookie": "wa_admin=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+      });
+      res.end();
+      return;
+    }
+
+    if (url.pathname.startsWith("/admin/") && !(await isAdminAuthenticated(req))) {
+      return redirectToLogin(res, url.pathname + url.search);
+    }
+
+    if (req.method === "GET" && url.pathname === "/order-admin/login") {
+      return sendHtml(res, 200, orderAdminLoginHtml("", ""));
+    }
+
+    if (req.method === "POST" && url.pathname === "/order-admin/login") {
+      const body = await readFormBody(req);
+      const accountId = String(body.get("accountId") || "").trim();
+      const account = await adminAccounts.authenticate(accountId, String(body.get("password") || ""), "order_admin");
+      if (!account) return sendHtml(res, 401, orderAdminLoginHtml("Wrong account ID or password.", accountId));
+      return sendOrderAdminSession(res, account);
+    }
+
+    if (req.method === "POST" && url.pathname === "/order-admin/logout") {
+      res.writeHead(303, {
+        Location: "/order-admin/login",
+        "Set-Cookie": "wa_order_admin=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+      });
+      res.end();
+      return;
+    }
+
+    if (url.pathname.startsWith("/order-admin/") && !(await isOrderAdminAuthenticated(req))) {
+      return redirectToOrderAdminLogin(res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/order-admin/dashboard") {
+      return sendHtml(res, 200, orderAdminDashboardHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/order-admin/orders-data") {
+      return sendJson(res, 200, { orders: (await store.listOrders()).map(formatOrderAdminRow) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/order-admin/orders/status") {
+      const body = await readJsonBody(req);
+      const session = readSessionToken(parseCookies(req.headers.cookie || "").wa_order_admin);
+      try {
+        const order = await store.updateOrderStatus(String(body.orderId || ""), String(body.status || ""), session.accountId);
+        await store.appendAuditLog({
+          actor: `order_admin:${session.accountId}`,
+          action: "order_status_updated",
+          result: `${order.id}:${order.status}`,
+        });
+        return sendJson(res, 200, { order: formatOrderAdminRow(order) });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/superadmin/login") {
+      return sendHtml(res, 200, superAdminLoginHtml(""));
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/login") {
+      const body = await readFormBody(req);
+      if (!config.superAdminPassword) {
+        return sendHtml(res, 503, superAdminLoginHtml("Set SUPER_ADMIN_PASSWORD in .env before signing in."));
+      }
+      if (!timingSafeTextEqual(String(body.get("password") || ""), config.superAdminPassword)) {
+        return sendHtml(res, 401, superAdminLoginHtml("Wrong password."));
+      }
+      return sendSuperAdminSession(res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/logout") {
+      res.writeHead(303, {
+        Location: "/superadmin/login",
+        "Set-Cookie": "wa_superadmin=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+      });
+      res.end();
+      return;
+    }
+
+    if (url.pathname.startsWith("/superadmin/") && !isSuperAdminAuthenticated(req)) {
+      return redirectToSuperAdminLogin(res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/superadmin/accounts") {
+      return sendHtml(res, 200, superAdminAccountsHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/superadmin/accounts-data") {
+      return sendJson(res, 200, { accounts: await adminAccounts.listAccounts() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/accounts/create") {
+      const body = await readJsonBody(req);
+      try {
+        const account = await adminAccounts.createAccount({
+          id: String(body.id || "").trim(),
+          name: String(body.name || "").trim(),
+          password: String(body.password || ""),
+          role: String(body.role || "business_admin"),
+        });
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "admin_account_created",
+          result: account.id,
+        });
+        return sendJson(res, 201, { account });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/accounts/password") {
+      const body = await readJsonBody(req);
+      try {
+        const account = await adminAccounts.resetPassword(String(body.id || ""), String(body.password || ""));
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "admin_password_reset",
+          result: account.id,
+        });
+        return sendJson(res, 200, { account });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/accounts/status") {
+      const body = await readJsonBody(req);
+      try {
+        const account = await adminAccounts.setActive(String(body.id || ""), Boolean(body.active));
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: account.active ? "admin_account_enabled" : "admin_account_disabled",
+          result: account.id,
+        });
+        return sendJson(res, 200, { account });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/superadmin/system") {
+      return sendHtml(res, 200, superAdminSystemHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/superadmin/system-data") {
+      return sendJson(res, 200, await buildSystemManagementData());
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/system/account-control") {
+      const body = await readJsonBody(req);
+      try {
+        const account = await adminAccounts.setOperationalControl(String(body.id || ""), {
+          automationPaused: Boolean(body.automationPaused),
+          testMode: Boolean(body.testMode),
+        });
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "automation_control_updated",
+          result: `${account.id}:${account.automationPaused ? "paused" : account.testMode ? "test_mode" : "live"}`,
+        });
+        return sendJson(res, 200, { account });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/system/release") {
+      const body = await readJsonBody(req);
+      try {
+        const state = await operations.recordRelease({ version: body.version, notes: body.notes });
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "system_release_recorded",
+          result: state.version,
+        });
+        return sendJson(res, 200, { state });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/system/retry-message") {
+      const body = await readJsonBody(req);
+      const failure = await operations.getFailedMessage(String(body.id || ""));
+      if (!failure) return sendJson(res, 404, { error: "Failed message not found." });
+      try {
+        await sendOutbound(failure.to, failure.messages, {
+          ...failure.meta,
+          businessAccountId: failure.businessAccountId,
+          skipFailureRecord: true,
+        });
+        const message = await operations.markRetry(failure.id, { success: true });
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "failed_message_retried",
+          result: failure.id,
+        });
+        return sendJson(res, 200, { message });
+      } catch (error) {
+        const message = await operations.markRetry(failure.id, { success: false, error: error.message });
+        return sendJson(res, 502, { error: error.message, message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/superadmin/system/backup") {
+      const backup = await buildSystemBackup();
+      await store.appendAuditLog({
+        actor: "super_admin",
+        action: "system_backup_exported",
+        result: backup.exportedAt,
+      });
+      return sendJsonDownload(res, `whatsapp-agent-backup-${new Date().toISOString().slice(0, 10)}.json`, backup);
+    }
+
+    if (req.method === "GET" && url.pathname === config.webhookPath) {
+      return handleVerification(url, res);
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/assets/")) {
+      return handleAsset(url, res);
+    }
+
+    if (req.method === "POST" && url.pathname === config.webhookPath) {
+      const rawBody = await readBody(req);
+      if (!isValidSignature(req.headers, rawBody)) {
+        return sendText(res, 403, "Invalid signature");
+      }
+
+      sendText(res, 200, "OK");
+      void handleWebhookPayload(rawBody).catch((error) => {
+        void recordSystemError("webhook_processing", error);
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/demo/message") {
+      const body = await readJsonBody(req);
+      const source = { ...(body.source || {}) };
+      if (body.productId && !source.productId) source.productId = body.productId;
+      const result = await processInboundMessage({
+        id: `demo_${Date.now()}`,
+        from: body.from || "demo_customer_1",
+        text: String(body.text || ""),
+        source,
+        businessAccountId: DEMO_ACCOUNT_ID,
+      });
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/followups/run") {
+      const body = await readJsonBody(req);
+      const result = await requestFollowupRun(body.now ? new Date(body.now) : new Date(), {
+        respectOperationalControl: true,
+      });
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/demo/followups/run") {
+      const body = await readJsonBody(req);
+      const result = await requestFollowupRun(body.now ? new Date(body.now) : new Date(), {
+        respectOperationalControl: false,
+      });
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/demo/customer/time") {
+      const body = await readJsonBody(req);
+      const customerId = String(body.customerId || "");
+      if (!customerId) return sendText(res, 400, "Missing customerId");
+      const firstSeenAt = String(body.firstSeenAt || new Date().toISOString());
+      const customer = await store.updateCustomer(customerId, () => ({
+        firstSeenAt,
+        lastMessageAt: firstSeenAt,
+        lastInboundAt: firstSeenAt,
+        inboundCount: 1,
+        followupsSent: {},
+        orderIds: [],
+        businessAccountId: DEMO_ACCOUNT_ID,
+      }), DEMO_ACCOUNT_ID);
+      return sendJson(res, 200, { customer });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/stock-arrival") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const result = await handleStockArrival(body.productId || catalog.default_product_id, adminSession.accountId);
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/orders") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const orders = (await store.listOrders()).filter(
+        (order) => (order.businessAccountId || config.accountId) === adminSession.accountId
+      );
+      return sendJson(res, 200, { orders });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/orders/reached-warehouse") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      const orderId = String(body.orderId || "");
+      try {
+        const existing = (await store.listOrders()).find(
+          (order) =>
+            order.id === orderId &&
+            ((order.businessAccountId || config.accountId) === adminSession.accountId ||
+              DASHBOARD_DEMO_ORDER_IDS.has(order.id))
+        );
+        if (!existing) return sendJson(res, 404, { error: "Order not found." });
+        if (existing.status !== "pending_admin_order") {
+          return sendJson(res, 400, { error: "Only Order Submitted orders can be marked as Reached Warehouse." });
+        }
+        const order = await store.updateOrderStatus(orderId, "reached_warehouse", adminSession.accountId);
+        const message = reachedWarehouseCustomerMessage(order);
+        const outboundAccountId = order.businessAccountId || adminSession.accountId;
+        await sendOutbound(order.customerId, [textMessage(message)], {
+          businessAccountId: outboundAccountId,
+          purpose: "order_reached_warehouse",
+          channel: "business_admin",
+          from: `business_admin:${adminSession.accountId}`,
+        });
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "order_reached_warehouse",
+          customerId: order.customerId,
+          result: order.id,
+          businessAccountId: outboundAccountId,
+        });
+        return sendJson(res, 200, { order: formatOrderAdminRow(order), message });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/order-status-replies") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendJson(res, 200, {
+        options: ORDER_STATUS_OPTIONS,
+        replies: await store.getOrderStatusReplies(adminSession.accountId),
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/order-status-replies") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const replies = await store.saveOrderStatusReplies(adminSession.accountId, body.replies || {});
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "order_status_replies_updated",
+          result: adminSession.accountId,
+        });
+        return sendJson(res, 200, { options: ORDER_STATUS_OPTIONS, replies });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/dashboard-data") {
+      const selectedDate = parseSelectedDate(url.searchParams.get("date"));
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendJson(res, 200, await buildDashboardData(new Date(), selectedDate, adminSession.accountId));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/profile") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const profile = await operations.updateDashboardProfile({
+          name: body.name,
+          accentColor: body.accentColor,
+        });
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "dashboard_profile_updated",
+          result: profile.name,
+        });
+        return sendJson(res, 200, { profile });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/dashboard") {
+      return sendHtml(res, 200, adminDashboardHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/chat") {
+      return sendHtml(res, 200, adminChatPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/complaint-settings") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendJson(res, 200, await store.getComplaintSettings(adminSession.accountId));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/complaint-settings") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const settings = await store.saveComplaintSettings(adminSession.accountId, body);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "complaint_acknowledgement_updated",
+          result: adminSession.accountId,
+        });
+        return sendJson(res, 200, settings);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/handoff/complaint/resolve") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const complaint = await store.resolveComplaintCase(
+          String(body.caseId || ""),
+          adminSession.accountId,
+          `admin:${adminSession.accountId}`
+        );
+        const hasOpenComplaint = (await store.listComplaintCases(adminSession.accountId)).some(
+          (item) => item.customerId === complaint.customerId && item.status !== "resolved"
+        );
+        if (!hasOpenComplaint) {
+          await store.updateCustomer(complaint.customerId, (customer) => ({
+            complaintStatus: "resolved",
+            complaintResolvedAt: complaint.resolvedAt,
+            handoffStatus: customer.handoffReason?.startsWith("Complaint") ? "" : customer.handoffStatus,
+            handoffReason: customer.handoffReason?.startsWith("Complaint") ? "" : customer.handoffReason,
+            followupBlocked: Boolean(customer.optedOut),
+            followupBlockedReason: customer.optedOut ? customer.followupBlockedReason : "",
+          }), adminSession.accountId);
+        }
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "complaint_resolved",
+          customerId: complaint.customerId,
+          result: complaint.id,
+        });
+        return sendJson(res, 200, { complaint });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/manual-reply") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "").trim();
+      const replyText = String(body.text || "").trim();
+      if (!replyText) return sendJson(res, 400, { error: "Reply message is required." });
+      if (replyText.length > config.maxReplyChars) {
+        return sendJson(res, 400, { error: `Reply must be ${config.maxReplyChars} characters or fewer.` });
+      }
+      const customer = (await store.listCustomers()).find(
+        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
+      );
+      if (!customer) return sendJson(res, 404, { error: "Customer not found." });
+      const lastInboundAt = new Date(customer.lastInboundAt || customer.firstSeenAt || 0).getTime();
+      if (!config.demoMode && (!Number.isFinite(lastInboundAt) || Date.now() - lastInboundAt > DAY_MS)) {
+        return sendJson(res, 409, {
+          error: "The 24-hour customer service window has ended. Send an approved WhatsApp template instead.",
+        });
+      }
+      try {
+        await sendOutbound(customerId, [textMessage(replyText)], {
+          channel: "business_admin",
+          from: `business_admin:${adminSession.accountId}`,
+          businessAccountId: adminSession.accountId,
+        });
+        let learnedFaq = null;
+        try {
+          learnedFaq = await maybeLearnFromManualReply(customer, replyText, adminSession.accountId);
+        } catch (learningError) {
+          await recordSystemError("manual_reply_learning", learningError, `Customer: ${customerId}`, adminSession.accountId);
+        }
+        await store.updateCustomer(customerId, () => ({
+          handoffStatus: "",
+          handoffReason: "",
+          lastLearnedFaqId: learnedFaq?.id || customer.lastLearnedFaqId || "",
+        }), adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "manual_reply_sent",
+          customerId,
+          result: learnedFaq ? `sent_via_whatsapp_api; learned_faq:${learnedFaq.id}` : "sent_via_whatsapp_api",
+        });
+        return sendJson(res, 200, { ok: true, customerId, learnedFaq });
+      } catch (error) {
+        return sendJson(res, 502, { error: "Message was not sent. Check the failed-message queue." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/no-reply/handoff") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "");
+      const customer = (await store.listCustomers()).find(
+        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
+      );
+      if (!customer) return sendJson(res, 404, { error: "Customer not found." });
+      const updated = await store.updateCustomer(customerId, () => ({
+        handoffStatus: "human_required",
+        handoffReason: "Customer message has no AI reply. Manual reply required.",
+      }), adminSession.accountId);
+      await store.appendAuditLog({
+        actor: `admin:${adminSession.accountId}`,
+        action: "no_reply_sent_to_handoff",
+        customerId,
+        result: "manual_reply_required",
+      });
+      return sendJson(res, 200, { customer: updated });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/no-reply/resolve") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "");
+      const inboundMessageId = String(body.inboundMessageId || "");
+      const customer = (await store.listCustomers()).find(
+        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
+      );
+      if (!customer || !inboundMessageId) return sendJson(res, 404, { error: "No-reply item not found." });
+      const review = await operations.resolveNoReply({
+        businessAccountId: adminSession.accountId,
+        customerId,
+        inboundMessageId,
+        actor: `admin:${adminSession.accountId}`,
+      });
+      await store.appendAuditLog({
+        actor: `admin:${adminSession.accountId}`,
+        action: "no_reply_resolved",
+        customerId,
+        result: inboundMessageId,
+      });
+      return sendJson(res, 200, { review });
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/product-flow") {
+      return sendHtml(res, 200, productFlowPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/product-flow-data") {
+      return sendJson(res, 200, { products: catalog.products.map(productFlowEditorData) });
+    }
+
+    if (req.method === "GET" && (url.pathname === "/admin/reply-library" || url.pathname === "/admin/faq-library")) {
+      return sendHtml(res, 200, replyLibraryPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/faq-library-data") {
+      return sendJson(res, 200, faqLibraryData());
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/faq-library/save") {
+      const body = await readJsonBody(req);
+      try {
+        const faq = saveApprovedFaq(body);
+        if (faq.scope === "general") await persistFaqLibrary();
+        else await persistCatalog();
+        return sendJson(res, 200, { faq, data: faqLibraryData() });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/faq-library/delete") {
+      const body = await readJsonBody(req);
+      try {
+        const deleted = deleteApprovedFaq(body);
+        if (deleted.scope === "general") await persistFaqLibrary();
+        else await persistCatalog();
+        return sendJson(res, 200, { deleted, data: faqLibraryData() });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/sales-replies") {
+      return sendHtml(res, 200, replyLibraryPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/sales-replies-data") {
+      return sendJson(res, 200, salesRepliesData());
+    }
+
+if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
+      const body = await readJsonBody(req);
+      try {
+        const salesReply = saveSalesReply(body);
+        await persistSalesReplies();
+        return sendJson(res, 200, { salesReply, data: salesRepliesData() });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/sales-replies/delete") {
+      const body = await readJsonBody(req);
+      try {
+        const deleted = deleteSalesReply(body);
+        await persistSalesReplies();
+        return sendJson(res, 200, { deleted, data: salesRepliesData() });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/create") {
+      const body = await readJsonBody(req);
+      const name = String(body.name || "").trim();
+      if (!name) return sendJson(res, 400, { error: "Product name is required." });
+      const product = createCatalogProduct(name);
+      catalog.products.push(product);
+      await persistCatalog();
+      return sendJson(res, 201, { product: productFlowEditorData(product) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/save") {
+      const body = await readJsonBody(req);
+      const product = findCatalogProduct(body.productId);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      try {
+        updateProductFlowText(product, body);
+        await persistCatalog();
+        return sendJson(res, 200, { product: productFlowEditorData(product) });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/image") {
+      const body = await readJsonBody(req);
+      const product = findCatalogProduct(body.productId);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      const slot = PRODUCT_FLOW_IMAGE_SLOTS.find((item) => item.key === body.slot);
+      if (!slot) return sendJson(res, 400, { error: "Unknown image slot." });
+      const image = decodeUploadedImage(body.dataUrl);
+      if (!image) return sendJson(res, 400, { error: "Please upload a PNG, JPG, or WEBP image." });
+      if (image.bytes.length > 10 * 1024 * 1024) {
+        return sendJson(res, 400, { error: "Image must be 10 MB or smaller." });
+      }
+      const productAssetId = safeAssetSegment(product.id);
+      const targetDirectory = path.join(config.assetsDir, productAssetId);
+      await mkdir(targetDirectory, { recursive: true });
+      const originalName = String(body.originalName || "").trim();
+      const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName)));
+      const filename = originalBase && !["file", "image", "blob"].includes(originalBase)
+        ? `${slot.filename}-${originalBase}.${image.extension}`
+        : `${slot.filename}.${image.extension}`;
+      await writeFile(path.join(targetDirectory, filename), image.bytes);
+      const assetUrl = `/assets/${productAssetId}/${filename}`;
+      updateProductFlowImage(product, slot, assetUrl);
+      const extraction = await ingestProductImageKnowledge(product, {
+        slot,
+        assetUrl,
+        originalName,
+        dataUrl: body.dataUrl,
+      });
+      await persistCatalog();
+      return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/extract-existing") {
+      const body = await readJsonBody(req);
+      const product = findCatalogProduct(body.productId);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      const extraction = await extractExistingProductImageKnowledge(product);
+      await persistCatalog();
+      return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/clean-pending") {
+      const body = await readJsonBody(req);
+      const product = findCatalogProduct(body.productId);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      const result = cleanPendingExtractedFacts(product);
+      await persistCatalog();
+      return sendJson(res, 200, { product: productFlowEditorData(product), result });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/approve") {
+      const body = await readJsonBody(req);
+      const product = findCatalogProduct(body.productId);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      const result = approveExtractedProductFact(product, String(body.factId || ""));
+      await persistCatalog();
+      return sendJson(res, 200, { product: productFlowEditorData(product), result });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/delete") {
+      const body = await readJsonBody(req);
+      const product = findCatalogProduct(body.productId);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      const result = deleteExtractedProductFact(product, String(body.factId || ""), String(body.status || "pending"));
+      await persistCatalog();
+      return sendJson(res, 200, { product: productFlowEditorData(product), result });
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/analytics") {
+      return sendHtml(res, 200, analyticsPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/compliance") {
+      return sendHtml(res, 200, compliancePageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/compliance-data") {
+      return sendJson(res, 200, await buildComplianceData());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/customer/export") {
+      const customerId = url.searchParams.get("customerId") || "";
+      if (!customerId) return sendText(res, 400, "Missing customerId");
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const data = await store.exportCustomerData(customerId, adminSession.accountId);
+      await store.appendAuditLog({
+        action: "customer_export",
+        customerId,
+        result: data.status,
+      });
+      return sendJson(res, 200, data);
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/customer/delete") {
+      const body = await readJsonBody(req);
+      const customerId = String(body.customerId || "");
+      if (!customerId) return sendText(res, 400, "Missing customerId");
+      const reason = String(body.reason || "Manual admin deletion");
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const deleted = await store.deleteCustomer(customerId, reason, new Date(), adminSession.accountId);
+      await store.appendAuditLog({
+        action: "customer_delete",
+        customerId,
+        result: deleted ? "deleted" : "not_found",
+        reason,
+      });
+      return sendJson(res, 200, { deleted: Boolean(deleted), customer: deleted });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/reset-demo-data") {
+      await store.resetDemoData();
+      return sendJson(res, 200, { ok: true, resetAt: new Date().toISOString() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/generate-test-customers") {
+      if (testCustomerGenerationActive) {
+        return sendJson(res, 409, {
+          ok: false,
+          error: "Test customer generation is already running. Please wait for it to finish.",
+        });
+      }
+      const body = await readJsonBody(req).catch(() => ({}));
+      const count = Math.max(1, Math.min(Number(body.count || 100), 500));
+      testCustomerGenerationActive = true;
+      try {
+        const result = await generateTestCustomers(count);
+        return sendJson(res, 200, result);
+      } finally {
+        testCustomerGenerationActive = false;
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/demo/state") {
+      return sendJson(res, 200, {
+        customers: await store.listCustomers(),
+        deletedCustomers: await store.listDeletedCustomers(),
+        orders: await store.listOrders(),
+        outbox: await store.listOutbox(),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      return sendJson(res, 200, {
+        ok: true,
+        demoMode: config.demoMode,
+        webhookPath: config.webhookPath,
+        model: config.openaiModel,
+        extractionModel: config.extractionModel,
+        embeddingModel: config.embeddingModel,
+        ragProvider: "openai_vector_store",
+        ragEnabled: Boolean(config.openaiApiKey && config.vectorStoreId),
+        products: catalog.products.map((product) => ({ id: product.id, name: product.name })),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/demo/chat") {
+      return sendHtml(res, 200, demoChatHtml());
+    }
+
+    sendText(res, 404, "Not found");
+  } catch (error) {
+    await recordSystemError("http_request", error, `${req.method} ${req.url}`);
+    sendText(res, 500, "Internal server error");
+  }
+});
+
+server.listen(config.port, () => {
+  console.log(`WhatsApp AI customer service agent listening on http://localhost:${config.port}`);
+  console.log(`Mode: ${config.demoMode ? "demo/local outbox" : "WhatsApp Cloud API"}`);
+  console.log(`Webhook endpoint: ${config.webhookPath}`);
+});
+
+if (config.followupAutorun) {
+  setInterval(() => {
+    void requestFollowupRun().catch((error) => recordSystemError("followup_run", error));
+  }, Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
+}
+
+function handleVerification(url, res) {
+  const mode = url.searchParams.get("hub.mode");
+  const token = url.searchParams.get("hub.verify_token");
+  const challenge = url.searchParams.get("hub.challenge");
+
+  if (mode === "subscribe" && token === config.verifyToken && challenge) {
+    return sendText(res, 200, challenge);
+  }
+
+  return sendText(res, 403, "Verification failed");
+}
+
+async function handleWebhookPayload(rawBody) {
+  const payload = JSON.parse(rawBody.toString("utf8"));
+  for (const status of extractOutboundStatuses(payload)) {
+    noteOutboundStatus(status);
+  }
+  const messages = extractInboundMessages(payload);
+
+  for (const message of messages) {
+    if (alreadyProcessed(message.id)) continue;
+    const text = getMessageText(message);
+    if (!text) {
+      const blocked = await liveAutomationBlock();
+      if (blocked) {
+        await store.appendAuditLog({
+          action: "live_reply_suppressed",
+          customerId: message.from,
+          result: blocked.code,
+        });
+        continue;
+      }
+      await sendOutbound(message.from, [
+        textMessage("Thanks for your message. I can help fastest with text questions, or our team can review this shortly."),
+      ]);
+      continue;
+    }
+
+    await processInboundMessage({
+      id: message.id,
+      from: message.from,
+      text,
+      source: extractMessageSource(message),
+      live: true,
+    });
+  }
+}
+
+async function processInboundMessage({ id, from, text, source = {}, live = false, businessAccountId = config.accountId }) {
+  console.log(`Incoming WhatsApp message from ${from}: ${text}`);
+  await store.appendOutbox({
+    direction: "inbound",
+    from,
+    to: "agent",
+    businessAccountId,
+    channel: "customer",
+    type: "text",
+    body: text,
+  });
+  const customer = await store.getOrCreateCustomer(from, {
+    lastInboundMessageId: id,
+    lastMessageAt: new Date().toISOString(),
+    lastInboundAt: new Date().toISOString(),
+    recordInbound: true,
+    businessAccountId,
+    source,
+  });
+
+  if (live) {
+    const blocked = await liveAutomationBlock();
+    if (blocked) {
+      const updatedCustomer = await store.updateCustomer(from, () => ({
+        handoffStatus: "human_required",
+        handoffReason: blocked.message,
+      }), businessAccountId);
+      await store.appendAuditLog({
+        action: "live_reply_suppressed",
+        customerId: from,
+        result: blocked.code,
+      });
+      return {
+        customer: updatedCustomer,
+        order: null,
+        messages: [],
+        handoffRequired: true,
+        handoffReason: blocked.message,
+      };
+    }
+  }
+
+  const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
+  const optOutIntent = detectOptOutIntent(text);
+  const textMatchedProduct = findProduct(catalog, text, {}, "");
+  const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
+  if (isProductNameOnlyOpening) {
+    const messageSource = {
+      ...source,
+      productId: textMatchedProduct.id,
+      productNameMatch: true,
+    };
+    const plan = await buildConversationPlan({
+      catalog,
+      customer,
+      customerMessage: text,
+      source: messageSource,
+      faqLibrary,
+      salesReplyLibrary,
+      productFactMatch: null,
+      approvedFaqMatch: null,
+      salesReplyMatch: null,
+      ragAnswer: null,
+    });
+    console.log(`Skipping OpenAI for product-name opening flow to ${from}`);
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      ...(plan.customerPatch || {}),
+      complaintCaseId: "",
+      complaintStatus: "",
+      complaintCategory: "",
+      complaintAt: "",
+      followupBlocked: false,
+      followupBlockedReason: "",
+      handoffStatus: "",
+      handoffReason: "",
+    }), businessAccountId);
+    const outbound = clampMessages(plan.messages);
+    await sendOutbound(from, outbound, { businessAccountId });
+    return {
+      customer: updatedCustomer,
+      order: null,
+      messages: outbound,
+      handoffRequired: Boolean(plan.handoffRequired),
+      handoffReason: plan.handoffReason || "",
+    };
+  }
+  if (customer.complaintStatus === "open" && !optOutIntent.optedOut) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "complaint_followup_received",
+      customerId: from,
+      result: customer.complaintCaseId || "open_complaint",
+      businessAccountId,
+    });
+    return {
+      customer,
+      order: null,
+      messages: [],
+      handoffRequired: true,
+      handoffReason: customer.handoffReason || "Complaint requires human reply.",
+    };
+  }
+  if (!faqSalesResponse && optOutIntent.optedOut) {
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      optedOut: true,
+      optedOutAt: new Date().toISOString(),
+      followupBlocked: true,
+      followupBlockedReason: optOutIntent.reason,
+      handoffStatus: "",
+      handoffReason: "",
+    }), businessAccountId);
+    await store.appendAuditLog({
+      action: "customer_opt_out",
+      customerId: from,
+      result: "followups_blocked",
+      reason: `${optOutIntent.reason}: ${text}`,
+    });
+    const outbound = [textMessage("Noted kita, kami tidak akan follow up lagi. Terima kasih.")];
+    await sendOutbound(from, outbound, { businessAccountId });
+    return {
+      customer: updatedCustomer,
+      order: null,
+      messages: outbound,
+      handoffRequired: false,
+      handoffReason: "Customer opted out.",
+    };
+  }
+
+  if (!faqSalesResponse && optOutIntent.uncertain) {
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      followupBlockedReason: optOutIntent.reason,
+      handoffStatus: "",
+      handoffReason: "",
+    }), businessAccountId);
+    await store.appendAuditLog({
+      action: "possible_opt_out_review",
+      customerId: from,
+      result: "noted_followups_continue",
+      reason: `${optOutIntent.reason}: ${text}`,
+    });
+    const outbound = [textMessage("Baik kita, no worries. Kalau berminat nanti, kita boleh message kami semula.")];
+    await sendOutbound(from, outbound, { businessAccountId });
+    return {
+      customer: updatedCustomer,
+      order: null,
+      messages: outbound,
+      handoffRequired: false,
+      handoffReason: "",
+    };
+  }
+
+  const initialAdOpening =
+    Boolean(source.sourceUrl || source.adId || source.referralHeadline) ||
+    /\b(berminat|interested|saya berminat|mau info|nak info)\b/i.test(text);
+  const obviousComplaint = detectObviousComplaint(text);
+  const complaintIntent = faqSalesResponse || (initialAdOpening && !obviousComplaint)
+    ? null
+    : obviousComplaint || await maybeDetectComplaintIntent(text);
+  if (complaintIntent) {
+    const product = findProduct(catalog, text, source, customer.productId);
+    const complaint = await store.addComplaintCase({
+      businessAccountId,
+      customerId: from,
+      productId: product.id,
+      category: complaintIntent.category,
+      reason: complaintIntent.reason,
+      customerMessage: text,
+      inboundMessageId: id,
+    });
+    const settings = await store.getComplaintSettings(businessAccountId);
+    const outbound = [textMessage(settings.acknowledgement)];
+    const categoryLabel = complaintCategoryDisplay(complaint.category);
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      productId: product.id,
+      awaitingPackageBInterest: false,
+      pendingOrder: null,
+      complaintCaseId: complaint.id,
+      complaintStatus: "open",
+      complaintCategory: complaint.category,
+      complaintAt: complaint.createdAt,
+      followupBlocked: true,
+      followupBlockedReason: "complaint_handoff",
+      handoffStatus: "human_required",
+      handoffReason: `Complaint - ${categoryLabel}`,
+    }), businessAccountId);
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "complaint_handoff_created",
+      customerId: from,
+      result: `${complaint.id}:${complaint.category}`,
+      businessAccountId,
+    });
+    if (businessAccountId !== DEMO_ACCOUNT_ID) await notifyAdmin(`Complaint handoff for ${from} (${categoryLabel}): ${text}`);
+    await sendOutbound(from, outbound, {
+      businessAccountId,
+      purpose: "complaint_acknowledgement",
+    });
+    return {
+      customer: updatedCustomer,
+      order: null,
+      messages: outbound,
+      handoffRequired: true,
+      handoffReason: updatedCustomer.handoffReason,
+    };
+  }
+
+  if (!faqSalesResponse && !initialAdOpening && await maybeDetectOrderStatusIntent(text)) {
+    const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
+    const statusReplies = await store.getOrderStatusReplies(businessAccountId);
+    const outbound = [textMessage(customerOrderStatusReply(latestOrder, statusReplies))];
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      awaitingPackageBInterest: false,
+      handoffStatus: "",
+      handoffReason: "",
+      lastOrderStatusEnquiryAt: new Date().toISOString(),
+    }), businessAccountId);
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "customer_order_status_reply",
+      customerId: from,
+      result: latestOrder ? `${latestOrder.id}:${latestOrder.status}` : "no_linked_order",
+      businessAccountId,
+    });
+    await sendOutbound(from, outbound, {
+      businessAccountId,
+      purpose: "order_status_reply",
+    });
+    return {
+      customer: updatedCustomer,
+      order: latestOrder,
+      messages: outbound,
+      handoffRequired: false,
+      handoffReason: "",
+    };
+  }
+
+  const product = findProduct(catalog, text, source, customer.productId);
+  const productNameOpening = isProductNameMessage(product, text);
+  const messageSource = productNameOpening ? { ...source, productNameMatch: true } : source;
+  const fixedOpeningFlow = usesFixedOpeningFlow(customer, text, messageSource);
+  const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse
+    ? null
+    : findApprovedFaqLocalMatch(catalog, product, text, { faqLibrary });
+  const exactSalesReply = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq
+    ? null
+    : findSalesReplyExactMatch(catalog, product, text, { salesReplyLibrary });
+  const approvedFaqMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
+    ? null
+    : await maybeSelectApprovedFaq({ customerMessage: text, product });
+  const productFactMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || approvedFaqMatch
+    ? null
+    : await maybeSelectProductFact({ customerMessage: text, product });
+  const salesReplyMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch || approvedFaqMatch
+    ? null
+    : await maybeSelectSalesReply({ customerMessage: text, product });
+  const ragAnswer = null;
+  if (fixedOpeningFlow) {
+    console.log(`Skipping OpenAI for fixed opening flow to ${from}`);
+  }
+  if (faqSalesResponse) {
+    console.log(`Skipping OpenAI for Package B interest response from ${from}: ${faqSalesResponse}`);
+  }
+  const plan = await buildConversationPlan({
+    catalog,
+    customer,
+    customerMessage: text,
+    source: messageSource,
+    faqLibrary,
+    salesReplyLibrary,
+    productFactMatch,
+    approvedFaqMatch,
+    salesReplyMatch,
+    ragAnswer,
+  });
+
+  const updatedCustomer = await store.updateCustomer(from, () => plan.customerPatch || {}, businessAccountId);
+  let order = null;
+  if (plan.order) {
+    order = await store.addOrder({ ...plan.order, businessAccountId });
+  }
+
+  if (plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(plan.adminMessage);
+  }
+
+  if (plan.handoffRequired && !plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(`Human handoff requested for ${from}: ${plan.handoffReason || "No reason supplied."}`);
+  }
+
+  const outbound = clampMessages(order ? orderSubmittedCustomerMessages() : plan.messages);
+  await sendOutbound(from, outbound, { businessAccountId });
+
+  return {
+    customer: updatedCustomer,
+    order,
+    messages: outbound,
+    handoffRequired: Boolean(plan.handoffRequired),
+    handoffReason: plan.handoffReason || "",
+  };
+}
+
+async function maybeDetectOrderStatusIntent(customerMessage) {
+  if (!config.openaiApiKey) return isLikelyOrderStatusQuestion(customerMessage);
+  try {
+    return await detectOrderStatusIntent({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      customerMessage,
+    });
+  } catch (error) {
+    await recordSystemError("order_status_intent", error, "Unable to classify order-status enquiry.");
+    return isLikelyOrderStatusQuestion(customerMessage);
+  }
+}
+
+async function maybeDetectComplaintIntent(customerMessage) {
+  if (!config.openaiApiKey) return detectObviousComplaint(customerMessage);
+  try {
+    return await detectComplaintIntent({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      customerMessage,
+    });
+  } catch (error) {
+    await recordSystemError("complaint_intent", error, "Unable to classify complaint enquiry.");
+    return detectObviousComplaint(customerMessage);
+  }
+}
+
+async function maybeSelectProductFact({ customerMessage, product }) {
+  if (!config.openaiApiKey) return null;
+  if (isBusinessOrLogisticsQuestion(customerMessage)) return null;
+  if (isUsageDurationQuestion(customerMessage)) return null;
+  if (isProductOriginQuestion(customerMessage)) return null;
+  const records = approvedProductFactRecordsForProduct(product);
+  if (!records.length) return null;
+  try {
+    const retrievedRecords = await retrieveProductFactRecords({
+      records,
+      customerMessage,
+      productName: product.name,
+      embedTexts: embedKnowledgeTexts,
+      topK: 20,
+    });
+    if (!retrievedRecords.length) return null;
+    const rerankedRecords = await rerankProductFacts({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      customerMessage,
+      productName: product.name,
+      factRecords: retrievedRecords,
+      topK: 5,
+    });
+    if (!rerankedRecords.length) return null;
+    const match = await selectProductFact({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      customerMessage,
+      productName: product.name,
+      factRecords: rerankedRecords,
+    });
+    if (!match) return null;
+    const fact = records.find((item) => item.id === match.factId);
+    if (!fact) return null;
+    const retrieved = rerankedRecords.find((item) => item.id === fact.id) ||
+      retrievedRecords.find((item) => item.id === fact.id);
+    const generatedReply = fact.kind === "image_chunk"
+      ? await createProductFactReply({
+          apiKey: config.openaiApiKey,
+          model: config.openaiModel,
+          customerMessage,
+          productName: product.name,
+          factRecord: fact,
+        })
+      : "";
+    const safeGeneratedReply = sanitizeProductKnowledgeReply(generatedReply);
+    if (fact.kind === "image_chunk" && !safeGeneratedReply) return null;
+    return {
+      factId: fact.id,
+      reply: safeGeneratedReply || fact.approved_reply,
+      reason: match.reason,
+      retrieval: retrieved?.retrieval || "",
+      retrievalScore: retrieved?.retrieval_score || 0,
+      rerankScore: retrieved?.rerank_score || 0,
+      rerankReason: retrieved?.rerank_reason || "",
+    };
+  } catch (error) {
+    await recordSystemError("product_fact_match", error, `Product: ${product.id}`);
+    return null;
+  }
+}
+
+function sanitizeProductKnowledgeReply(reply) {
+  return String(reply || "")
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean)
+    .filter((sentence) => !/\b(claim\s*produk|claimed?|visible text|promotional image|poster|chunk|extracted)\b/i.test(sentence))
+    .filter((sentence) => !/\bblackheads?\s*out\s*in\s*5\s*minutes?\b/i.test(sentence))
+    .join(" ")
+    .trim();
+}
+
+function isBusinessOrLogisticsQuestion(text) {
+  const normalized = String(text || "").toLowerCase();
+  return /\b(area|location|lokasi|alamat|warehouse|kedai|store|shop|delivery|deliver|hantar|perhantaran|penghantaran|shipping|cod|bayar|payment|caj|charge|fee)\b/i.test(normalized);
+}
+
+function isUsageDurationQuestion(text) {
+  const normalized = String(text || "").toLowerCase();
+  return /\b(berapa\s*lama|how\s*long|guna\s*berapa\s*lama|tahan\s*berapa\s*lama|last\s*how\s*long|one\s*bottle|satu\s*botol)\b/i.test(normalized) &&
+    /\b(guna|pakai|use|last|lama|tahan|bottle|botol)\b/i.test(normalized);
+}
+
+function isProductOriginQuestion(text) {
+  const normalized = String(text || "").toLowerCase();
+  return /\b(from\s*where|where\s*(is|are|this|the)?.*(product|barang)|product\s*(from|made)|made\s*in|asal\s*(mana|dari)|dari\s*mana|barang\s*mana|produk\s*(dari|asal))\b/i.test(normalized);
+}
+
+async function maybeSelectApprovedFaq({ customerMessage, product }) {
+  if (!config.openaiApiKey) return null;
+  const faqRecords = approvedFaqRecordsForProduct(catalog, product, {
+    includeGeneral: isGeneralBusinessQuestion(customerMessage),
+    faqLibrary,
+  });
+  if (!faqRecords.length) return null;
+  try {
+    const retrievedRecords = await retrieveFaqRecords({
+      records: faqRecords,
+      customerMessage,
+      productName: product.name,
+      embedTexts: embedKnowledgeTexts,
+      topK: 8,
+    });
+    if (!retrievedRecords.length) return null;
+    const match = await selectApprovedFaq({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      customerMessage,
+      productName: product.name,
+      faqRecords: retrievedRecords,
+    });
+    if (!match) return null;
+    const faq = faqRecords.find((item) => item.id === match.faqId);
+    if (!faq) return null;
+    return {
+      faqId: faq.id,
+      approvedReply: faq.approved_reply,
+      scope: faq.scope,
+      reason: match.reason,
+      retrieval: retrievedRecords.find((item) => item.id === faq.id)?.retrieval || "",
+      retrievalScore: retrievedRecords.find((item) => item.id === faq.id)?.retrieval_score || 0,
+    };
+  } catch (error) {
+    await recordSystemError("approved_faq_match", error, `Product: ${product.id}`);
+    return null;
+  }
+}
+
+async function maybeSelectSalesReply({ customerMessage, product }) {
+  if (!config.openaiApiKey) return null;
+  const records = salesReplyRecordsForProduct(catalog, product, { salesReplyLibrary });
+  if (!records.length) return null;
+  try {
+    const retrievedRecords = await retrieveSalesReplyRecords({
+      records,
+      customerMessage,
+      productName: product.name,
+      embedTexts: embedKnowledgeTexts,
+      topK: 8,
+    });
+    if (!retrievedRecords.length) return null;
+    const match = await selectSalesReply({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      customerMessage,
+      productName: product.name,
+      salesReplyRecords: retrievedRecords,
+    });
+    if (!match) return null;
+    const salesReply = records.find((item) => item.id === match.salesReplyId);
+    if (!salesReply) return null;
+    return {
+      salesReplyId: salesReply.id,
+      approvedReply: salesReply.approved_reply,
+      followupPrompt: salesReply.followup_prompt || "",
+      scope: salesReply.scope,
+      reason: match.reason,
+      retrieval: retrievedRecords.find((item) => item.id === salesReply.id)?.retrieval || "",
+      retrievalScore: retrievedRecords.find((item) => item.id === salesReply.id)?.retrieval_score || 0,
+    };
+  } catch (error) {
+    await recordSystemError("sales_reply_match", error, `Product: ${product.id}`);
+    return null;
+  }
+}
+
+async function embedKnowledgeTexts(texts) {
+  return createEmbeddings({
+    apiKey: config.openaiApiKey,
+    model: config.embeddingModel,
+    input: texts,
+  });
+}
+
+function orderSubmittedCustomerMessages() {
+  return [
+    textMessage("Sorry Dear our stock just finish , I will take order again, will take around 15-18 days for arrived brunei new stock 🥰 But i will try my best to get it quick for you ya."),
+    textMessage("REMINDER ✨: \n-Order after 1 hour cannot be canceled. \n-Brg Sampai baru byr runner"),
+    textMessage("Terima kasih❤️"),
+  ];
+}
+
+function followupTemplateName(followupKey) {
+  return FOLLOWUP_TEMPLATE_BY_KEY[String(followupKey || "")] || "";
+}
+
+function templateMessage(name, languageCode = FOLLOWUP_TEMPLATE_LANGUAGE, components = []) {
+  return {
+    type: "template",
+    name,
+    languageCode,
+    components,
+  };
+}
+
+function requestFollowupRun(now = new Date(), options = {}) {
+  if (followupRunPromise) return followupRunPromise;
+  followupRunPromise = runDueFollowups(now, options).finally(() => {
+    followupRunPromise = null;
+  });
+  return followupRunPromise;
+}
+
+async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
+  if (respectOperationalControl) {
+    const blocked = await liveAutomationBlock();
+    if (blocked) {
+      return {
+        sent: 0,
+        queued: 0,
+        heldForApprovedTemplate: 0,
+        deleted: 0,
+        skipped: await buildFollowupSkippedSummary(now),
+        checkedAt: now.toISOString(),
+        deletedCustomers: [],
+        customers: [],
+        templateRequired: [],
+        templateRequiredCustomers: [],
+        blockedReason: blocked.message,
+      };
+    }
+  }
+  const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
+  const due = await store.getDueFollowups(catalog, now);
+  const sendable = due.filter((item) =>
+    config.demoMode ||
+    isWithinCustomerServiceWindow(item.customer, now) ||
+    Boolean(followupTemplateName(item.followupKey))
+  );
+  const templateRequired = due.filter((item) =>
+    !config.demoMode &&
+    !isWithinCustomerServiceWindow(item.customer, now) &&
+    !followupTemplateName(item.followupKey)
+  );
+  const queued = await operations.enqueueFollowups(
+    sendable.map((item) => ({
+      businessAccountId: item.customer.businessAccountId || config.accountId,
+      customerId: item.customer.id,
+      productId: item.product.id,
+      labelDisplay: item.customer.labelDisplay,
+      followupKey: item.followupKey,
+      message: item.followup.message,
+    })),
+    now
+  );
+  const dispatched = await dispatchFollowupQueue(now);
+  return {
+    sent: dispatched.sent.length,
+    queued: queued.length,
+    queueFailed: dispatched.failed.length,
+    queueCancelled: dispatched.cancelled.length,
+    queueHeldForApprovedTemplate: dispatched.heldForApprovedTemplate.length,
+    heldForApprovedTemplate: templateRequired.length,
+    deleted: deletedCustomers.length,
+    skipped: await buildFollowupSkippedSummary(now),
+    checkedAt: now.toISOString(),
+    deletedCustomers: deletedCustomers.map((customer) => ({
+      customerId: customer.id,
+      label: customer.label,
+      labelDisplay: customer.labelDisplay,
+      deleteReason: customer.deleteReason,
+    })),
+    customers: dispatched.sent,
+    templateRequired: templateRequired.map((item) => ({
+      customerId: item.customer.id,
+      label: item.customer.label,
+      labelDisplay: item.customer.labelDisplay,
+      followupKey: item.followupKey,
+      productId: item.product.id,
+    })),
+    templateRequiredCustomers: templateRequired.map((item) => ({
+      customerId: item.customer.id,
+      label: item.customer.label,
+      labelDisplay: item.customer.labelDisplay,
+      followupKey: item.followupKey,
+      productId: item.product.id,
+      message: item.followup.message,
+    })),
+  };
+}
+
+async function dispatchFollowupQueue(now = new Date()) {
+  const batch = await operations.claimFollowupBatch(Math.max(config.followupSendsPerMinute, 1), now);
+  const customers = await store.listCustomers(now);
+  const customerById = new Map(customers.map((customer) => [customer.id, customer]));
+  const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [] };
+
+  for (const item of batch) {
+    const customer = customerById.get(item.customerId);
+    const sentItem = {
+      customerId: item.customerId,
+      labelDisplay: customer?.labelDisplay || item.labelDisplay,
+      followupKey: item.followupKey,
+      productId: item.productId,
+      message: item.message,
+    };
+    if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "cancelled",
+        lastError: !customer ? "Customer no longer exists." : "Customer ordered or opted out before send.",
+      });
+      result.cancelled.push(sentItem);
+      continue;
+    }
+    if (customer.followupsSent?.[item.followupKey]) {
+      await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: customer.followupsSent[item.followupKey] });
+      continue;
+    }
+    const outsideCustomerServiceWindow = !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
+    const templateName = outsideCustomerServiceWindow ? followupTemplateName(item.followupKey) : "";
+    if (outsideCustomerServiceWindow) {
+      if (templateName) {
+        sentItem.templateName = templateName;
+      } else {
+        await operations.updateFollowupDispatch(item.id, {
+          status: "held_template",
+          lastError: "Approved WhatsApp template required outside the 24-hour customer service window.",
+        });
+        result.heldForApprovedTemplate.push(sentItem);
+        continue;
+      }
+    }
+    try {
+      const outboundMessage = templateName
+        ? templateMessage(templateName, FOLLOWUP_TEMPLATE_LANGUAGE)
+        : textMessage(item.message);
+      await sendOutbound(item.customerId, [outboundMessage], {
+        businessAccountId: item.businessAccountId || config.accountId,
+        purpose: "followup",
+        followupKey: item.followupKey,
+        templateName,
+        skipFailureRecord: true,
+      });
+      await store.markFollowupSent(item.customerId, item.followupKey, now, item.businessAccountId || config.accountId);
+      await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
+      result.sent.push(sentItem);
+    } catch (error) {
+      const retryAt = new Date(now.getTime() + Math.max(config.followupRetryMinutes, 1) * 60 * 1000);
+      await operations.updateFollowupDispatch(item.id, {
+        status: "retry_pending",
+        availableAt: retryAt.toISOString(),
+        lastError: error.message,
+      });
+      result.failed.push(sentItem);
+    }
+  }
+  return result;
+}
+
+async function buildFollowupSkippedSummary(now = new Date()) {
+  const customers = await store.listCustomers(now);
+  const rows = customers.map((customer) => followupGuardrailStatus(customer, now));
+  return {
+    optedOut: rows.filter((row) => row.reason === "opted_out").length,
+    outside24HourWindow: rows.filter((row) => row.reason === "outside_24_hour_window").length,
+    ordered: rows.filter((row) => row.reason === "order_submitted").length,
+  };
+}
+
+async function handleStockArrival(productId, businessAccountId = config.accountId) {
+  const product = catalog.products.find((item) => item.id === productId);
+  if (!product) throw new Error(`Unknown product: ${productId}`);
+  const orders = await store.updateOrdersForStockArrival(productId, businessAccountId, `admin:${businessAccountId}`);
+  const customerIds = [...new Set(orders.map((order) => order.customerId))];
+  for (const customerId of customerIds) {
+    await sendOutbound(customerId, [textMessage(formatStockArrivalMessage(product))], { businessAccountId });
+  }
+  await notifyAdmin(`Stock arrival message sent to ${customerIds.length} customer(s) for ${product.name}.`);
+  return { productId, notifiedCustomers: customerIds, updatedOrders: orders.length };
+}
+
+async function generateTestCustomers(count = 100, now = new Date()) {
+  const product = catalog.products.find((item) => item.id === catalog.default_product_id) || catalog.products[0];
+  const packageB = product.packages?.find((item) => item.id === "B") || product.packages?.[0] || {};
+  const outboxBuffer = [];
+  const stats = {
+    requested: count,
+    createdCustomers: 0,
+    orders: 0,
+    optedOut: 0,
+    replied: 0,
+    ignored: 0,
+    followupFirstSent: 0,
+    followupSecondSent: 0,
+    followupLaterSent: 0,
+    followupReplies: 0,
+    handoff: 0,
+    lowInterestBlocked: 0,
+    scenarios: {},
+  };
+  const batchId = Date.now();
+
+  simulatedOutboxBuffer = outboxBuffer;
+  try {
+    for (let index = 0; index < count; index += 1) {
+    const customerId = `sim_customer_${batchId}_${String(index + 1).padStart(3, "0")}`;
+    const firstSeenAt = randomDateWithinDays(now, 10, index);
+    const scenario = testScenario(index);
+    stats.scenarios[scenario] = (stats.scenarios[scenario] || 0) + 1;
+    const basePatch = {
+      businessAccountId: config.accountId,
+      firstSeenAt: firstSeenAt.toISOString(),
+      lastMessageAt: firstSeenAt.toISOString(),
+      lastInboundAt: firstSeenAt.toISOString(),
+      inboundCount: 1,
+      source: { referralHeadline: "Facebook ad blackhead remover", testBatchId: String(batchId) },
+      productId: product.id,
+      followupsSent: {},
+      orderIds: [],
+      pendingOrder: null,
+      handoffStatus: "",
+      handoffReason: "",
+    };
+
+    await store.getOrCreateCustomer(customerId, basePatch);
+    await appendSimInbound(customerId, firstSeenAt, "Assalamualaikum, saya berminat");
+    const flowEndAt = await appendSimOpeningFlow(customerId, firstSeenAt, product);
+    stats.createdCustomers += 1;
+
+    if (scenario === "order_complete") {
+      const intentAt = addMinutes(flowEndAt, 6);
+      const detailsAt = addMinutes(intentAt, 3);
+      const order = await appendSimOrderConversation({
+        batchId,
+        index,
+        customerId,
+        product,
+        packageItem: packageB,
+        intentAt,
+        detailsAt,
+      });
+      await store.updateCustomer(customerId, () => ({
+        lastMessageAt: detailsAt.toISOString(),
+        lastInboundAt: detailsAt.toISOString(),
+        inboundCount: 3,
+        handoffStatus: "human_required",
+        handoffReason: "Customer submitted complete order details.",
+      }));
+      await appendSimAdmin(
+        addSeconds(detailsAt, 14),
+        `New simulated order needs human processing for ${customerId}: ${order.packageName} ${order.packagePrice}.`
+      );
+      stats.orders += 1;
+      stats.replied += 1;
+      stats.handoff += 1;
+      continue;
+    }
+
+    if (scenario === "order_after_followup") {
+      const followupResult = await appendSimDueFollowups({
+        customerId,
+        product,
+        firstSeenAt,
+        now,
+        maxMessages: 10,
+        simulateTemplateWindow: true,
+      });
+      const intentAt = addMinutes(followupResult.lastSentAt || flowEndAt, 42);
+      const detailsAt = addMinutes(intentAt, 4);
+      const order = await appendSimOrderConversation({
+        batchId,
+        index,
+        customerId,
+        product,
+        packageItem: packageB,
+        intentAt,
+        detailsAt,
+      });
+      await store.updateCustomer(customerId, () => ({
+        followupsSent: followupResult.followupsSent,
+        lastMessageAt: detailsAt.toISOString(),
+        lastInboundAt: detailsAt.toISOString(),
+        inboundCount: 3,
+        handoffStatus: "human_required",
+        handoffReason: "Customer submitted complete order details.",
+      }));
+      await appendSimAdmin(
+        addSeconds(detailsAt, 14),
+        `New simulated order after follow-up for ${customerId}: ${order.packageName} ${order.packagePrice}.`
+      );
+      stats.orders += 1;
+      stats.replied += 1;
+      stats.followupReplies += 1;
+      stats.handoff += 1;
+      stats.followupFirstSent += followupResult.firstSent;
+      stats.followupSecondSent += followupResult.secondSent;
+      stats.followupLaterSent += followupResult.laterSent;
+      continue;
+    }
+
+    if (scenario === "opted_out_exact" || scenario === "opted_out_semantic") {
+      const optOutAt = addMinutes(flowEndAt, 8);
+      const optOutText = scenario === "opted_out_exact" ? "stop" : "saya inda mau kana contact lagi";
+      await appendSimInbound(customerId, optOutAt, optOutText);
+      await appendSimOutbound(customerId, addSeconds(optOutAt, 5), "Noted kita, kami tidak akan follow up lagi. Terima kasih.");
+      await store.updateCustomer(customerId, () => ({
+        optedOut: true,
+        optedOutAt: optOutAt.toISOString(),
+        followupBlocked: true,
+        followupBlockedReason: "simulated opt-out",
+        lastMessageAt: optOutAt.toISOString(),
+        lastInboundAt: optOutAt.toISOString(),
+        inboundCount: 2,
+      }));
+      stats.optedOut += 1;
+      stats.replied += 1;
+      continue;
+    }
+
+    if (scenario === "low_interest") {
+      const replyAt = addMinutes(flowEndAt, 9);
+      await appendSimInbound(customerId, replyAt, "Nanti dulu saya fikir dulu");
+      await appendSimOutbound(
+        customerId,
+        addSeconds(replyAt, 5),
+        "Baik kita, no worries. Kalau berminat nanti, kita boleh message kami semula."
+      );
+      const followupResult = await appendSimDueFollowups({
+        customerId,
+        product,
+        firstSeenAt,
+        now,
+        maxMessages: 10,
+        simulateTemplateWindow: true,
+      });
+      await store.updateCustomer(customerId, () => ({
+        followupsSent: followupResult.followupsSent,
+        lastMessageAt: replyAt.toISOString(),
+        lastInboundAt: replyAt.toISOString(),
+        inboundCount: 2,
+        followupBlockedReason: "possible_opt_out_or_low_interest",
+      }));
+      stats.replied += 1;
+      stats.followupFirstSent += followupResult.firstSent;
+      stats.followupSecondSent += followupResult.secondSent;
+      stats.followupLaterSent += followupResult.laterSent;
+      continue;
+    }
+
+    if (scenario === "sales_response") {
+      const replyAt = addMinutes(flowEndAt, 7);
+      await appendSimInbound(customerId, replyAt, "Tanya dulu");
+      await appendSimOutbound(customerId, addSeconds(replyAt, 5), "Buleh tau apa yg kita fikir? Ada rasa nak tunggu payday?");
+      const followupResult = await appendSimDueFollowups({
+        customerId,
+        product,
+        firstSeenAt,
+        now,
+        maxMessages: 10,
+        simulateTemplateWindow: true,
+      });
+      await store.updateCustomer(customerId, () => ({
+        followupsSent: followupResult.followupsSent,
+        lastMessageAt: replyAt.toISOString(),
+        lastInboundAt: replyAt.toISOString(),
+        inboundCount: 2,
+      }));
+      stats.replied += 1;
+      stats.followupFirstSent += followupResult.firstSent;
+      stats.followupSecondSent += followupResult.secondSent;
+      stats.followupLaterSent += followupResult.laterSent;
+      continue;
+    }
+
+    if (scenario === "faq_location") {
+      const replyAt = addMinutes(flowEndAt, 7);
+      await appendSimInbound(customerId, replyAt, "Business location kat mana?");
+      await appendSimOutbound(
+        customerId,
+        addSeconds(replyAt, 5),
+        "Warehouse at bandar. Tapi skrg buleh proceed delivery dgn MP service saja"
+      );
+      const followupResult = await appendSimDueFollowups({
+        customerId,
+        product,
+        firstSeenAt,
+        now,
+        maxMessages: 10,
+        simulateTemplateWindow: true,
+      });
+      await store.updateCustomer(customerId, () => ({
+        followupsSent: followupResult.followupsSent,
+        lastMessageAt: replyAt.toISOString(),
+        lastInboundAt: replyAt.toISOString(),
+        inboundCount: 2,
+      }));
+      stats.replied += 1;
+      stats.followupFirstSent += followupResult.firstSent;
+      stats.followupSecondSent += followupResult.secondSent;
+      stats.followupLaterSent += followupResult.laterSent;
+      continue;
+    }
+
+    if (scenario === "normal_faq") {
+      const replyAt = addMinutes(flowEndAt, 7);
+      await appendSimInbound(customerId, replyAt, "Boleh COD kah?");
+      await appendSimOutbound(customerId, addSeconds(replyAt, 5), "Boleh, COD to all Brunei.");
+      const followupResult = await appendSimDueFollowups({
+        customerId,
+        product,
+        firstSeenAt,
+        now,
+        maxMessages: 10,
+        simulateTemplateWindow: true,
+      });
+      await store.updateCustomer(customerId, () => ({
+        followupsSent: followupResult.followupsSent,
+        lastMessageAt: replyAt.toISOString(),
+        lastInboundAt: replyAt.toISOString(),
+        inboundCount: 2,
+      }));
+      stats.replied += 1;
+      stats.followupFirstSent += followupResult.firstSent;
+      stats.followupSecondSent += followupResult.secondSent;
+      stats.followupLaterSent += followupResult.laterSent;
+      continue;
+    }
+
+    if (scenario === "unknown_handoff") {
+      const replyAt = addMinutes(flowEndAt, 7);
+      await appendSimInbound(customerId, replyAt, "Boleh guna kalau ada skin allergy teruk?");
+      await appendSimOutbound(
+        customerId,
+        addSeconds(replyAt, 5),
+        "Terima kasih kita. Saya akan minta team check dan reply kita sekejap lagi."
+      );
+      await appendSimAdmin(
+        addSeconds(replyAt, 8),
+        `Human handoff requested for ${customerId}: No matching sales response, FAQ, or RAG answer.`
+      );
+      await store.updateCustomer(customerId, () => ({
+        lastMessageAt: replyAt.toISOString(),
+        lastInboundAt: replyAt.toISOString(),
+        inboundCount: 2,
+        handoffStatus: "human_required",
+        handoffReason: "No matching sales response, FAQ, or RAG answer.",
+      }));
+      stats.replied += 1;
+      stats.handoff += 1;
+      continue;
+    }
+
+    if (scenario === "followup_reply") {
+      const followupResult = await appendSimDueFollowups({
+        customerId,
+        product,
+        firstSeenAt,
+        now,
+        maxMessages: 10,
+        simulateTemplateWindow: true,
+      });
+      const replyAt = addMinutes(followupResult.lastSentAt || flowEndAt, 36);
+      await appendSimInbound(customerId, replyAt, "Masih ada promo?");
+      await appendSimOutbound(
+        customerId,
+        addSeconds(replyAt, 5),
+        "Masih ada kita. Package B masih promo B$70 dapat 4 unit, free delivery & COD."
+      );
+      await store.updateCustomer(customerId, () => ({
+        followupsSent: followupResult.followupsSent,
+        lastMessageAt: replyAt.toISOString(),
+        lastInboundAt: replyAt.toISOString(),
+        inboundCount: 2,
+      }));
+      stats.replied += 1;
+      stats.followupReplies += 1;
+      stats.followupFirstSent += followupResult.firstSent;
+      stats.followupSecondSent += followupResult.secondSent;
+      stats.followupLaterSent += followupResult.laterSent;
+      continue;
+    }
+
+    const followupResult = await appendSimDueFollowups({
+      customerId,
+      product,
+      firstSeenAt,
+      now,
+      maxMessages: 10,
+      simulateTemplateWindow: true,
+    });
+    await store.updateCustomer(customerId, () => ({ followupsSent: followupResult.followupsSent }));
+    stats.followupFirstSent += followupResult.firstSent;
+    stats.followupSecondSent += followupResult.secondSent;
+    stats.followupLaterSent += followupResult.laterSent;
+    stats.ignored += 1;
+  }
+
+    await store.appendOutboxMany(outboxBuffer);
+    simulatedOutboxBuffer = null;
+
+    await store.appendAuditLog({
+      action: "generate_test_customers",
+      result: "completed",
+      reason: `Generated ${count} local simulated customer(s)`,
+    });
+
+    return { ok: true, generatedAt: new Date().toISOString(), batchId, outboxMessages: outboxBuffer.length, ...stats };
+  } finally {
+    simulatedOutboxBuffer = null;
+  }
+}
+
+async function appendSimOpeningFlow(customerId, firstSeenAt, product) {
+  const openingFlow = product.opening_flow?.length
+    ? product.opening_flow
+    : [{ type: "text", body: `Assalamualaikum kita nama saya Fadilah, skrg saya share info utk ${product.name}` }];
+  let lastAt = addSeconds(firstSeenAt, 2);
+  for (const [messageIndex, message] of openingFlow.entries()) {
+    lastAt = addSeconds(firstSeenAt, 2 + messageIndex * 3);
+    await appendSimMessage({
+      createdAt: lastAt.toISOString(),
+      direction: "outbound",
+      from: "ai_agent",
+      to: customerId,
+      channel: "customer",
+      type: message.type || "text",
+      body: message.body || "",
+      url: message.url || "",
+      caption: message.caption || "",
+    });
+  }
+  return lastAt;
+}
+
+async function appendSimOrderConversation({ batchId, index, customerId, product, packageItem, intentAt, detailsAt }) {
+  await appendSimInbound(customerId, intentAt, `Saya mau order Package ${packageItem.id || "B"}`);
+  await appendSimOutbound(customerId, addSeconds(intentAt, 5), "Noted and thank you.");
+  await appendSimOutbound(
+    customerId,
+    addSeconds(intentAt, 9),
+    "Can you help me fill up this details for hold promo? 🥰 \n\n✅ Full name : \n🏠 Full address : \n📱 Phone number : \n\nOrder Package :"
+  );
+
+  const phone = `6738${String(100000 + index).slice(-6)}`;
+  const rawMessage = [
+    `Full name: Test Customer ${index + 1}`,
+    `Full address: Simpang ${index + 10}, Bandar Seri Begawan, Brunei`,
+    `Phone number: ${phone}`,
+    `Order Package: ${packageItem.id || "B"}`,
+  ].join("\n");
+  await appendSimInbound(customerId, detailsAt, rawMessage);
+  await appendSimOutbound(
+    customerId,
+    addSeconds(detailsAt, 5),
+    "Sorry Dear our stock just finish , it will take order again, will take around 15-18 days for arrived brunei new stock 🥰\n\nREMINDER : ORDER AFTER 1 HOURS CANNOT BE CANCEL"
+  );
+  await appendSimOutbound(
+    customerId,
+    addSeconds(detailsAt, 9),
+    "But i will proceed system for COD service 🥰\n\nBrg Sampai baru byr runner"
+  );
+
+  return store.addOrder({
+    businessAccountId: config.accountId,
+    id: `ord_sim_${batchId}_${String(index + 1).padStart(3, "0")}`,
+    customerId,
+    productId: product.id,
+    productName: product.name,
+    shoppingLink: product.shopping_link || "",
+    packageId: packageItem.id || "B",
+    packageName: packageItem.name || "Package B",
+    packagePrice: packageItem.price || "B$70",
+    quantity: packageItem.total_units || 4,
+    name: `Test Customer ${index + 1}`,
+    phone,
+    address: `Simpang ${index + 10}, Bandar Seri Begawan, Brunei`,
+    rawMessage,
+    createdAt: detailsAt.toISOString(),
+    updatedAt: detailsAt.toISOString(),
+  });
+}
+
+async function appendSimDueFollowups({
+  customerId,
+  product,
+  firstSeenAt,
+  now,
+  maxMessages = 2,
+  simulateTemplateWindow = false,
+}) {
+  const followupsSent = {};
+  let sent = 0;
+  let firstSent = 0;
+  let secondSent = 0;
+  let laterSent = 0;
+  let lastSentAt = null;
+  const baseCustomer = {
+    firstSeenAt: firstSeenAt.toISOString(),
+    lastInboundAt: firstSeenAt.toISOString(),
+  };
+
+  for (const item of productFollowupSequence(product)) {
+    if (sent >= maxMessages) break;
+    const dueAt = followupDueAt(firstSeenAt, item);
+    if (dueAt > now) continue;
+    if (!simulateTemplateWindow && !isWithinCustomerServiceWindow(baseCustomer, dueAt)) continue;
+    await appendSimOutbound(customerId, dueAt, item.followup?.message || "");
+    followupsSent[item.key] = dueAt.toISOString();
+    sent += 1;
+    lastSentAt = dueAt;
+    if (item.key === "first_day_followup") firstSent += 1;
+    else if (item.key === "day_1_followup") secondSent += 1;
+    else laterSent += 1;
+  }
+
+  return { followupsSent, firstSent, secondSent, laterSent, lastSentAt };
+}
+
+async function appendSimInbound(customerId, createdAt, body) {
+  await appendSimMessage({
+    createdAt: createdAt.toISOString(),
+    direction: "inbound",
+    from: customerId,
+    to: "agent",
+    channel: "customer",
+    type: "text",
+    body,
+  });
+}
+
+async function appendSimOutbound(customerId, createdAt, body) {
+  await appendSimMessage({
+    createdAt: createdAt.toISOString(),
+    direction: "outbound",
+    from: "ai_agent",
+    to: customerId,
+    channel: "customer",
+    type: "text",
+    body,
+  });
+}
+
+async function appendSimAdmin(createdAt, body) {
+  await appendSimMessage({
+    createdAt: createdAt.toISOString(),
+    direction: "outbound",
+    from: "ai_agent",
+    to: "admin",
+    channel: "admin",
+    type: "text",
+    body,
+  });
+}
+
+async function appendSimMessage(message) {
+  if (simulatedOutboxBuffer) {
+    simulatedOutboxBuffer.push(message);
+    return;
+  }
+  await store.appendOutbox(message);
+}
+
+async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId) {
+  const [
+    allCustomers,
+    allDeletedCustomers,
+    allOrders,
+    allOutbox,
+    noReplyReviews,
+    systemState,
+    allFollowupQueue,
+    orderStatusReplies,
+    allComplaintCases,
+    complaintSettings,
+  ] = await Promise.all([
+    store.listCustomers(now),
+    store.listDeletedCustomers(),
+    store.listOrders(),
+    store.listOutbox(),
+    operations.listNoReplyReviews(),
+    operations.getState(),
+    operations.listFollowupQueue(),
+    store.getOrderStatusReplies(businessAccountId),
+    store.listComplaintCases(businessAccountId),
+    store.getComplaintSettings(businessAccountId),
+  ]);
+  const belongsToBusiness = (item) => (item.businessAccountId || config.accountId) === businessAccountId;
+  const belongsToDashboard = (item) =>
+    belongsToBusiness(item) &&
+    (item.businessAccountId || "") !== DEMO_ACCOUNT_ID &&
+    !isDemoEnvironmentCustomerId(item.id || item.customerId || item.from || item.to);
+  const belongsToDashboardOrder = (item) =>
+    belongsToDashboard(item) || DASHBOARD_DEMO_ORDER_IDS.has(String(item.id || ""));
+  const customers = allCustomers.filter(belongsToDashboard);
+  const deletedCustomers = allDeletedCustomers.filter(belongsToDashboard);
+  const orders = allOrders.filter(belongsToDashboardOrder);
+  const followupQueue = allFollowupQueue.filter(belongsToDashboard);
+  const complaintCases = allComplaintCases.filter(belongsToDashboard);
+  const customerIds = new Set(customers.map((customer) => customer.id));
+  const outbox = allOutbox.filter((message) =>
+    !isDemoEnvironmentCustomerId(message.from) &&
+    !isDemoEnvironmentCustomerId(message.to) &&
+    (message.businessAccountId
+      ? message.businessAccountId === businessAccountId && message.businessAccountId !== DEMO_ACCOUNT_ID
+      : customerIds.has(message.to) || customerIds.has(message.from))
+  );
+  const productById = new Map(catalog.products.map((product) => [product.id, product]));
+  const ordersByCustomer = groupBy(orders, (order) => order.customerId);
+  const guardrails = buildGuardrailSummary(customers, now);
+  const noReplyAlerts = buildNoReplyRows(
+    customers,
+    outbox,
+    productById,
+    noReplyReviews,
+    now,
+    systemState.noReplyMonitorStartedAt
+  );
+  const followupRows = buildFollowupRows(customers, productById, now, followupQueue);
+  const pendingFollowupDispatches = followupQueue.filter((item) =>
+    ["queued", "processing", "retry_pending"].includes(item.status)
+  ).length;
+  const customerRows = customers.map((customer) => {
+    const customerOrders = ordersByCustomer.get(customer.id) || [];
+    const latestOrder = customerOrders.at(-1) || {};
+    return {
+      id: customer.id,
+      name: latestOrder.name || "",
+      whatsappId: customer.id,
+      product: productById.get(customer.productId)?.name || customer.productId || "",
+      label: customer.label,
+      labelDisplay: customer.labelDisplay,
+      lastMessageAt: customer.lastMessageAt || "",
+      firstSeenAt: customer.firstSeenAt || "",
+      inboundCount: Number(customer.inboundCount || 0),
+      status: conversationStatus(customer, customerOrders),
+      handoffReason: customer.handoffReason || "",
+      guardrail: guardrailDisplay(customer, now),
+      optedOut: Boolean(customer.optedOut),
+      orderCount: customerOrders.length,
+    };
+  });
+
+  const handoffQueue = [
+    ...complaintCases
+      .filter((complaint) => complaint.status !== "resolved")
+      .map((complaint) => ({
+        type: "complaint",
+        caseId: complaint.id,
+        customerId: complaint.customerId,
+        product: productById.get(complaint.productId)?.name || complaint.productId || "",
+        category: complaintCategoryDisplay(complaint.category),
+        customerMessage: complaint.customerMessage,
+        status: complaint.status,
+        reason: complaint.reason || "Complaint requires human reply.",
+        createdAt: complaint.createdAt,
+      })),
+    ...customers
+      .filter((customer) => customer.handoffStatus === "human_required" && customer.complaintStatus !== "open")
+      .map((customer) => ({
+        type: "conversation",
+        customerId: customer.id,
+        product: productById.get(customer.productId)?.name || customer.productId || "",
+        reason: customer.handoffReason || "Human review needed",
+        createdAt: customer.lastMessageAt || customer.firstSeenAt || "",
+      })),
+    ...orders.filter((order) => order.status === "pending_admin_order").map((order) => ({
+      type: "order",
+      customerId: order.customerId,
+      product: order.productName || productById.get(order.productId)?.name || order.productId || "",
+      reason: "Awaiting order processing",
+      createdAt: order.createdAt || "",
+      orderId: order.id,
+    })),
+  ].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+
+  return {
+    generatedAt: now.toISOString(),
+    summary: {
+      customers: customers.length,
+      handoff: handoffQueue.length,
+      complaints: complaintCases.filter((complaint) => complaint.status !== "resolved").length,
+      orders: orders.length,
+      followupsDue: followupRows.filter((row) => row.status === "due").length,
+      followupsQueued: pendingFollowupDispatches,
+      deleted: deletedCustomers.length,
+      outbox: outbox.length,
+      optedOut: guardrails.optedOut,
+      blockedFollowups: guardrails.blockedFollowups,
+      noReplyAlerts: noReplyAlerts.length,
+    },
+    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate }),
+    profile: normalizeDashboardProfile(systemState.dashboardProfile),
+    orderStatusOptions: ORDER_STATUS_OPTIONS,
+    orderStatusReplies,
+    complaintSettings,
+    guardrails,
+    customers: customerRows,
+    noReplyAlerts,
+    handoffQueue,
+    orders: orders.map((order) => ({
+      id: order.id,
+      customerId: order.customerId,
+      businessAccountId: order.businessAccountId || "",
+      package: order.orderOptionName || order.packageName || order.orderOptionId || order.packageId || "",
+      packagePrice: order.orderOptionPrice || order.packagePrice || "",
+      quantity: order.quantity || "",
+      totalSales: formatCurrency(orderSalesAmount(order)),
+      name: order.name || "",
+      phone: order.phone || "",
+      address: order.address || "",
+      product: order.productName || productById.get(order.productId)?.name || order.productId || "",
+      status: order.status || "",
+      statusDisplay: orderStatusDisplay(order.status),
+      statusUpdatedAt: order.statusUpdatedAt || order.updatedAt || "",
+      statusHistory: order.statusHistory || [],
+      acknowledgedAt: order.acknowledgedAt || "",
+      completedAt: order.completedAt || "",
+      createdAt: order.createdAt || "",
+      orderTimestamp: order.createdAt || "",
+      orderRecord: formatOrderRecord(order, productById),
+      rawMessage: order.rawMessage || "",
+    })),
+    orderCustomers: orders.map((order) => ({
+      id: order.id,
+      customerId: order.customerId,
+      businessAccountId: order.businessAccountId || "",
+      product: order.productName || productById.get(order.productId)?.name || order.productId || "",
+      package: order.orderOptionName || order.packageName || order.orderOptionId || order.packageId || "",
+      packagePrice: order.orderOptionPrice || order.packagePrice || "",
+      addOnChoice: order.addOnChoice || "",
+      quantity: order.quantity || "",
+      name: order.name || "",
+      phone: order.phone || "",
+      address: order.address || "",
+      status: order.status || "",
+      statusDisplay: orderStatusDisplay(order.status),
+      statusUpdatedAt: order.statusUpdatedAt || order.updatedAt || "",
+      createdAt: order.createdAt || "",
+      orderTimestamp: order.createdAt || "",
+    })),
+    orderCustomerCount: new Set(orders.map((order) => order.customerId).filter(Boolean)).size,
+    followups: followupRows,
+    followupQueue: followupQueue.slice(0, 250),
+    deletedCustomers: deletedCustomers.map((customer) => ({
+      id: customer.id,
+      product: productById.get(customer.productId)?.name || customer.productId || "",
+      label: customer.label,
+      labelDisplay: customer.labelDisplay || "DELETE",
+      firstSeenAt: customer.firstSeenAt || "",
+      deletedAt: customer.deletedAt || "",
+      deleteReason: customer.deleteReason || "",
+    })),
+    conversationMessages: outbox
+      .slice()
+      .slice(-5000)
+      .map(formatDashboardMessage),
+    outbox: outbox
+      .slice()
+      .reverse()
+      .slice(0, 200)
+      .map(formatDashboardMessage),
+  };
+}
+
+function buildNoReplyRows(customers, outbox, productById, reviews = [], now = new Date(), monitoringStartedAt = "") {
+  const resolvedKeys = new Set(
+    reviews.filter((review) => review.status === "resolved").map((review) => `${review.customerId}:${review.inboundMessageId}`)
+  );
+  const thresholdMs = Math.max(Number(config.noReplyAlertMinutes || 2), 1) * 60 * 1000;
+  return customers.flatMap((customer) => {
+    const messages = outbox
+      .filter((message) => message.from === customer.id || message.to === customer.id)
+      .slice()
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    const latestInbound = messages.slice().reverse().find((message) => message.direction === "inbound");
+    if (!latestInbound || resolvedKeys.has(`${customer.id}:${latestInbound.id}`)) return [];
+    if (monitoringStartedAt && String(latestInbound.createdAt) < String(monitoringStartedAt)) return [];
+    const hasReply = messages.some(
+      (message) =>
+        message.direction === "outbound" &&
+        message.channel !== "admin" &&
+        message.to === customer.id &&
+        String(message.createdAt) > String(latestInbound.createdAt)
+    );
+    if (hasReply) return [];
+    const waitedMs = now.getTime() - new Date(latestInbound.createdAt).getTime();
+    if (!Number.isFinite(waitedMs) || waitedMs < thresholdMs) return [];
+    return [{
+      customerId: customer.id,
+      inboundMessageId: latestInbound.id,
+      product: productById.get(customer.productId)?.name || customer.productId || "",
+      labelDisplay: customer.labelDisplay || "",
+      receivedAt: latestInbound.createdAt || "",
+      waitingMinutes: Math.max(1, Math.floor(waitedMs / (60 * 1000))),
+      customerMessage: latestInbound.body || latestInbound.caption || "",
+      reason: customer.handoffReason || "No recorded AI reply after this customer message.",
+      handoffStatus: customer.handoffStatus || "",
+    }];
+  }).sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)));
+}
+
+async function buildComplianceData() {
+  const customers = await store.listCustomers();
+  const guardrails = buildGuardrailSummary(customers);
+  return {
+    generatedAt: new Date().toISOString(),
+    retentionPolicy: [
+      {
+        item: "No-reply leads",
+        rule: "Delete from active customers on DAY 11 if the customer never replied after the first product info/images flow and has no order.",
+      },
+      {
+        item: "Message log",
+        rule: "Demo keeps messages locally. Production recommendation: retain 30-90 days unless needed for disputes or legal/accounting reasons.",
+      },
+      {
+        item: "Orders",
+        rule: "Keep only data needed for fulfilment, delivery, refund, and accounting. Review retention before launch.",
+      },
+      {
+        item: "Deleted customers",
+        rule: "Keep minimal audit data only: customer id, deleted time, reason. Avoid keeping full chat forever.",
+      },
+    ],
+    securityChecklist: [
+      { item: "HTTPS in production", status: "required" },
+      { item: "Meta webhook signature verification", status: config.appSecret ? "configured" : "needs WHATSAPP_APP_SECRET" },
+      { item: "Secrets stored outside code", status: "use .env or production secret manager" },
+      { item: "Admin login", status: "configured for demo; set ADMIN_PASSWORD before production" },
+      { item: "Admin roles and 2FA", status: "production hardening step" },
+      { item: "Database encryption and backups", status: "next production step" },
+      { item: "Restrict dashboard access", status: "next production step" },
+    ],
+    automationGuardrails: [
+      { item: "Opt-out detection", status: "enabled for exact keywords plus similar meaning in English, Malay, and Brunei Malay" },
+      { item: "Possible opt-out or low-interest wording", status: "uncertain meanings are noted, but follow-up continues unless customer clearly opts out" },
+      { item: "Opted-out customers", status: `${guardrails.optedOut} active customer(s)` },
+      { item: "Follow-up cap", status: guardrails.followupCap },
+      { item: "24-hour window", status: guardrails.windowRule },
+      { item: "Template-required follow-ups", status: `${guardrails.outside24HourWindow} customer(s) currently outside 24h window` },
+      { item: "Follow-up dispatch throttling", status: `queued and sent at up to ${Math.max(config.followupSendsPerMinute, 1)} message(s) per minute` },
+      { item: "Human handoff", status: `${guardrails.humanRequired} customer(s) require human review; complaint cases pause follow-ups until resolved` },
+      { item: "Order status lookup", status: "answers only from the current business account and customer WhatsApp ID" },
+      { item: "Block/report risk monitor", status: "production step: connect Meta quality rating, blocks, and reports once WhatsApp API is live" },
+      { item: "Message quality", status: "avoid misleading claims, fake scarcity, and restricted product claims" },
+      { item: "Official API", status: "use WhatsApp Business Platform/API; avoid WhatsApp Web scraping/bulk sender tools" },
+    ],
+    whatsappReadiness: [
+      { item: "Demo mode disabled", status: config.demoMode ? "not ready: DEMO_MODE=true" : "ready" },
+      { item: "Phone number ID", status: config.phoneNumberId ? "configured" : "missing WHATSAPP_PHONE_NUMBER_ID" },
+      { item: "Access token", status: config.accessToken ? "configured" : "missing WHATSAPP_ACCESS_TOKEN" },
+      { item: "Webhook verify token", status: config.verifyToken ? "configured" : "missing WHATSAPP_VERIFY_TOKEN" },
+      { item: "App secret signature check", status: config.appSecret ? "configured" : "missing WHATSAPP_APP_SECRET" },
+      { item: "Public HTTPS base URL for images", status: config.publicBaseUrl ? "configured" : "missing PUBLIC_BASE_URL" },
+      { item: "Admin WhatsApp alert number", status: config.adminWhatsAppNumber ? "configured" : "missing ADMIN_WHATSAPP_NUMBER" },
+      { item: "OpenAI RAG", status: config.openaiApiKey && config.vectorStoreId ? "configured" : "optional: missing OpenAI key/vector store" },
+    ],
+    privacyNotice: [
+      "We collect your WhatsApp number, messages, name, phone number, address, selected product/package, and order details to answer enquiries, process orders, arrange delivery, and provide customer support.",
+      "We do not ask for passwords, OTPs, or full card details.",
+      "You may request access, correction, or deletion of your personal data by contacting our team.",
+      "Your data is kept only as long as needed for customer service, order fulfilment, legal/accounting needs, and fraud prevention.",
+    ],
+    handoffRules: [
+      "AI cannot answer after checking sales responses, FAQ, and RAG.",
+      "Customer submits complete order details.",
+      "Refund, damaged item, complaint, legal threat, sensitive personal data, or payment confirmation.",
+      "Customer opts out or asks not to be messaged.",
+    ],
+    auditLog: (await store.listAuditLog()).slice().reverse().slice(0, 200),
+  };
+}
+
+function formatDashboardMessage(message) {
+  return {
+    id: message.id,
+    createdAt: message.createdAt || "",
+    direction: message.direction || "outbound",
+    from: message.from || "",
+    to: message.to || "",
+    channel: message.channel || "customer",
+    type: message.type || "text",
+    sentFrom:
+      message.direction === "inbound"
+        ? message.from || "Customer"
+        : message.channel === "admin"
+          ? "Admin alert"
+          : message.channel === "business_admin"
+            ? "Business admin"
+            : "AI agent",
+    body: message.body || message.caption || message.url || (message.name ? `[template] ${message.name}` : ""),
+  };
+}
+
+function conversationStatus(customer, customerOrders) {
+  if (customer.optedOut) return "opted out";
+  if (customer.complaintStatus === "open") return "complaint - human required";
+  if (customer.handoffStatus === "human_required") return "human required";
+  if (customerOrders.length > 0) return orderStatusDisplay(customerOrders.at(-1).status);
+  if (Number(customer.inboundCount || 0) <= 1) return "waiting reply";
+  return "active";
+}
+
+function buildGuardrailSummary(customers, now = new Date()) {
+  const rows = customers.map((customer) => followupGuardrailStatus(customer, now));
+  const blockedReasons = rows.filter((row) => row.blocked);
+  return {
+    optedOut: rows.filter((row) => row.reason === "opted_out").length,
+    blockedFollowups: blockedReasons.length,
+    outside24HourWindow: rows.filter((row) => row.reason === "outside_24_hour_window").length,
+    humanRequired: customers.filter((customer) => customer.handoffStatus === "human_required").length,
+    followupCap: "follow-ups continue until order details are submitted, customer opts out, or sequence ends",
+    optOutHandling: "enabled",
+    windowRule: "outside the 24-hour customer service window, production WhatsApp follow-ups must use approved templates",
+  };
+}
+
+function guardrailDisplay(customer, now = new Date()) {
+  const status = followupGuardrailStatus(customer, now);
+  if (!status.blocked) return "ok";
+  if (status.reason === "opted_out") return "opted out: no follow-up";
+  if (status.reason === "complaint_handoff") return "complaint: human required";
+  if (status.reason === "outside_24_hour_window") return "template follow-up required";
+  if (status.reason === "order_submitted") return "order submitted";
+  return status.reason;
+}
+
+function followupGuardrailStatus(customer, now = new Date()) {
+  if (customer.optedOut) return { blocked: true, reason: "opted_out" };
+  if (customer.complaintStatus === "open" || customer.followupBlockedReason === "complaint_handoff") {
+    return { blocked: true, reason: "complaint_handoff" };
+  }
+  if (customer.followupBlocked) return { blocked: true, reason: "followup_blocked" };
+  if ((customer.orderIds || []).length > 0) return { blocked: true, reason: "order_submitted" };
+  if (!isWithinCustomerServiceWindow(customer, now)) return { blocked: false, reason: "outside_24_hour_window" };
+  return { blocked: false, reason: "ok" };
+}
+
+function buildFollowupRows(customers, productById, now, queueItems = []) {
+  const queueByDispatchKey = new Map(queueItems.map((item) => [item.dispatchKey, item]));
+  return customers.map((customer) => {
+    const product = productById.get(customer.productId);
+    const sent = customer.followupsSent || {};
+    const hasOrder = (customer.orderIds || []).length > 0;
+    const followups = productFollowupSequence(product);
+    const nextItem = followups.find((item) => !sent[item.key]);
+    let nextFollowup = nextItem?.key || "";
+    let nextDueAt = nextItem ? followupDueAt(customer.firstSeenAt || now, nextItem) : null;
+    let status = nextDueAt && now >= nextDueAt ? "due" : "scheduled";
+    const dispatchKey = [
+      customer.businessAccountId || config.accountId,
+      customer.id,
+      nextFollowup,
+    ].join(":");
+    const queuedItem = nextItem ? queueByDispatchKey.get(dispatchKey) : null;
+
+    if (!nextItem) {
+      status = "completed";
+    }
+    const guardrail = followupGuardrailStatus(customer, now);
+    if (hasOrder) status = "skipped order";
+    if (guardrail.reason === "opted_out") status = "blocked: opted out";
+    if (guardrail.reason === "outside_24_hour_window") {
+      status = status === "due" ? "due: send approved template" : `${status}: approved template`;
+    }
+    if (
+      queuedItem &&
+      ["queued", "processing", "retry_pending"].includes(queuedItem.status) &&
+      !hasOrder &&
+      (config.demoMode || guardrail.reason === "ok" || Boolean(followupTemplateName(nextFollowup)))
+    ) {
+      status =
+        queuedItem.status === "processing"
+          ? "sending"
+          : queuedItem.status === "retry_pending"
+            ? "queued: retry pending"
+            : "queued";
+    }
+
+    return {
+      customerId: customer.id,
+      product: product?.name || customer.productId || "",
+      labelDisplay: customer.labelDisplay,
+      firstSeenAt: customer.firstSeenAt || "",
+      nextFollowup,
+      nextDueAt: nextDueAt ? nextDueAt.toISOString() : "",
+      status,
+      queueStatus: queuedItem?.status || "",
+      queueAttempts: queuedItem?.attempts || 0,
+      guardrail: guardrailDisplay(customer, now),
+      sentFirst: sent.first_day_followup || "",
+      sentDay1: sent.day_1_followup || "",
+      sentCount: followups.filter((item) => sent[item.key]).length,
+      totalFollowups: followups.length,
+    };
+  });
+}
+
+function buildAnalytics({ customers, orders, productById, now }) {
+  const selectedDateCustomers = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, now));
+  const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
+  const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
+  const selectedDateOrdersFromNewCustomers = selectedDateOrders.filter((order) =>
+    selectedDateCustomerIds.has(order.customerId)
+  );
+  const productCounts = new Map();
+  for (const customer of selectedDateCustomers) {
+    const productName = productById.get(customer.productId)?.name || customer.productId || "Unknown product";
+    productCounts.set(productName, (productCounts.get(productName) || 0) + 1);
+  }
+  const orderProductCounts = new Map();
+  for (const order of selectedDateOrders) {
+    const productName = order.productName || productById.get(order.productId)?.name || order.productId || "Unknown product";
+    orderProductCounts.set(productName, (orderProductCounts.get(productName) || 0) + 1);
+  }
+  const totalSales = selectedDateOrders.reduce((sum, order) => sum + orderSalesAmount(order), 0);
+  const followupPerformance = buildFollowupPerformance(customers, now);
+  const hourlyCustomerCounts = Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    label: `${String(hour).padStart(2, "0")}:00`,
+    count: 0,
+  }));
+  for (const customer of selectedDateCustomers) {
+    const firstSeen = new Date(customer.firstSeenAt);
+    if (!Number.isNaN(firstSeen.getTime())) {
+      hourlyCustomerCounts[firstSeen.getHours()].count += 1;
+    }
+  }
+  const sevenDayCustomerCounts = Array.from({ length: 7 }, (_, index) => {
+    const date = addLocalDays(now, index - 6);
+    const dateKey = formatLocalDate(date);
+    const count = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, date)).length;
+    return {
+      date: dateKey,
+      label: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+      count,
+    };
+  });
+
+  return {
+    date: formatLocalDate(now),
+    totalNewCustomersToday: selectedDateCustomers.length,
+    totalOrdersFromNewCustomersToday: selectedDateOrdersFromNewCustomers.length,
+    totalOrdersToday: selectedDateOrders.length,
+    totalSalesToday: totalSales,
+    totalSalesTodayDisplay: formatCurrency(totalSales),
+    newCustomersByProductToday: [...productCounts.entries()]
+      .map(([product, count]) => ({ product, count }))
+      .sort((a, b) => b.count - a.count || a.product.localeCompare(b.product)),
+    newOrdersByProductToday: [...orderProductCounts.entries()]
+      .map(([product, count]) => ({ product, label: product, count }))
+      .sort((a, b) => b.count - a.count || a.product.localeCompare(b.product)),
+    customerCharts: {
+      hourly: hourlyCustomerCounts,
+      sevenDays: sevenDayCustomerCounts,
+      followups: followupPerformance,
+    },
+  };
+}
+
+function buildFollowupPerformance(customers, now) {
+  const product = catalog.products.find((item) => item.id === catalog.default_product_id) || catalog.products[0];
+  return productFollowupSequence(product).map((stage) => {
+    const sentCustomers = customers.filter((customer) => {
+      const sentAt = customer.followupsSent?.[stage.key];
+      return sentAt && isSameLocalDate(sentAt, now);
+    });
+    const replies = sentCustomers.filter((customer) => {
+      const sentAt = new Date(customer.followupsSent?.[stage.key] || 0).getTime();
+      const lastInbound = new Date(customer.lastInboundAt || customer.lastMessageAt || 0).getTime();
+      return Number.isFinite(sentAt) && lastInbound > sentAt;
+    }).length;
+    const sent = sentCustomers.length;
+    const replyRate = sent === 0 ? 0 : Math.round((replies / sent) * 1000) / 10;
+    return {
+      label: followupStageName(stage.key),
+      sent,
+      replies,
+      replyRate,
+      rateLabel: `${replyRate}%`,
+    };
+  });
+}
+
+function followupStageName(value) {
+  if (value === "first_day_followup") return "First follow-up";
+  if (value === "day_1_followup") return "Second follow-up";
+  const dayMatch = String(value || "").match(/^day_(\d+)_followup$/);
+  if (dayMatch) return `Day ${dayMatch[1]} follow-up`;
+  return "-";
+}
+
+function orderSalesAmount(order) {
+  if (Number.isFinite(Number(order.totalAmount))) return Number(order.totalAmount);
+  const price = Number(String(order.orderOptionPrice || order.packagePrice || "").replace(/[^\d.]/g, ""));
+  return Number.isFinite(price) ? price : 0;
+}
+
+function formatOrderRecord(order, productById) {
+  const productName = order.productName || productById.get(order.productId)?.name || order.productId || "Product";
+  const quantity = order.quantity || "";
+  const price = order.orderOptionPrice || order.packagePrice || formatCurrency(orderSalesAmount(order));
+  const optionName = order.orderOptionName || order.packageName || "";
+  return [
+    `Name: ${order.name || ""}`,
+    `Phone number: ${order.phone || ""}`,
+    `Address: ${order.address || ""}`,
+    ...(optionName ? [`Order option: ${optionName}`] : []),
+    ...(order.addOnChoice ? [`Add-on choice: ${order.addOnChoice}`] : []),
+    "",
+    `${productName} x ${quantity} units , ${price}`,
+    "Free delivery & COD",
+  ].join("\n");
+}
+
+function reachedWarehouseCustomerMessage(order) {
+  const quantity = Number(order.quantity || 1) || 1;
+  const productName = String(order.productName || order.productId || "barang").trim().toLowerCase();
+  return `Salam kita, dlm 1-3 ari runner will hantar brg ‘${quantity} unit ${productName}’ utk kita ya 🥰\nKita ingat reply Runner text, Runner TOMU LOGISTIC. 🥰`;
+}
+
+function formatOrderAdminRow(order) {
+  const productById = new Map(catalog.products.map((product) => [product.id, product]));
+  const product = productById.get(order.productId);
+  return {
+    id: order.id,
+    businessAccountId: order.businessAccountId || config.accountId,
+    customerId: order.customerId,
+    product: order.productName || product?.name || order.productId || "",
+    package: order.orderOptionName || order.packageName || order.orderOptionId || order.packageId || "",
+    name: order.name || "",
+    phone: order.phone || "",
+    address: order.address || "",
+    record: formatOrderRecord(order, productById),
+    shoppingLink: order.shoppingLink || product?.shopping_link || "",
+    status: order.status || "",
+    statusDisplay: orderStatusDisplay(order.status),
+    statusUpdatedAt: order.statusUpdatedAt || order.updatedAt || "",
+    statusHistory: order.statusHistory || [],
+    createdAt: order.createdAt || "",
+    updatedAt: order.updatedAt || "",
+    acknowledgedAt: order.acknowledgedAt || "",
+    completedAt: order.completedAt || "",
+  };
+}
+
+function formatCurrency(amount) {
+  return `B$${Number(amount || 0).toFixed(2)}`;
+}
+
+function addLocalDays(value, days) {
+  const date = value instanceof Date ? new Date(value) : new Date(value);
+  date.setDate(date.getDate() + days);
+  return date;
+}
+
+function addHours(value, hours) {
+  const date = value instanceof Date ? new Date(value) : new Date(value);
+  date.setHours(date.getHours() + hours);
+  return date;
+}
+
+function addSeconds(value, seconds) {
+  const date = value instanceof Date ? new Date(value) : new Date(value);
+  date.setSeconds(date.getSeconds() + seconds);
+  return date;
+}
+
+function addMinutes(value, minutes) {
+  const date = value instanceof Date ? new Date(value) : new Date(value);
+  date.setMinutes(date.getMinutes() + minutes);
+  return date;
+}
+
+function randomDateWithinDays(now, days, seed) {
+  const date = new Date(now);
+  const dayOffset = seed % (days + 1);
+  const hour = (seed * 7) % 24;
+  const minute = (seed * 13) % 60;
+  date.setDate(date.getDate() - dayOffset);
+  date.setHours(hour, minute, 0, 0);
+  return date;
+}
+
+function testScenario(index) {
+  const scenarios = [
+    "order_complete",
+    "sales_response",
+    "faq_location",
+    "normal_faq",
+    "followup_reply",
+    "order_after_followup",
+    "opted_out_exact",
+    "opted_out_semantic",
+    "low_interest",
+    "unknown_handoff",
+    "ignored_short",
+    "ignored_long",
+  ];
+  return scenarios[index % scenarios.length];
+}
+
+function isSameLocalDate(value, now) {
+  if (!value) return false;
+  return formatLocalDate(new Date(value)) === formatLocalDate(now);
+}
+
+function parseSelectedDate(value) {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return new Date();
+  const date = new Date(`${value}T12:00:00`);
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function normalizeDashboardProfile(profile = {}) {
+  const name = String(profile.name || "AI Agent Monitor").trim().slice(0, 80) || "AI Agent Monitor";
+  const accentColor = /^#[0-9a-fA-F]{6}$/.test(String(profile.accentColor || ""))
+    ? String(profile.accentColor)
+    : "#0071e3";
+  return { name, accentColor };
+}
+
+function isDemoEnvironmentCustomerId(value) {
+  return /^(customer_\d+|demo_|sim_customer_)/.test(String(value || ""));
+}
+
+function formatLocalDate(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function firstFollowupDueAt(firstSeenAt, options = {}) {
+  const firstSeen = new Date(firstSeenAt);
+  const due = new Date(firstSeen);
+  const cutoffHour = Number.isFinite(options.cutoffHour) ? options.cutoffHour : 19;
+  const sendHour = Number.isFinite(options.sendHour) ? options.sendHour : 20;
+  if (firstSeen.getHours() < cutoffHour) {
+    due.setHours(sendHour, 0, 0, 0);
+    return due;
+  }
+  due.setDate(due.getDate() + 1);
+  due.setHours(sendHour, 0, 0, 0);
+  return due;
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function productFollowupSequence(product) {
+  const entries = Object.entries(product?.followups || {});
+  const firstFollowup = entries.find(([key]) => key === "first_day_followup")?.[1] || {};
+  return entries
+    .map(([key, followup], index) => ({
+      key,
+      followup,
+      firstFollowup,
+      index,
+      dayOffset: followupDayOffset(key, followup, index),
+      sendHour: Number.isFinite(followup?.send_hour) ? followup.send_hour : 20,
+    }))
+    .sort((a, b) => a.dayOffset - b.dayOffset || a.index - b.index);
+}
+
+function followupDayOffset(key, followup, index) {
+  if (Number.isFinite(followup?.day_offset)) return followup.day_offset;
+  if (key === "first_day_followup") return 0;
+  const dayMatch = String(key).match(/^day_(\d+)_followup$/);
+  if (dayMatch) return Number(dayMatch[1]);
+  return index;
+}
+
+function followupDueAt(firstSeenAt, item) {
+  const firstDueAt = firstFollowupDueAt(firstSeenAt, {
+    cutoffHour: item.firstFollowup?.first_chat_cutoff_hour,
+    sendHour: Number.isFinite(item.firstFollowup?.send_hour) ? item.firstFollowup.send_hour : item.sendHour,
+  });
+  if (item.key === "first_day_followup") return firstDueAt;
+
+  const firstSeen = new Date(firstSeenAt);
+  const due = addDays(firstSeen, item.dayOffset);
+  due.setHours(item.sendHour, 0, 0, 0);
+  if (due <= firstDueAt) {
+    due.setTime(firstDueAt.getTime());
+    due.setDate(due.getDate() + 1);
+    due.setHours(item.sendHour, 0, 0, 0);
+  }
+  return due;
+}
+
+function isWithinCustomerServiceWindow(customer, at = new Date()) {
+  const lastInbound = new Date(customer.lastInboundAt || customer.firstSeenAt || 0);
+  if (Number.isNaN(lastInbound.getTime())) return false;
+  return at.getTime() - lastInbound.getTime() <= DAY_MS;
+}
+
+function isOptOutMessage(text) {
+  return detectOptOutIntent(text).optedOut;
+}
+
+function detectOptOutIntent(text) {
+  const message = normalizeIntentText(text);
+  if (!message) return { optedOut: false, uncertain: false, reason: "empty" };
+  if (OPT_OUT_PATTERN.test(message)) {
+    return { optedOut: true, uncertain: false, reason: "keyword_opt_out" };
+  }
+  if (OPT_OUT_INTENT_PATTERNS.some((pattern) => pattern.test(message))) {
+    return { optedOut: true, uncertain: false, reason: "similar_meaning_opt_out" };
+  }
+  if (OPT_OUT_UNCERTAIN_PATTERNS.some((pattern) => pattern.test(message))) {
+    return { optedOut: false, uncertain: true, reason: "possible_opt_out_or_low_interest" };
+  }
+  return { optedOut: false, uncertain: false, reason: "not_opt_out" };
+}
+
+function normalizeIntentText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}\s']/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function groupBy(items, getKey) {
+  const grouped = new Map();
+  for (const item of items) {
+    const key = getKey(item);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(item);
+  }
+  return grouped;
+}
+
+async function notifyAdmin(body) {
+  if (config.adminWhatsAppNumber) {
+    await sendOutbound(config.adminWhatsAppNumber, [textMessage(body)], { channel: "admin" });
+    return;
+  }
+  await store.appendOutbox({ to: "admin", channel: "admin", type: "text", body });
+  console.log(`Admin notification:\n${body}`);
+}
+
+async function sendOutbound(to, messages, meta = {}) {
+  const { skipFailureRecord = false, ...safeMeta } = meta;
+  const prior = outboundQueues.get(to) || Promise.resolve();
+  const pending = prior.catch(() => {}).then(() => sendOutboundSequence(to, messages, safeMeta));
+  outboundQueues.set(to, pending);
+  try {
+    await pending;
+  } catch (error) {
+    if (!skipFailureRecord) {
+      await operations.recordFailedMessage({
+        businessAccountId: safeMeta.businessAccountId || config.accountId,
+        to,
+        messages: error.unsentMessages || messages,
+        meta: safeMeta,
+        error: error.message,
+      });
+    }
+    await recordSystemError("outbound_message", error, `Recipient: ${to}`, safeMeta.businessAccountId || config.accountId);
+    throw error;
+  } finally {
+    if (outboundQueues.get(to) === pending) outboundQueues.delete(to);
+  }
+}
+
+async function sendOutboundSequence(to, messages, meta = {}) {
+  for (const [index, message] of messages.entries()) {
+    try {
+      if (config.demoMode) {
+        await store.appendOutbox({ direction: "outbound", to, ...meta, ...message });
+        console.log(`Demo outbound to ${to}: ${message.type} ${message.body || message.caption || message.url || message.name}`);
+        continue;
+      }
+      const messageId = await sendWhatsAppMessage(to, message);
+      if (messageId) {
+        await store.appendOutbox({
+          direction: "outbound",
+          from: "ai_agent",
+          to,
+          businessAccountId: meta.businessAccountId || config.accountId,
+          ...meta,
+          ...message,
+        });
+        submittedOutboundMessages.set(messageId, {
+          to,
+          messages: [message],
+          meta,
+          businessAccountId: meta.businessAccountId || config.accountId,
+          createdAt: Date.now(),
+        });
+      }
+      if (index < messages.length - 1) {
+        if (messageId) {
+          const status = await waitForDeliveredMessage(messageId);
+          console.log(`WhatsApp sequence gate ${status} for ${messageId}`);
+        }
+        if (config.messageSequenceDelayMs > 0) {
+          await wait(config.messageSequenceDelayMs);
+        }
+      }
+    } catch (error) {
+      error.unsentMessages = messages.slice(index);
+      throw error;
+    }
+  }
+}
+
+async function sendWhatsAppMessage(to, message) {
+  const image = message.type === "image" ? { link: resolveMediaUrl(message.url) } : null;
+  if (image && message.caption) image.caption = message.caption;
+  const payload =
+    message.type === "image"
+      ? {
+          messaging_product: "whatsapp",
+          to,
+          type: "image",
+          image,
+        }
+      : message.type === "template"
+      ? {
+          messaging_product: "whatsapp",
+          to,
+          type: "template",
+          template: {
+            name: message.name,
+            language: { code: message.languageCode || FOLLOWUP_TEMPLATE_LANGUAGE },
+            ...(Array.isArray(message.components) && message.components.length
+              ? { components: message.components }
+              : {}),
+          },
+        }
+      : {
+          messaging_product: "whatsapp",
+          to,
+          type: "text",
+          text: { preview_url: false, body: message.body },
+        };
+
+  const response = await fetch(
+    `https://graph.facebook.com/${config.graphVersion}/${config.phoneNumberId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`WhatsApp send failed: ${text}`);
+  }
+  const data = text ? JSON.parse(text) : {};
+  console.log(`Sent WhatsApp ${message.type} to ${to}`);
+  return data.messages?.[0]?.id || "";
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function waitForDeliveredMessage(messageId) {
+  cleanupDeliveryTracking();
+  if (deliveredOutboundMessages.has(messageId)) return Promise.resolve("delivered");
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      outboundDeliveryWaiters.delete(messageId);
+      resolve("timeout");
+    }, config.deliveryWaitTimeoutMs);
+    outboundDeliveryWaiters.set(messageId, {
+      resolve(status) {
+        clearTimeout(timer);
+        outboundDeliveryWaiters.delete(messageId);
+        resolve(status);
+      },
+    });
+  });
+}
+
+function noteOutboundStatus(status) {
+  const messageId = String(status.id || "");
+  if (!messageId) return;
+  if (status.status === "delivered" || status.status === "read") {
+    deliveredOutboundMessages.set(messageId, Date.now());
+    outboundDeliveryWaiters.get(messageId)?.resolve(status.status);
+    submittedOutboundMessages.delete(messageId);
+  } else if (status.status === "failed") {
+    outboundDeliveryWaiters.get(messageId)?.resolve("failed");
+    const submitted = submittedOutboundMessages.get(messageId);
+    if (submitted) {
+      const statusError = status.errors?.[0]?.title || status.errors?.[0]?.message || "Meta delivery failed";
+      void operations.recordFailedMessage({ ...submitted, error: statusError });
+      void recordSystemError("message_delivery_status", new Error(statusError), `Message ID: ${messageId}`, submitted.businessAccountId);
+      submittedOutboundMessages.delete(messageId);
+    }
+  }
+  cleanupDeliveryTracking();
+}
+
+function cleanupDeliveryTracking() {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [messageId, timestamp] of deliveredOutboundMessages) {
+    if (timestamp < cutoff) deliveredOutboundMessages.delete(messageId);
+  }
+  for (const [messageId, submitted] of submittedOutboundMessages) {
+    if (submitted.createdAt < cutoff) submittedOutboundMessages.delete(messageId);
+  }
+}
+
+function extractInboundMessages(payload) {
+  const messages = [];
+  for (const entry of payload.entry || []) {
+    for (const change of entry.changes || []) {
+      const value = change.value || {};
+      for (const message of value.messages || []) {
+        messages.push(message);
+      }
+    }
+  }
+  return messages;
+}
+
+function extractOutboundStatuses(payload) {
+  const statuses = [];
+  for (const entry of payload.entry || []) {
+    for (const change of entry.changes || []) {
+      for (const status of change.value?.statuses || []) {
+        statuses.push(status);
+      }
+    }
+  }
+  return statuses;
+}
+
+function extractMessageSource(message) {
+  const referral = message.referral || {};
+  return {
+    sourceUrl: referral.source_url || "",
+    sourceType: referral.source_type || "",
+    adId: referral.source_id || referral.ctwa_clid || "",
+    referralHeadline: referral.headline || "",
+    referralBody: referral.body || "",
+    mediaType: referral.media_type || "",
+    imageUrl: referral.image_url || "",
+    videoUrl: referral.video_url || "",
+  };
+}
+
+function getMessageText(message) {
+  if (message.type === "text") {
+    return message.text?.body?.trim();
+  }
+  if (message.type === "interactive") {
+    return (
+      message.interactive?.button_reply?.title ||
+      message.interactive?.list_reply?.title ||
+      message.interactive?.button_reply?.id ||
+      message.interactive?.list_reply?.id ||
+      ""
+    ).trim();
+  }
+  if (message.type === "button") {
+    return (message.button?.text || message.button?.payload || "").trim();
+  }
+  return "";
+}
+
+function isValidSignature(headers, rawBody) {
+  if (config.demoMode || !config.appSecret) return true;
+
+  const signature = headers["x-hub-signature-256"];
+  if (!signature || !signature.startsWith("sha256=")) return false;
+
+  const expected = crypto.createHmac("sha256", config.appSecret).update(rawBody).digest("hex");
+  const actual = signature.slice("sha256=".length);
+
+  return timingSafeEqual(actual, expected);
+}
+
+function timingSafeEqual(a, b) {
+  const left = Buffer.from(a, "hex");
+  const right = Buffer.from(b, "hex");
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function alreadyProcessed(messageId) {
+  if (!messageId) return false;
+  cleanupProcessedMessages();
+  if (processedMessageIds.has(messageId)) return true;
+  processedMessageIds.set(messageId, Date.now());
+  return false;
+}
+
+function cleanupProcessedMessages() {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [messageId, timestamp] of processedMessageIds) {
+    if (timestamp < cutoff) processedMessageIds.delete(messageId);
+  }
+}
+
+function clampMessages(messages = []) {
+  return messages.map((message) => {
+    if (message.type !== "text") return message;
+    return { ...message, body: String(message.body || "").slice(0, config.maxReplyChars) };
+  });
+}
+
+async function readJsonBody(req) {
+  const body = await readBody(req);
+  return body.length ? JSON.parse(body.toString("utf8")) : {};
+}
+
+async function readFormBody(req) {
+  const body = await readBody(req);
+  return new URLSearchParams(body.toString("utf8"));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+function sendText(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "text/plain" });
+  res.end(body);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]
+  );
+}
+
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body, null, 2));
+}
+
+function sendJsonDownload(res, filename, body) {
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+  });
+  res.end(JSON.stringify(body, null, 2));
+}
+
+function sendHtml(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(body);
+}
+
+function redirectToLogin(res, next) {
+  res.writeHead(303, { Location: `/admin/login?next=${encodeURIComponent(next)}` });
+  res.end();
+}
+
+function redirectToSuperAdminLogin(res) {
+  res.writeHead(303, { Location: "/superadmin/login" });
+  res.end();
+}
+
+function redirectToOrderAdminLogin(res) {
+  res.writeHead(303, { Location: "/order-admin/login" });
+  res.end();
+}
+
+function sendLoginSession(res, next, account) {
+  const token = createSessionToken({ actor: `admin:${account.id}`, role: "admin", accountId: account.id });
+  res.writeHead(303, {
+    Location: next.startsWith("/admin/") ? next : "/admin/dashboard",
+    "Set-Cookie": `wa_admin=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${8 * 60 * 60}`,
+  });
+  res.end();
+}
+
+function sendSuperAdminSession(res) {
+  const token = createSessionToken({ actor: "super_admin", role: "superadmin" });
+  res.writeHead(303, {
+    Location: "/superadmin/accounts",
+    "Set-Cookie": `wa_superadmin=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${8 * 60 * 60}`,
+  });
+  res.end();
+}
+
+function sendOrderAdminSession(res, account) {
+  const token = createSessionToken({ actor: `order_admin:${account.id}`, role: "order_admin", accountId: account.id });
+  res.writeHead(303, {
+    Location: "/order-admin/dashboard",
+    "Set-Cookie": `wa_order_admin=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${8 * 60 * 60}`,
+  });
+  res.end();
+}
+
+function createSessionToken(subject) {
+  const payload = Buffer.from(
+    JSON.stringify({ ...subject, exp: Date.now() + 8 * 60 * 60 * 1000 })
+  ).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", config.adminSessionSecret)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+async function isAdminAuthenticated(req) {
+  const token = parseCookies(req.headers.cookie || "").wa_admin;
+  const data = readSessionToken(token);
+  if (!data || Number(data.exp || 0) <= Date.now() || !["admin", undefined].includes(data.role)) return false;
+  return adminAccounts.isActive(data.accountId || config.accountId, "business_admin");
+}
+
+function isSuperAdminAuthenticated(req) {
+  const data = readSessionToken(parseCookies(req.headers.cookie || "").wa_superadmin);
+  return Boolean(data && data.role === "superadmin" && Number(data.exp || 0) > Date.now());
+}
+
+async function isOrderAdminAuthenticated(req) {
+  const data = readSessionToken(parseCookies(req.headers.cookie || "").wa_order_admin);
+  return Boolean(
+    data &&
+    data.role === "order_admin" &&
+    Number(data.exp || 0) > Date.now() &&
+    (await adminAccounts.isActive(data.accountId, "order_admin"))
+  );
+}
+
+function readSessionToken(token) {
+  if (!token || !token.includes(".")) return null;
+  const [payload, signature] = token.split(".");
+  const expected = crypto.createHmac("sha256", config.adminSessionSecret).update(payload).digest("base64url");
+  if (!timingSafeTextEqual(signature, expected)) return null;
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  for (const part of cookieHeader.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key) cookies[key] = rest.join("=");
+  }
+  return cookies;
+}
+
+function timingSafeTextEqual(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+async function handleAsset(url, res) {
+  const relativePath = decodeURIComponent(url.pathname.slice("/assets/".length));
+  const filePath = path.resolve(config.assetsDir, relativePath);
+  const root = `${config.assetsDir}${path.sep}`.toLowerCase();
+  if (!filePath.toLowerCase().startsWith(root)) {
+    return sendText(res, 403, "Forbidden");
+  }
+
+  try {
+    const bytes = await readFile(filePath);
+    res.writeHead(200, {
+      "Content-Type": contentTypeFor(filePath),
+      "Cache-Control": "public, max-age=3600",
+    });
+    res.end(bytes);
+  } catch (error) {
+    if (error.code === "ENOENT") return sendText(res, 404, "Asset not found");
+    throw error;
+  }
+}
+
+function resolveMediaUrl(url) {
+  if (/^https?:\/\//i.test(url)) return url;
+  if (config.publicBaseUrl) return new URL(url, config.publicBaseUrl).toString();
+  throw new Error("Image messages need PUBLIC_BASE_URL when DEMO_MODE=false.");
+}
+
+function contentTypeFor(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".png") return "image/png";
+  if (ext === ".webp") return "image/webp";
+  return "application/octet-stream";
+}
+
+function normalizePath(value) {
+  return value.startsWith("/") ? value : `/${value}`;
+}
+
+function parseBool(value) {
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function usableEnv(name) {
+  const value = process.env[name];
+  if (!value || value.startsWith("replace_")) return "";
+  return value;
+}
+
+function usableSecretEnv(name) {
+  const value = String(process.env[name] || "");
+  if (!value || /^(replace_|change_me)/i.test(value)) return "";
+  return value;
+}
+
+async function liveAutomationBlock() {
+  const account = await adminAccounts.getAccount(config.accountId);
+  if (account?.automationPaused) {
+    return { code: "automation_paused", message: "AI automation paused by super admin." };
+  }
+  if (account?.testMode) {
+    return { code: "test_mode", message: "Account is in test mode; live AI reply suppressed." };
+  }
+  return null;
+}
+
+async function recordSystemError(scope, error, details = "", accountId = config.accountId) {
+  console.error(`${scope}:`, error);
+  try {
+    await operations.recordError({
+      scope,
+      accountId,
+      message: error?.message || String(error),
+      details,
+    });
+  } catch (recordError) {
+    console.error("Unable to persist operational error:", recordError);
+  }
+}
+
+async function buildSystemManagementData() {
+  const [state, accounts, failedMessages, errors, audits, customers, outbox, noReplyReviews, followupQueue] = await Promise.all([
+    operations.getState(),
+    adminAccounts.listAccounts(),
+    operations.listFailedMessages(),
+    operations.listErrors(),
+    store.listAuditLog(),
+    store.listCustomers(),
+    store.listOutbox(),
+    operations.listNoReplyReviews(),
+    operations.listFollowupQueue(),
+  ]);
+  const productById = new Map(catalog.products.map((product) => [product.id, product]));
+  return {
+    state,
+    accounts: accounts.filter((account) => account.role === "business_admin"),
+    failedMessages,
+    errors,
+    audits: [...audits].reverse().slice(0, 100),
+    noReplyAlertCount: buildNoReplyRows(
+      customers,
+      outbox,
+      productById,
+      noReplyReviews,
+      new Date(),
+      state.noReplyMonitorStartedAt
+    ).length,
+    queuedFollowupCount: followupQueue.filter((item) => ["queued", "processing", "retry_pending"].includes(item.status)).length,
+  };
+}
+
+async function buildSystemBackup() {
+  const [state, accounts, failedMessages, errors, audits, customers, deletedCustomers, orders, outbox, followupQueue] =
+    await Promise.all([
+      operations.getState(),
+      adminAccounts.listAccounts(),
+      operations.listFailedMessages(),
+      operations.listErrors(),
+      store.listAuditLog(),
+      store.listCustomers(),
+      store.listDeletedCustomers(),
+      store.listOrders(),
+      store.listOutbox(),
+      operations.listFollowupQueue(),
+    ]);
+  return {
+    exportedAt: new Date().toISOString(),
+    state,
+    accounts,
+    failedMessages,
+    errors,
+    audits,
+    customers,
+    deletedCustomers,
+    orders,
+    outbox,
+    followupQueue,
+  };
+}
+
+function faqLibraryData() {
+  return {
+    general: (faqLibrary.approved_faqs || []).map((faq) => ({ ...faq, scope: "general", productId: "" })),
+    products: catalog.products.map((product) => ({
+      id: product.id,
+      name: product.name,
+      faqs: (product.approved_faqs || []).map((faq) => ({ ...faq, scope: "product", productId: product.id })),
+    })),
+  };
+}
+
+async function maybeLearnFromManualReply(customer, replyText, businessAccountId) {
+  if (customer.handoffStatus !== "human_required") return null;
+  const latestInbound = await latestInboundMessageForCustomer(customer.id, businessAccountId);
+  const question = String(latestInbound?.body || "").trim();
+  if (!question || !replyText) return null;
+  if (shouldSkipLearningQuestion(question)) return null;
+
+  const scope = isGeneralBusinessQuestion(question) ? "general" : "product";
+  const productId = scope === "product" ? String(customer.productId || "").trim() : "";
+  if (scope === "product" && !findCatalogProduct(productId)) return null;
+
+  const learnedFaq = upsertLearnedFaq({
+    scope,
+    productId,
+    question,
+    replyText,
+  });
+  if (learnedFaq.scope === "general") await persistFaqLibrary();
+  else await persistCatalog();
+  await store.appendAuditLog({
+    actor: `system:${businessAccountId}`,
+    action: "manual_reply_learned_faq",
+    customerId: customer.id,
+    result: `${learnedFaq.scope}:${learnedFaq.productId || "general"}:${learnedFaq.id}`,
+    businessAccountId,
+  });
+  return learnedFaq;
+}
+
+async function latestInboundMessageForCustomer(customerId, businessAccountId) {
+  const messages = await store.listOutbox();
+  return messages
+    .filter((message) =>
+      message.direction === "inbound" &&
+      message.from === customerId &&
+      (!businessAccountId || message.businessAccountId === businessAccountId)
+    )
+    .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")))[0] || null;
+}
+
+function upsertLearnedFaq({ scope, productId, question, replyText }) {
+  const product = scope === "product" ? findCatalogProduct(productId) : null;
+  const records = scope === "general" ? (faqLibrary.approved_faqs ||= []) : (product.approved_faqs ||= []);
+  const normalizedQuestion = normalizeLearnedText(question);
+  const existing = records.find((faq) =>
+    (faq.example_questions || []).some((example) => normalizeLearnedText(example) === normalizedQuestion)
+  );
+
+  if (existing) {
+    existing.approved_reply = replyText;
+    existing.active = true;
+    existing.learned_from_handoff = true;
+    existing.updatedAt = new Date().toISOString();
+    return { ...existing, scope, productId };
+  }
+
+  return saveApprovedFaq({
+    scope,
+    productId,
+    topic: `Learned: ${question.slice(0, 80)}`,
+    exampleQuestions: [question],
+    approvedReply: replyText,
+    active: true,
+  });
+}
+
+function shouldSkipLearningQuestion(question) {
+  return /\b(full\s*name|phone\s*number|address|alamat|order\s*package|complaint|refund|rosak|marah|angry)\b/i.test(question);
+}
+
+function normalizeLearnedText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}$]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function saveApprovedFaq(body) {
+  const scope = body.scope === "product" ? "product" : "general";
+  const productId = scope === "product" ? String(body.productId || "").trim() : "";
+  const product = scope === "product" ? findCatalogProduct(productId) : null;
+  if (scope === "product" && !product) throw new Error("Select a product for product FAQ.");
+  const topic = String(body.topic || "").trim();
+  const approvedReply = String(body.approvedReply || "").trim();
+  const exampleQuestions = Array.isArray(body.exampleQuestions)
+    ? body.exampleQuestions.map((question) => String(question).trim()).filter(Boolean)
+    : String(body.exampleQuestions || "").split(/\r?\n/).map((question) => question.trim()).filter(Boolean);
+  if (!topic) throw new Error("FAQ topic is required.");
+  if (!approvedReply) throw new Error("Approved reply is required.");
+  if (!exampleQuestions.length) throw new Error("Add at least one example customer question.");
+  const records = scope === "general"
+    ? (faqLibrary.approved_faqs ||= [])
+    : (product.approved_faqs ||= []);
+  const existingId = String(body.id || "").trim();
+  const prefix = scope === "general" ? "general" : safeAssetSegment(product.id);
+  const proposedId = `${prefix}_${safeAssetSegment(topic)}`;
+  let id = existingId || proposedId;
+  if (!existingId) {
+    let suffix = 2;
+    const allIds = new Set([
+      ...(faqLibrary.approved_faqs || []).map((faq) => faq.id),
+      ...catalog.products.flatMap((entry) => (entry.approved_faqs || []).map((faq) => faq.id)),
+    ]);
+    while (allIds.has(id)) {
+      id = `${proposedId}_${suffix}`;
+      suffix += 1;
+    }
+  }
+  const saved = {
+    id,
+    topic,
+    example_questions: exampleQuestions,
+    approved_reply: approvedReply,
+    active: body.active !== false,
+  };
+  const index = records.findIndex((faq) => faq.id === id);
+  if (index >= 0) records[index] = saved;
+  else records.push(saved);
+  return { ...saved, scope, productId };
+}
+
+function deleteApprovedFaq(body) {
+  const scope = body.scope === "product" ? "product" : "general";
+  const productId = scope === "product" ? String(body.productId || "").trim() : "";
+  const product = scope === "product" ? findCatalogProduct(productId) : null;
+  if (scope === "product" && !product) throw new Error("Select a product for product FAQ.");
+  const id = String(body.id || "").trim();
+  if (!id) throw new Error("FAQ id is required.");
+  const records = scope === "general"
+    ? (faqLibrary.approved_faqs ||= [])
+    : (product.approved_faqs ||= []);
+  const index = records.findIndex((faq) => faq.id === id);
+  if (index < 0) throw new Error("FAQ not found.");
+  const [deleted] = records.splice(index, 1);
+  return { ...deleted, scope, productId };
+}
+
+function salesRepliesData() {
+  return {
+    general: (salesReplyLibrary.sales_replies || [])
+      .filter((reply) => (reply.scope || "business") !== "product")
+      .map((reply) => ({ ...reply, scope: "general", productId: "" })),
+    products: [],
+  };
+}
+
+function saveSalesReply(body) {
+  if (body.scope === "product") throw new Error("Sales replies are general only. Product-specific answers belong in Product FAQ.");
+  const scope = "general";
+  const productId = "";
+  const objectionType = String(body.objectionType || "").trim();
+  const intent = String(body.intent || "").trim();
+  const approvedReply = String(body.approvedReply || "").trim();
+  const followupPrompt = String(body.followupPrompt || "").trim();
+  const exampleMessages = Array.isArray(body.exampleMessages)
+    ? body.exampleMessages.map((message) => String(message).trim()).filter(Boolean)
+    : String(body.exampleMessages || "").split(/\r?\n/).map((message) => message.trim()).filter(Boolean);
+  if (!objectionType) throw new Error("Objection type is required.");
+  if (!intent) throw new Error("Intent description is required.");
+  if (!approvedReply) throw new Error("Approved reply is required.");
+  if (!exampleMessages.length) throw new Error("Add at least one example customer message.");
+  const records = (salesReplyLibrary.sales_replies ||= []);
+  const existingId = String(body.id || "").trim();
+  const storageScope = "business";
+  const prefix = "sales";
+  const proposedId = `${prefix}_${safeAssetSegment(objectionType)}`;
+  let id = existingId || proposedId;
+  if (!existingId) {
+    let suffix = 2;
+    const allIds = new Set([
+      ...(salesReplyLibrary.sales_replies || []).map((reply) => reply.id),
+    ]);
+    while (allIds.has(id)) {
+      id = `${proposedId}_${suffix}`;
+      suffix += 1;
+    }
+  }
+  const saved = {
+    id,
+    objection_type: objectionType,
+    intent,
+    example_messages: exampleMessages,
+    approved_reply: approvedReply,
+    followup_prompt: followupPrompt,
+    scope: storageScope,
+    productId: "",
+    active: body.active !== false,
+  };
+  const index = records.findIndex((reply) => reply.id === id);
+  if (index >= 0) records[index] = saved;
+  else records.push(saved);
+  return { ...saved, scope, productId };
+}
+
+function deleteSalesReply(body) {
+  if (body.scope === "product") throw new Error("Sales replies are general only. Product-specific answers belong in Product FAQ.");
+  const scope = "general";
+  const productId = "";
+  const id = String(body.id || "").trim();
+  if (!id) throw new Error("Sales reply id is required.");
+  const records = (salesReplyLibrary.sales_replies ||= []);
+  const index = records.findIndex((reply) => reply.id === id);
+  if (index < 0) throw new Error("Sales reply not found.");
+  const [deleted] = records.splice(index, 1);
+  return { ...deleted, scope, productId: deleted.productId || productId };
+}
+
+function legacyStandardSalesReplies(product) {
+  return (product.standard_replies || [])
+    .filter((reply) => reply.type === "sales_response")
+    .map((reply, index) => legacyStandardSalesReply(product, reply, index));
+}
+
+function legacyStandardSalesReply(product, reply, index) {
+  const examples = reply.customer_messages || reply.triggers || [];
+  const label = examples[0] || reply.reply || `sales response ${index + 1}`;
+  return {
+    id: legacyStandardSalesReplyId(product, reply, index),
+    objection_type: label,
+    intent: `Customer gives this sales response or hesitation: ${label}`,
+    example_messages: examples,
+    approved_reply: reply.reply || "",
+    followup_prompt: "",
+    active: reply.active !== false,
+    legacy_standard_reply: true,
+  };
+}
+
+function legacyStandardSalesReplyId(product, reply, index) {
+  const examples = reply.customer_messages || reply.triggers || [];
+  const label = examples[0] || reply.reply || `sales response ${index + 1}`;
+  return `${product.id}_legacy_sales_${safeAssetSegment(label)}_${index + 1}`;
+}
+
+const PRODUCT_FLOW_TEXT_SLOTS = [
+  { key: "greeting", index: 0 },
+  { key: "description", index: 4 },
+  { key: "testimonialText", index: 9 },
+  { key: "priceText", index: 11, shiftedIndex: 12 },
+  { key: "packageQuestion", index: 12, shiftedIndex: 13 },
+];
+const PRODUCT_FLOW_IMAGE_SLOTS = [
+  { key: "infoPhoto1", label: "Product info photo 1", index: 1, filename: "product-1" },
+  { key: "infoPhoto2", label: "Product info photo 2", index: 2, filename: "product-2" },
+  { key: "infoPhoto3", label: "Product info photo 3", index: 3, filename: "product-3" },
+  { key: "testimonialPhoto1", label: "Testimonial photo 1", index: 5, filename: "testimonial-1" },
+  { key: "testimonialPhoto2", label: "Testimonial photo 2", index: 6, filename: "testimonial-2" },
+  { key: "testimonialPhoto3", label: "Testimonial photo 3", index: 7, filename: "testimonial-3" },
+  { key: "testimonialPhoto4", label: "Testimonial photo 4", index: 8, filename: "testimonial-4" },
+  { key: "pricePhoto", label: "Price photo", index: 10, filename: "price" },
+  { key: "salesPhoto", label: "Optional sales photo", index: -1, filename: "sales" },
+];
+const REQUIRED_PRODUCT_FLOW_IMAGE_KEYS = new Set(PRODUCT_FLOW_IMAGE_SLOTS
+  .filter((slot) => slot.key !== "salesPhoto")
+  .map((slot) => slot.key));
+
+function findCatalogProduct(productId) {
+  return catalog.products.find((product) => product.id === String(productId || ""));
+}
+
+function productFlowEditorData(product, options = {}) {
+  const openingFlow = product.opening_flow || [];
+  const hasSalesPhotoInFlow = Boolean(
+    openingFlow[11]?.type === "image" ||
+    (product.sales_photo_url && openingFlow.some((message) => message?.url === product.sales_photo_url))
+  );
+  const textValueForSlot = (slot) => {
+    const index = hasSalesPhotoInFlow && slot.shiftedIndex !== undefined ? slot.shiftedIndex : slot.index;
+    return String(openingFlow[index]?.body || "");
+  };
+  const imageUrlForSlot = (slot) => {
+    if (slot.key === "salesPhoto") return String(product.sales_photo_url || "");
+    return String(openingFlow[slot.index]?.url || "");
+  };
+  return {
+    id: product.id,
+    name: product.name,
+    shoppingLink: String(product.shopping_link || ""),
+    orderOptions: orderOptionsForEditor(product),
+    extractedKnowledge: productKnowledgeForEditor(product),
+    ready: options.skipReady ? false : product.openingFlowEnabled !== false && isProductFlowComplete(product),
+    ...Object.fromEntries(
+      PRODUCT_FLOW_TEXT_SLOTS.map((slot) => [slot.key, textValueForSlot(slot)])
+    ),
+    images: PRODUCT_FLOW_IMAGE_SLOTS.map((slot) => ({
+      key: slot.key,
+      label: slot.label,
+      url: imageUrlForSlot(slot),
+    })),
+  };
+}
+
+function productKnowledgeForEditor(product) {
+  const knowledge = ensureProductKnowledge(product);
+  return {
+    pending: [...knowledge.pendingImages, ...knowledge.pending],
+    approved: [...knowledge.approvedImages, ...knowledge.approved],
+    lastExtraction: knowledge.lastExtraction || null,
+  };
+}
+
+function updateProductFlowText(product, body) {
+  const current = productFlowEditorData(product);
+  const hasFlowTextUpdate = PRODUCT_FLOW_TEXT_SLOTS.some((slot) =>
+    Object.prototype.hasOwnProperty.call(body, slot.key)
+  );
+  if (hasFlowTextUpdate) {
+    product.package_question = String(body.packageQuestion ?? current.packageQuestion ?? "");
+    product.opening_flow = buildProductOpeningFlow({
+      ...current,
+      ...Object.fromEntries(
+        PRODUCT_FLOW_TEXT_SLOTS.map((slot) => [slot.key, String(body[slot.key] ?? current[slot.key])])
+      ),
+    });
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "orderOptions")) {
+    product.order_options = normalizeOrderOptions(body.orderOptions);
+  }
+  product.shopping_link = normalizeShoppingLink(body.shoppingLink ?? product.shopping_link ?? "");
+  updateProductFlowReadiness(product);
+}
+
+function updateProductFlowImage(product, slot, assetUrl) {
+  const current = productFlowEditorData(product);
+  current.images = current.images.map((image) =>
+    image.key === slot.key ? { ...image, url: assetUrl } : image
+  );
+  if (slot.key === "salesPhoto") product.sales_photo_url = assetUrl;
+  product.opening_flow = buildProductOpeningFlow(current);
+  product.images = current.images.map((image) => ({
+    url: image.url,
+    caption: image.label,
+  }));
+  updateProductFlowReadiness(product);
+}
+
+async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, originalName = "" }) {
+  ensureProductKnowledge(product);
+  if (!config.openaiApiKey) {
+    product.extracted_knowledge.lastExtraction = {
+      status: "skipped",
+      reason: "OPENAI_API_KEY is not configured.",
+      at: new Date().toISOString(),
+      sourceSlot: slot.key,
+      sourceImageUrl: assetUrl,
+      sourceFilename: imageFilename(assetUrl, originalName),
+    };
+    return product.extracted_knowledge.lastExtraction;
+  }
+
+  try {
+    const result = await extractProductKnowledgeFromImage({
+      apiKey: config.openaiApiKey,
+      model: config.extractionModel,
+      productName: product.name,
+      imageDataUrl: dataUrl,
+      imageLabel: [slot.label, imageFilename(assetUrl, originalName)].filter(Boolean).join(" | "),
+    });
+    const now = new Date().toISOString();
+    const sourceFilename = imageFilename(assetUrl, originalName);
+    const existingImageKeys = new Set([
+      ...product.extracted_knowledge.pendingImages,
+      ...product.extracted_knowledge.approvedImages,
+    ].map(imageChunkKey));
+    const imageChunk = result.imageChunk && !existingImageKeys.has(imageChunkKey({ ...result.imageChunk, sourceImageUrl: assetUrl }))
+      ? {
+          id: `image_${Date.now()}`,
+          kind: "image_chunk",
+          category: result.imageChunk.category || categoryFromImageName(sourceFilename, slot.label),
+          title: result.imageChunk.title || slot.label,
+          summary: result.imageChunk.summary || "",
+          extracted_text: result.imageChunk.extracted_text || "",
+          embedding_text: result.imageChunk.embedding_text || "",
+          brunei_malay_summary: result.imageChunk.brunei_malay_summary || "",
+          brunei_malay_search_text: result.imageChunk.brunei_malay_search_text || "",
+          customer_safe: result.imageChunk.customer_safe !== false,
+          approval_note: result.imageChunk.approval_note || "",
+          question_examples: result.imageChunk.question_examples || [],
+          brunei_malay_question_examples: result.imageChunk.brunei_malay_question_examples || [],
+          sourceSlot: slot.key,
+          sourceLabel: slot.label,
+          sourceImageUrl: assetUrl,
+          sourceFilename,
+          extractedAt: now,
+      }
+      : null;
+    if (imageChunk) product.extracted_knowledge.pendingImages.push(imageChunk);
+    product.extracted_knowledge.lastExtraction = {
+      status: "completed",
+      imageChunkAdded: Boolean(imageChunk),
+      factsFound: result.facts.length,
+      factsAdded: 0,
+      factsSkipped: result.facts.length,
+      at: now,
+      sourceSlot: slot.key,
+      sourceImageUrl: assetUrl,
+      sourceFilename,
+    };
+    return product.extracted_knowledge.lastExtraction;
+  } catch (error) {
+    await recordSystemError("product_image_knowledge_extraction", error, `Product: ${product.id}`);
+    product.extracted_knowledge.lastExtraction = {
+      status: "failed",
+      reason: error.message,
+      at: new Date().toISOString(),
+      sourceSlot: slot.key,
+      sourceImageUrl: assetUrl,
+      sourceFilename: imageFilename(assetUrl, originalName),
+    };
+    return product.extracted_knowledge.lastExtraction;
+  }
+}
+
+async function extractExistingProductImageKnowledge(product) {
+  ensureProductKnowledge(product);
+  const editorData = productFlowEditorData(product);
+  const eligibleKeys = new Set(["infoPhoto1", "infoPhoto2", "infoPhoto3", "pricePhoto", "salesPhoto"]);
+  const images = (editorData.images || [])
+    .filter((image) => eligibleKeys.has(image.key) && image.url)
+    .map((image) => ({
+      ...image,
+      slot: PRODUCT_FLOW_IMAGE_SLOTS.find((slot) => slot.key === image.key),
+    }))
+    .filter((image) => image.slot);
+
+  if (!images.length) {
+    product.extracted_knowledge.lastExtraction = {
+      status: "skipped",
+      reason: "No existing product, price, or sales images found.",
+      at: new Date().toISOString(),
+      batch: true,
+    };
+    return product.extracted_knowledge.lastExtraction;
+  }
+
+  const results = [];
+  for (const image of images) {
+    try {
+      const dataUrl = await assetUrlToDataUrl(image.url);
+      const result = await ingestProductImageKnowledge(product, {
+        slot: image.slot,
+        assetUrl: image.url,
+        originalName: imageFilename(image.url),
+        dataUrl,
+      });
+      results.push({ slot: image.key, url: image.url, ...result });
+    } catch (error) {
+      await recordSystemError("existing_product_image_knowledge_extraction", error, `Product: ${product.id}; image: ${image.url}`);
+      results.push({
+        slot: image.key,
+        url: image.url,
+        status: "failed",
+        reason: error.message,
+      });
+    }
+  }
+
+  const completed = results.filter((result) => result.status === "completed");
+  const failed = results.filter((result) => result.status === "failed");
+  const imageChunksAdded = completed.filter((result) => result.imageChunkAdded).length;
+  product.extracted_knowledge.lastExtraction = {
+    status: completed.length ? "completed" : "failed",
+    imageChunksAdded,
+    factsFound: 0,
+    factsAdded: 0,
+    imagesProcessed: images.length,
+    imagesCompleted: completed.length,
+    imagesFailed: failed.length,
+    at: new Date().toISOString(),
+    batch: true,
+    results,
+    ...(completed.length ? {} : { reason: failed[0]?.reason || "Extraction failed." }),
+  };
+  return product.extracted_knowledge.lastExtraction;
+}
+
+async function assetUrlToDataUrl(assetUrl) {
+  const cleanUrl = String(assetUrl || "").split("?")[0];
+  if (!cleanUrl.startsWith("/assets/")) {
+    throw new Error("Only local uploaded assets can be extracted.");
+  }
+  const relativePath = decodeURIComponent(cleanUrl.slice("/assets/".length));
+  const filePath = path.resolve(config.assetsDir, relativePath);
+  const root = `${config.assetsDir}${path.sep}`.toLowerCase();
+  if (!filePath.toLowerCase().startsWith(root)) {
+    throw new Error("Image path is outside the assets folder.");
+  }
+  const contentType = contentTypeFor(filePath);
+  if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
+    throw new Error("Only PNG, JPG, and WEBP images can be extracted.");
+  }
+  const bytes = await readFile(filePath);
+  return `data:${contentType};base64,${bytes.toString("base64")}`;
+}
+
+function imageFilename(assetUrl, originalName = "") {
+  const original = String(originalName || "").trim();
+  if (original) return path.basename(original);
+  const cleanUrl = String(assetUrl || "").split("?")[0];
+  if (!cleanUrl) return "";
+  return path.basename(decodeURIComponent(cleanUrl));
+}
+
+function categoryFromImageName(filename = "", fallback = "") {
+  const text = `${filename} ${fallback}`.toLowerCase();
+  if (/\b(benefit|result|after|before|claim)\b/.test(text)) return "benefit_claim";
+  if (/\b(feature|function|mode|head|usb|recharge|button)\b/.test(text)) return "feature";
+  if (/\b(price|package|promo|combo|offer)\b/.test(text)) return "price";
+  if (/\b(ingredient|formula|content)\b/.test(text)) return "ingredient";
+  if (/\b(usage|how-to|howto|instruction|cara)\b/.test(text)) return "usage";
+  if (/\b(warning|caution|avoid|jangan)\b/.test(text)) return "caution";
+  if (/\b(delivery|shipping|cod)\b/.test(text)) return "delivery";
+  if (/\b(testimonial|review|feedback)\b/.test(text)) return "social_proof";
+  return "other";
+}
+
+function cleanPendingExtractedFacts(product) {
+  const knowledge = ensureProductKnowledge(product);
+  const beforePending = knowledge.pending.length;
+  const beforeApproved = knowledge.approved.length;
+  knowledge.pending = [];
+  knowledge.approved = [];
+  return {
+    removed: beforePending,
+    approvedRemoved: beforeApproved,
+    remaining: 0,
+    pendingImages: knowledge.pendingImages.length,
+    approvedImages: knowledge.approvedImages.length,
+  };
+}
+
+function ensureProductKnowledge(product) {
+  product.extracted_knowledge ||= {};
+  product.extracted_knowledge.pending = Array.isArray(product.extracted_knowledge.pending)
+    ? product.extracted_knowledge.pending
+    : [];
+  product.extracted_knowledge.approved = Array.isArray(product.extracted_knowledge.approved)
+    ? product.extracted_knowledge.approved
+    : [];
+  product.extracted_knowledge.pendingImages = Array.isArray(product.extracted_knowledge.pendingImages)
+    ? product.extracted_knowledge.pendingImages
+    : [];
+  product.extracted_knowledge.approvedImages = Array.isArray(product.extracted_knowledge.approvedImages)
+    ? product.extracted_knowledge.approvedImages
+    : [];
+  return product.extracted_knowledge;
+}
+
+function imageChunkKey(chunk) {
+  const source = String(chunk.sourceImageUrl || "").trim().toLowerCase();
+  if (source) return source;
+  return `${String(chunk.title || "").trim().toLowerCase()}::${String(chunk.summary || chunk.extracted_text || "").trim().toLowerCase()}`;
+}
+
+function approveExtractedProductFact(product, factId) {
+  const knowledge = ensureProductKnowledge(product);
+  const imageIndex = knowledge.pendingImages.findIndex((item) => item.id === factId);
+  if (imageIndex >= 0) {
+    const [item] = knowledge.pendingImages.splice(imageIndex, 1);
+    knowledge.approvedImages.push({ ...item, approvedAt: new Date().toISOString() });
+    return { approved: true, factId, kind: "image_chunk" };
+  }
+  const index = knowledge.pending.findIndex((fact) => fact.id === factId);
+  if (index >= 0) {
+    const [fact] = knowledge.pending.splice(index, 1);
+    knowledge.approved.push({
+      ...fact,
+      approvedAt: new Date().toISOString(),
+    });
+    return { approved: true, factId, kind: "fact" };
+  }
+  throw new Error("Knowledge item not found.");
+}
+
+function deleteExtractedProductFact(product, factId, status = "pending") {
+  const knowledge = ensureProductKnowledge(product);
+  const factListName = status === "approved" ? "approved" : "pending";
+  const imageListName = status === "approved" ? "approvedImages" : "pendingImages";
+  const beforeFacts = knowledge[factListName].length;
+  const beforeImages = knowledge[imageListName].length;
+  knowledge[factListName] = knowledge[factListName].filter((fact) => fact.id !== factId);
+  knowledge[imageListName] = knowledge[imageListName].filter((item) => item.id !== factId);
+  return {
+    deleted: beforeFacts !== knowledge[factListName].length || beforeImages !== knowledge[imageListName].length,
+    factId,
+    status,
+  };
+}
+
+function orderOptionsForEditor(product) {
+  const options = Array.isArray(product.order_options) && product.order_options.length
+    ? product.order_options
+    : (product.packages || []).map((item) => ({
+        id: item.id || "",
+        name: item.name || item.id || "",
+        price: item.price || "",
+        quantity: Number(item.total_units || item.quantity || 1) || 1,
+        aliases: [item.id, item.name].filter(Boolean),
+        requires_add_on: false,
+        add_ons: [],
+      }));
+  return normalizeOrderOptions(options);
+}
+
+function normalizeOrderOptions(options) {
+  const list = Array.isArray(options) ? options : [];
+  return list
+    .map((item, index) => {
+      const name = String(item.name || "").trim();
+      if (!name) return null;
+      const id = safeAssetSegment(item.id || name || `option-${index + 1}`);
+      const addOns = normalizeLines(item.add_ons || item.addOns || item.addOnsText);
+      const aliases = normalizeLines(item.aliases || item.aliasesText);
+      return {
+        id,
+        name,
+        price: String(item.price || "").trim(),
+        quantity: Math.max(1, Number(item.quantity || item.total_units || 1) || 1),
+        aliases,
+        requires_add_on: Boolean(item.requires_add_on || item.requiresAddOn || addOns.length),
+        add_ons: addOns,
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeLines(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+  return String(value || "")
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildProductOpeningFlow(flow) {
+  const images = Object.fromEntries((flow.images || []).map((image) => [image.key, image.url]));
+  return [
+    textMessage(flow.greeting),
+    { type: "image", url: images.infoPhoto1 || "", caption: "" },
+    { type: "image", url: images.infoPhoto2 || "", caption: "" },
+    { type: "image", url: images.infoPhoto3 || "", caption: "" },
+    textMessage(flow.description),
+    { type: "image", url: images.testimonialPhoto1 || "", caption: "" },
+    { type: "image", url: images.testimonialPhoto2 || "", caption: "" },
+    { type: "image", url: images.testimonialPhoto3 || "", caption: "" },
+    { type: "image", url: images.testimonialPhoto4 || "", caption: "" },
+    textMessage(flow.testimonialText),
+    { type: "image", url: images.pricePhoto || "", caption: "" },
+    ...(images.salesPhoto ? [{ type: "image", url: images.salesPhoto, caption: "" }] : []),
+    textMessage(flow.priceText),
+    textMessage(flow.packageQuestion),
+  ];
+}
+
+function safeAssetSegment(value) {
+  return String(value || "product").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "product";
+}
+
+function createCatalogProduct(name) {
+  const baseId = safeAssetSegment(name);
+  let id = baseId;
+  let suffix = 2;
+  while (findCatalogProduct(id)) {
+    id = `${baseId}-${suffix}`;
+    suffix += 1;
+  }
+  const followupTemplate = catalog.products.find((product) => product.id === catalog.default_product_id)?.followups || {};
+  const product = {
+    id,
+    name,
+    aliases: [name.toLowerCase()],
+    price: "",
+    stock_status: "preorder",
+    shopping_link: "",
+    ad_keywords: [name.toLowerCase()],
+    packages: [],
+    order_options: [],
+    images: [],
+    openingFlowEnabled: false,
+    opening_flow: buildProductOpeningFlow({
+      greeting: "",
+      description: "",
+      testimonialText: "",
+      priceText: "",
+      packageQuestion: "",
+      images: PRODUCT_FLOW_IMAGE_SLOTS.map((slot) => ({ key: slot.key, url: "" })),
+    }),
+    faqs: [],
+    sales_replies: [],
+    standard_replies: [],
+    followups: structuredClone(followupTemplate),
+  };
+  return product;
+}
+
+function normalizeShoppingLink(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+    return url.toString();
+  } catch {
+    throw new Error("Shopping link must be a valid http or https URL.");
+  }
+}
+
+function isProductFlowComplete(product) {
+  const editorData = productFlowEditorData(product, { skipReady: true });
+  const imageByKey = new Map((editorData.images || []).map((image) => [image.key, image.url]));
+  return (
+    PRODUCT_FLOW_TEXT_SLOTS.every((slot) => String(editorData[slot.key] || "").trim()) &&
+    PRODUCT_FLOW_IMAGE_SLOTS
+      .filter((slot) => REQUIRED_PRODUCT_FLOW_IMAGE_KEYS.has(slot.key))
+      .every((slot) => String(imageByKey.get(slot.key) || "").trim())
+  );
+}
+
+function updateProductFlowReadiness(product) {
+  product.openingFlowEnabled = isProductFlowComplete(product);
+}
+
+function decodeUploadedImage(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)$/);
+  if (!match) return null;
+  const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[match[1]];
+  return { extension, bytes: Buffer.from(match[2].replace(/\s/g, ""), "base64") };
+}
+
+async function persistCatalog() {
+  const contents = `${JSON.stringify(catalog, null, 2)}\n`;
+  catalogWriteQueue = catalogWriteQueue.then(() => writeFile(config.catalogPath, contents, "utf8"));
+  await catalogWriteQueue;
+}
+
+async function persistSalesReplies() {
+  const contents = `${JSON.stringify(salesReplyLibrary, null, 2)}\n`;
+  await writeFile(config.salesRepliesPath, contents, "utf8");
+}
+
+function loginHtml(next, error = "", accountId = config.accountId) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin Login</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; background: #f5f5f7; color: #1d1d1f; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: linear-gradient(180deg, #ffffff 0%, #f5f5f7 100%); }
+    main { width: min(390px, calc(100vw - 28px)); background: rgba(255,255,255,.92); border: 1px solid #d2d2d7; border-radius: 8px; padding: 24px; box-shadow: 0 18px 50px rgba(0,0,0,.08); }
+    h1 { margin: 0 0 8px; font-size: 24px; font-weight: 700; }
+    p { margin: 0 0 18px; color: #6e6e73; }
+    label { display: block; font-weight: 700; margin-bottom: 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 11px 12px; border: 1px solid #d2d2d7; border-radius: 8px; font: inherit; background: #fff; }
+    input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: #0071e3; }
+    button { width: 100%; margin-top: 14px; border: 0; border-radius: 8px; padding: 11px; background: #0071e3; color: #fff; font-weight: 700; cursor: pointer; }
+    .error { color: #b42318; margin-bottom: 12px; }
+    .hint { margin-top: 14px; font-size: 13px; color: #6e6e73; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Admin Login</h1>
+    <p>Sign in to view customer data, analytics, and product tools.</p>
+    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
+    <form method="post" action="/admin/login">
+      <input type="hidden" name="next" value="${escapeHtml(next)}" />
+      <label for="accountId">Account ID</label>
+      <input id="accountId" name="accountId" value="${escapeHtml(accountId)}" autocomplete="username" />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autofocus autocomplete="current-password" />
+      <button type="submit">Login</button>
+    </form>
+    <div class="hint"><a href="/order-admin/login">Order Admin</a> | <a href="/superadmin/login">Super Admin</a></div>
+  </main>
+</body>
+</html>`;
+}
+
+function orderAdminLoginHtml(error = "", accountId = "") {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Order Admin Login</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; background: #f5f5f7; color: #1d1d1f; --line: #d2d2d7; --accent: #0071e3; --muted: #6e6e73; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f5f7; }
+    main { width: min(410px, calc(100vw - 28px)); background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 24px; box-shadow: 0 12px 38px rgba(0,0,0,.07); }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    p { margin: 0 0 18px; color: var(--muted); }
+    label { display: block; margin: 0 0 7px; font-weight: 700; }
+    input { display: block; width: 100%; margin: 0 0 14px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+    input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    button { width: 100%; border: 0; border-radius: 8px; padding: 11px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
+    .error { margin: 0 0 12px; color: #b42318; }
+    a { display: inline-block; margin-top: 16px; color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Order Admin</h1>
+    <p>Process submitted customer orders.</p>
+    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
+    <form method="post" action="/order-admin/login">
+      <label for="accountId">Account ID</label>
+      <input id="accountId" name="accountId" value="${escapeHtml(accountId)}" autocomplete="username" />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autofocus autocomplete="current-password" />
+      <button type="submit">Login</button>
+    </form>
+    <a href="/admin/login">Business admin login</a> | <a href="/superadmin/login">Super admin login</a>
+  </main>
+</body>
+</html>`;
+}
+
+function orderAdminDashboardHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Order Processing</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface:#fff; --surface-soft:#fbfbfd; --line:#d2d2d7; --muted:#6e6e73; --accent:#0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; font: inherit; font-weight: 600; cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .55; cursor: default; }
+    main { padding: 22px; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 0 0 16px; }
+    .metric { border: 1px solid #e5e5ea; border-radius: 8px; padding: 14px; background: var(--surface); }
+    .metric strong { display: block; font-size: 25px; margin-bottom: 3px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    section { border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; background: var(--surface); }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    .filters { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid #e5e5ea; }
+    .filters button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .filter-fields { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid #e5e5ea; background: var(--surface-soft); }
+    .filter-fields label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    .filter-fields select, .filter-fields input { min-width: 180px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; color: #1d1d1f; font: inherit; }
+    .filter-fields input { min-width: 150px; }
+    .filter-fields select:focus, .filter-fields input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 1100px; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; }
+    th { color: var(--muted); background: var(--surface-soft); font-size: 12px; text-transform: uppercase; }
+    .record { margin: 0; white-space: pre-wrap; line-height: 1.4; font: inherit; }
+    .shopping-link { display: inline-block; color: var(--accent); font-weight: 600; text-decoration: none; }
+    .shopping-link:hover { text-decoration: underline; }
+    .muted { color: var(--muted); }
+    .pill { display: inline-block; border-radius: 999px; padding: 4px 8px; background: #fff3d8; color: #7b4d00; font-weight: 700; }
+    .pill.ack { background: #e8f2ff; color: #075aa8; }
+    .pill.done { background: #e6f6e8; color: #176028; }
+    .actions { display: grid; gap: 6px; min-width: 190px; }
+    .actions select { border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px; background: #fff; font: inherit; }
+    .history { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .empty { padding: 16px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Order Processing</h1>
+    <div class="sub" id="generated">Loading orders...</div>
+  </header>
+  <nav>
+    <form method="post" action="/order-admin/logout" style="margin:0"><button type="submit">Logout</button></form>
+    <button id="refresh" type="button">Refresh</button>
+  </nav>
+  <main>
+    <div class="summary" id="summary"></div>
+    <section>
+      <h2>Submitted Orders</h2>
+      <div class="filters">
+        <button class="active" type="button" data-filter="all">All</button>
+        <button type="button" data-filter="pending_admin_order">New</button>
+        <button type="button" data-filter="reached_warehouse">Warehouse</button>
+      </div>
+      <div class="filter-fields">
+        <label>Business Account<select id="business-filter"><option value="">All Accounts</option></select></label>
+        <label>From Date<input id="from-date" type="date" /></label>
+        <label>To Date<input id="to-date" type="date" /></label>
+        <button id="clear-filters" type="button">Clear</button>
+      </div>
+      <div class="table-wrap" id="orders"></div>
+    </section>
+  </main>
+  <script>
+    let orders = [];
+    let activeFilter = "all";
+    let activeBusinessAccount = "";
+    let fromDate = "";
+    let toDate = "";
+    const statuses = ${JSON.stringify(ORDER_STATUS_OPTIONS)};
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function fmt(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+    }
+    function pill(order) {
+      return '<span class="pill">' + esc(order.statusDisplay) + '</span>';
+    }
+    function statusOptions(order) {
+      return statuses.map(status => '<option value="' + esc(status.key) + '"' +
+        (status.key === order.status ? ' selected' : '') + '>' + esc(status.label) + '</option>').join('');
+    }
+    function statusHistory(order) {
+      const rows = order.statusHistory || [];
+      if (!rows.length) return "";
+      return '<div class="history">' + rows.slice().reverse().map(item =>
+        esc((statuses.find(status => status.key === item.status) || {}).label || item.status) + ' - ' + esc(fmt(item.at))
+      ).join('<br>') + '</div>';
+    }
+    function shoppingLink(value) {
+      if (!value) return '<span class="muted">Not set</span>';
+      try {
+        const url = new URL(value);
+        if (url.protocol !== "http:" && url.protocol !== "https:") return '<span class="muted">Invalid link</span>';
+        return '<a class="shopping-link" target="_blank" rel="noopener noreferrer" href="' + esc(url.href) + '">Open shopping link</a>';
+      } catch (error) {
+        return '<span class="muted">Invalid link</span>';
+      }
+    }
+    function datePart(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+    function filteredOrders() {
+      return orders.filter(order => {
+        const submittedDate = datePart(order.createdAt);
+        if (activeFilter !== "all" && order.status !== activeFilter) return false;
+        if (activeBusinessAccount && order.businessAccountId !== activeBusinessAccount) return false;
+        if (fromDate && submittedDate < fromDate) return false;
+        if (toDate && submittedDate > toDate) return false;
+        return true;
+      });
+    }
+    function render() {
+      const rows = filteredOrders();
+      const counts = [
+        ["Filtered Orders", rows.length],
+        ["New", rows.filter(order => order.status === "pending_admin_order").length],
+        ["Warehouse", rows.filter(order => order.status === "reached_warehouse").length]
+      ];
+      document.querySelector("#summary").innerHTML = counts.map(item =>
+        '<div class="metric"><strong>' + esc(item[1]) + '</strong><span>' + esc(item[0]) + '</span></div>'
+      ).join("");
+      if (!rows.length) {
+        document.querySelector("#orders").innerHTML = '<div class="empty">No orders in this view.</div>';
+        return;
+      }
+      document.querySelector("#orders").innerHTML = '<table><thead><tr><th>Submitted</th><th>Business Account</th><th>WhatsApp ID</th><th>Order Record</th><th>Shopping Link</th><th>Status History</th><th>Updated</th><th>Change Status</th></tr></thead><tbody>' +
+        rows.map(order => '<tr><td>' + esc(fmt(order.createdAt)) + '</td><td>' + esc(order.businessAccountId) + '</td><td>' + esc(order.customerId) + '</td><td><pre class="record">' + esc(order.record) + '</pre></td><td>' + shoppingLink(order.shoppingLink) + '</td><td>' + pill(order) + statusHistory(order) + '</td><td>' + esc(fmt(order.statusUpdatedAt || order.updatedAt)) + '</td><td><div class="actions">' +
+          '<select data-status-select="' + esc(order.id) + '">' + statusOptions(order) + '</select>' +
+          '<button class="primary" type="button" data-save-status="' + esc(order.id) + '">Update Status</button>' +
+        '</div></td></tr>').join("") + '</tbody></table>';
+      document.querySelectorAll("button[data-save-status]").forEach(button => button.addEventListener("click", async () => {
+        const orderId = button.dataset.saveStatus;
+        const value = document.querySelector('select[data-status-select="' + CSS.escape(orderId) + '"]').value;
+        await fetch("/order-admin/orders/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ orderId: orderId, status: value })
+        });
+        loadOrders();
+      }));
+    }
+    async function loadOrders() {
+      const response = await fetch("/order-admin/orders-data");
+      const data = await response.json();
+      orders = data.orders || [];
+      const accountSelect = document.querySelector("#business-filter");
+      const accountIds = [...new Set(orders.map(order => order.businessAccountId).filter(Boolean))].sort();
+      accountSelect.innerHTML = '<option value="">All Accounts</option>' +
+        accountIds.map(accountId => '<option value="' + esc(accountId) + '">' + esc(accountId) + '</option>').join("");
+      accountSelect.value = activeBusinessAccount;
+      document.querySelector("#generated").textContent = "Updated " + new Date().toLocaleString();
+      render();
+    }
+    document.querySelectorAll("button[data-filter]").forEach(button => button.addEventListener("click", () => {
+      activeFilter = button.dataset.filter;
+      document.querySelectorAll("button[data-filter]").forEach(item => item.classList.toggle("active", item === button));
+      render();
+    }));
+    document.querySelector("#business-filter").addEventListener("change", event => {
+      activeBusinessAccount = event.target.value;
+      render();
+    });
+    document.querySelector("#from-date").addEventListener("change", event => {
+      fromDate = event.target.value;
+      render();
+    });
+    document.querySelector("#to-date").addEventListener("change", event => {
+      toDate = event.target.value;
+      render();
+    });
+    document.querySelector("#clear-filters").addEventListener("click", () => {
+      activeFilter = "all";
+      activeBusinessAccount = "";
+      fromDate = "";
+      toDate = "";
+      document.querySelector("#business-filter").value = "";
+      document.querySelector("#from-date").value = "";
+      document.querySelector("#to-date").value = "";
+      document.querySelectorAll("button[data-filter]").forEach(item => item.classList.toggle("active", item.dataset.filter === "all"));
+      render();
+    });
+    document.querySelector("#refresh").addEventListener("click", loadOrders);
+    loadOrders();
+    setInterval(loadOrders, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function superAdminLoginHtml(error = "") {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Super Admin Login</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; background: #f5f5f7; color: #1d1d1f; --line: #d2d2d7; --accent: #0071e3; --muted: #6e6e73; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f5f7; }
+    main { width: min(410px, calc(100vw - 28px)); background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 24px; box-shadow: 0 12px 38px rgba(0,0,0,.07); }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    p { margin: 0 0 18px; color: var(--muted); line-height: 1.4; }
+    label { display: block; font-weight: 700; margin: 0 0 7px; }
+    input { width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+    input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    button { width: 100%; margin-top: 14px; border: 0; border-radius: 8px; padding: 11px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
+    .error { margin-bottom: 12px; color: #b42318; }
+    a { display: inline-block; margin-top: 16px; color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Super Admin</h1>
+    <p>Manage access for business and order admin accounts.</p>
+    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
+    <form method="post" action="/superadmin/login">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autofocus autocomplete="current-password" />
+      <button type="submit">Sign In</button>
+    </form>
+    <a href="/admin/login">Business admin login</a> | <a href="/order-admin/login">Order admin login</a>
+  </main>
+</body>
+</html>`;
+}
+
+function superAdminAccountsHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Account Management</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #fff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; min-height: 18px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    button, nav a { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; font: inherit; font-weight: 600; cursor: pointer; text-decoration: none; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { color: #b42318; }
+    button:disabled { opacity: .55; cursor: wait; }
+    main { padding: 22px; max-width: 1160px; margin: 0 auto; display: grid; gap: 14px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    form.fields { padding: 14px; display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)) auto; gap: 10px; align-items: end; }
+    label { display: grid; gap: 7px; color: #1d1d1f; font-size: 13px; font-weight: 700; }
+    input, select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    input:focus, select:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 700px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: middle; font-size: 13px; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; background: var(--surface-soft); }
+    .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; font-weight: 700; background: #e6f6e8; color: #176028; }
+    .pill.off { background: #ffe9e7; color: #8f1d12; }
+    .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    #reset-panel { display: none; }
+    #reset-panel.open { display: block; }
+    .message { padding: 0 14px 14px; color: var(--muted); font-size: 13px; min-height: 18px; }
+    @media (max-width: 760px) { form.fields { grid-template-columns: 1fr; } main { padding: 14px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Account Management</h1>
+    <div class="sub" id="generated">Loading accounts...</div>
+  </header>
+  <nav>
+    <a href="/superadmin/system">System Management</a>
+    <a href="/admin/dashboard">Business Dashboard</a>
+    <form method="post" action="/superadmin/logout" style="margin:0"><button type="submit">Logout</button></form>
+    <button id="refresh" type="button">Refresh</button>
+  </nav>
+  <main>
+    <section>
+      <h2>Create Account</h2>
+      <form class="fields" id="create-form">
+        <label>Account ID<input name="id" required /></label>
+        <label>Business Name<input name="name" required /></label>
+        <label>Role<select name="role"><option value="business_admin">Business Admin</option><option value="order_admin">Order Admin</option></select></label>
+        <label>Temporary Password<input name="password" type="password" minlength="10" required autocomplete="new-password" /></label>
+        <button class="primary" type="submit">Create</button>
+      </form>
+      <div class="message" id="create-message"></div>
+    </section>
+    <section id="reset-panel">
+      <h2>Reset Password</h2>
+      <form class="fields" id="reset-form">
+        <label>Account ID<input id="reset-id" name="id" readonly /></label>
+        <label>New Password<input name="password" type="password" minlength="10" required autocomplete="new-password" /></label>
+        <button class="primary" type="submit">Save Password</button>
+        <button id="cancel-reset" type="button">Cancel</button>
+      </form>
+      <div class="message" id="reset-message"></div>
+    </section>
+    <section>
+      <h2>Accounts</h2>
+      <div class="table-wrap" id="accounts"></div>
+    </section>
+  </main>
+  <script>
+    let accounts = [];
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function fmt(value) {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+    }
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Action failed.");
+      return data;
+    }
+    async function loadAccounts() {
+      const response = await fetch("/superadmin/accounts-data");
+      const data = await response.json();
+      accounts = data.accounts || [];
+      document.querySelector("#generated").textContent = accounts.length + " account(s)";
+      document.querySelector("#accounts").innerHTML = '<table><thead><tr><th>Account ID</th><th>Name</th><th>Role</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody>' +
+        accounts.map(account => '<tr><td>' + esc(account.id) + '</td><td>' + esc(account.name) + '</td><td>' + esc(account.role === "order_admin" ? "Order Admin" : "Business Admin") + '</td><td><span class="pill' + (account.active ? '' : ' off') + '">' + (account.active ? 'Active' : 'Disabled') + '</span></td><td>' + esc(fmt(account.updatedAt)) + '</td><td><div class="row-actions"><button type="button" data-reset="' + esc(account.id) + '">Reset Password</button><button class="' + (account.active ? 'danger' : '') + '" type="button" data-status="' + esc(account.id) + '" data-active="' + (!account.active) + '">' + (account.active ? 'Disable' : 'Enable') + '</button></div></td></tr>').join('') +
+        '</tbody></table>';
+      document.querySelectorAll("button[data-reset]").forEach(button => button.addEventListener("click", () => {
+        document.querySelector("#reset-id").value = button.dataset.reset;
+        document.querySelector("#reset-panel").classList.add("open");
+      }));
+      document.querySelectorAll("button[data-status]").forEach(button => button.addEventListener("click", async () => {
+        await request("/superadmin/accounts/status", { id: button.dataset.status, active: button.dataset.active === "true" });
+        loadAccounts();
+      }));
+    }
+    document.querySelector("#create-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(event.target).entries());
+      try {
+        await request("/superadmin/accounts/create", values);
+        event.target.reset();
+        document.querySelector("#create-message").textContent = "Account created.";
+        loadAccounts();
+      } catch (error) {
+        document.querySelector("#create-message").textContent = error.message;
+      }
+    });
+    document.querySelector("#reset-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(event.target).entries());
+      try {
+        await request("/superadmin/accounts/password", values);
+        event.target.reset();
+        document.querySelector("#reset-panel").classList.remove("open");
+        document.querySelector("#reset-message").textContent = "";
+        loadAccounts();
+      } catch (error) {
+        document.querySelector("#reset-message").textContent = error.message;
+      }
+    });
+    document.querySelector("#cancel-reset").addEventListener("click", () => document.querySelector("#reset-panel").classList.remove("open"));
+    document.querySelector("#refresh").addEventListener("click", loadAccounts);
+    loadAccounts();
+  </script>
+</body>
+</html>`;
+}
+
+function superAdminSystemHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>System Management</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #fff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; --green: #176028; --amber: #7b4d00; --red: #b42318; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    button, nav a, .download { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; font: inherit; font-weight: 600; cursor: pointer; text-decoration: none; }
+    button.primary, .download { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button.warn { color: var(--red); }
+    button:disabled { opacity: .55; cursor: wait; }
+    main { max-width: 1280px; margin: 0 auto; padding: 22px; display: grid; gap: 14px; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+    .metric { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; padding: 14px; }
+    .metric strong { display: block; font-size: 25px; margin-bottom: 4px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding: 14px; }
+    label { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
+    input, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    textarea { min-width: min(420px, 86vw); min-height: 42px; resize: vertical; }
+    input:focus, textarea:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    .message { padding: 0 14px 14px; min-height: 18px; color: var(--muted); font-size: 13px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #f0f0f2; vertical-align: top; text-align: left; font-size: 13px; }
+    th { background: var(--surface-soft); color: var(--muted); text-transform: uppercase; font-size: 12px; }
+    .pill { display: inline-block; border-radius: 999px; padding: 4px 8px; font-weight: 700; background: #e6f6e8; color: var(--green); }
+    .pill.test { background: #e8f2ff; color: #075aa8; }
+    .pill.pause, .pill.pending { background: #fff3d8; color: var(--amber); }
+    .pill.fail { background: #ffe9e7; color: var(--red); }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .record { white-space: pre-wrap; word-break: break-word; max-width: 470px; margin: 0; line-height: 1.42; }
+    .empty { padding: 16px; color: var(--muted); }
+    .backup { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 14px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 760px) { main { padding: 14px; } .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } textarea { min-width: 100%; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>System Management</h1>
+    <div class="sub" id="generated">Loading system status...</div>
+  </header>
+  <nav>
+    <a href="/superadmin/accounts">Accounts</a>
+    <a href="/admin/dashboard">Business Dashboard</a>
+    <form method="post" action="/superadmin/logout" style="margin:0"><button type="submit">Logout</button></form>
+    <button id="refresh" type="button">Refresh</button>
+  </nav>
+  <main>
+    <div class="summary" id="summary"></div>
+    <section>
+      <h2>Release Record</h2>
+      <form class="toolbar" id="release-form">
+        <label>System Version<input name="version" required /></label>
+        <label>Update Notes<textarea name="notes" placeholder="What changed in this release"></textarea></label>
+        <button class="primary" type="submit">Record Update</button>
+      </form>
+      <div class="message" id="release-message"></div>
+    </section>
+    <section>
+      <h2>Business AI Controls</h2>
+      <div class="table-wrap" id="controls"></div>
+    </section>
+    <section>
+      <h2>Failed Message Queue</h2>
+      <div class="table-wrap" id="failed"></div>
+    </section>
+    <section>
+      <h2>Error Log</h2>
+      <div class="table-wrap" id="errors"></div>
+    </section>
+    <section>
+      <h2>Change History</h2>
+      <div class="table-wrap" id="history"></div>
+    </section>
+    <section>
+      <h2>Backup Export</h2>
+      <div class="backup">
+        <a class="download" href="/superadmin/system/backup">Export JSON Backup</a>
+        <span>Includes operational records, customers, orders, and message history. Password hashes and API secrets are excluded.</span>
+      </div>
+    </section>
+  </main>
+  <script>
+    let data = null;
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function fmt(value) {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+    }
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Action failed.");
+      return result;
+    }
+    function mode(account) {
+      if (account.automationPaused) return ["Paused", "pause"];
+      if (account.testMode) return ["Test Mode", "test"];
+      return ["Live", ""];
+    }
+    function retryStatus(message) {
+      if (message.status === "retried") return ["Retried", ""];
+      if (message.status === "retry_failed") return ["Retry Failed", "fail"];
+      return ["Pending Retry", "pending"];
+    }
+    function render() {
+      const pending = data.failedMessages.filter(item => item.status !== "retried").length;
+      const figures = [
+        [data.state.version || "-", "System Version"],
+        [fmt(data.state.lastUpdatedAt) || "-", "Last Update"],
+        [pending, "Messages Need Retry"],
+        [data.queuedFollowupCount || 0, "Followups Queued"],
+        [data.errors.length, "Recorded Errors"],
+        [data.noReplyAlertCount || 0, "No Reply Alerts"]
+      ];
+      document.querySelector("#summary").innerHTML = figures.map(item =>
+        '<div class="metric"><strong>' + esc(item[0]) + '</strong><span>' + esc(item[1]) + '</span></div>'
+      ).join("");
+
+      const accounts = data.accounts || [];
+      document.querySelector("#controls").innerHTML = accounts.length ? '<table><thead><tr><th>Account</th><th>Login</th><th>AI Mode</th><th>Last Updated</th><th>Action</th></tr></thead><tbody>' +
+        accounts.map(account => {
+          const accountMode = mode(account);
+          return '<tr><td><strong>' + esc(account.name) + '</strong><br>' + esc(account.id) + '</td><td>' + (account.active ? 'Enabled' : 'Disabled') + '</td><td><span class="pill ' + accountMode[1] + '">' + accountMode[0] + '</span></td><td>' + esc(fmt(account.updatedAt)) + '</td><td><div class="actions"><button class="' + (account.automationPaused ? '' : 'warn') + '" type="button" data-id="' + esc(account.id) + '" data-pause="' + (!account.automationPaused) + '" data-test="' + account.testMode + '">' + (account.automationPaused ? 'Resume AI' : 'Pause AI') + '</button><button type="button" data-id="' + esc(account.id) + '" data-pause="false" data-test="' + (!account.testMode) + '">' + (account.testMode ? 'Return Live' : 'Test Mode') + '</button></div></td></tr>';
+        }).join("") + '</tbody></table>' : '<div class="empty">No business accounts found.</div>';
+
+      const failed = data.failedMessages || [];
+      document.querySelector("#failed").innerHTML = failed.length ? '<table><thead><tr><th>Time</th><th>Account</th><th>Recipient</th><th>Message</th><th>Status</th><th>Action</th></tr></thead><tbody>' +
+        failed.map(item => {
+          const status = retryStatus(item);
+          const body = (item.messages || []).map(message => message.body || message.caption || message.url || message.type).join("\\n");
+          return '<tr><td>' + esc(fmt(item.createdAt)) + '</td><td>' + esc(item.businessAccountId) + '</td><td>' + esc(item.to) + '</td><td><pre class="record">' + esc(body) + '</pre><small>' + esc(item.lastError) + '</small></td><td><span class="pill ' + status[1] + '">' + status[0] + '</span><br>Attempts: ' + esc(item.attempts) + '</td><td><button class="primary" type="button" data-retry="' + esc(item.id) + '"' + (item.status === "retried" ? ' disabled' : '') + '>Retry</button></td></tr>';
+        }).join("") + '</tbody></table>' : '<div class="empty">No failed outbound messages recorded.</div>';
+
+      const errors = data.errors || [];
+      document.querySelector("#errors").innerHTML = errors.length ? '<table><thead><tr><th>Time</th><th>Area</th><th>Account</th><th>Error</th></tr></thead><tbody>' +
+        errors.slice(0, 50).map(error => '<tr><td>' + esc(fmt(error.createdAt)) + '</td><td>' + esc(error.scope) + '</td><td>' + esc(error.accountId) + '</td><td><pre class="record">' + esc(error.message + (error.details ? "\\n" + error.details : "")) + '</pre></td></tr>').join("") +
+        '</tbody></table>' : '<div class="empty">No operational errors recorded.</div>';
+
+      const audits = data.audits || [];
+      document.querySelector("#history").innerHTML = audits.length ? '<table><thead><tr><th>Time</th><th>Actor</th><th>Change</th><th>Result</th></tr></thead><tbody>' +
+        audits.slice(0, 50).map(item => '<tr><td>' + esc(fmt(item.createdAt)) + '</td><td>' + esc(item.actor) + '</td><td>' + esc(item.action) + '</td><td>' + esc(item.result || "") + '</td></tr>').join("") +
+        '</tbody></table>' : '<div class="empty">No change history recorded.</div>';
+
+      document.querySelectorAll("button[data-id][data-pause]").forEach(button => button.addEventListener("click", async () => {
+        await request("/superadmin/system/account-control", {
+          id: button.dataset.id,
+          automationPaused: button.dataset.pause === "true",
+          testMode: button.dataset.test === "true"
+        });
+        load();
+      }));
+      document.querySelectorAll("button[data-retry]").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await request("/superadmin/system/retry-message", { id: button.dataset.retry });
+        } catch (error) {
+          window.alert(error.message);
+        }
+        load();
+      }));
+    }
+    async function load() {
+      const response = await fetch("/superadmin/system-data");
+      data = await response.json();
+      document.querySelector("#generated").textContent = "Updated " + new Date().toLocaleString();
+      const versionInput = document.querySelector("#release-form input[name=version]");
+      if (!versionInput.value) versionInput.value = data.state.version || "";
+      render();
+    }
+    document.querySelector("#release-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(event.target).entries());
+      try {
+        await request("/superadmin/system/release", values);
+        document.querySelector("#release-message").textContent = "System update recorded.";
+        load();
+      } catch (error) {
+        document.querySelector("#release-message").textContent = error.message;
+      }
+    });
+    document.querySelector("#refresh").addEventListener("click", load);
+    load();
+    setInterval(load, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function adminDashboardHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Agent Monitor</title>
+  <style>
+    :root {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif;
+      color: #1d1d1f;
+      background: #f5f5f7;
+      --surface: #ffffff;
+      --surface-soft: #fbfbfd;
+      --line: #d2d2d7;
+      --muted: #6e6e73;
+      --accent: #0071e3;
+      --accent-soft: #e8f2ff;
+    }
+    body {
+      margin: 0;
+      background: #f5f5f7;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      padding: 16px 22px 10px;
+      background: rgba(251,251,253,.9);
+      color: #1d1d1f;
+      border-bottom: 1px solid rgba(210,210,215,.8);
+      backdrop-filter: saturate(180%) blur(16px);
+    }
+    .dashboard-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+    }
+    .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .dashboard-date-panel {
+      min-width: 260px;
+      padding: 10px 12px;
+      border: 1px solid rgba(210,210,215,.9);
+      border-radius: 12px;
+      background: #fff;
+      text-align: right;
+      box-shadow: 0 1px 2px rgba(0,0,0,.03);
+    }
+    .today-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .today-date {
+      margin-top: 2px;
+      font-size: 24px;
+      font-weight: 800;
+      line-height: 1.15;
+    }
+    .dashboard-date-panel label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .dashboard-date-panel input {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font: inherit;
+      background: #fff;
+      color: #1d1d1f;
+    }
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 22px 14px;
+      background: rgba(251,251,253,.9);
+      border-bottom: 1px solid rgba(210,210,215,.8);
+      backdrop-filter: saturate(180%) blur(16px);
+    }
+    nav a, button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 11px;
+      background: var(--surface);
+      color: #1d1d1f;
+      text-decoration: none;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    #profile-nav.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 14px;
+    }
+    .tab {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 12px;
+      background: var(--surface);
+      color: #1d1d1f;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .tab.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .tab-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      height: 22px;
+      padding: 0 7px;
+      border-radius: 999px;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      font-size: 12px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .tab.active .tab-count {
+      background: rgba(255,255,255,.22);
+      color: #fff;
+    }
+    .tab-count.soft {
+      background: #fff3d8;
+      color: #7b4d00;
+    }
+    .tab.active .tab-count.soft {
+      background: rgba(255,255,255,.26);
+      color: #fff;
+    }
+    .subtabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 12px 14px;
+      background: var(--surface-soft);
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .subtab {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      background: var(--surface);
+      color: #1d1d1f;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .subtab.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    main {
+      padding: 22px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    main.profile-only .summary,
+    main.profile-only .tabs {
+      display: none;
+    }
+    .metric {
+      background: var(--surface);
+      border: 1px solid #e5e5ea;
+      border-radius: 8px;
+      padding: 14px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.03);
+    }
+    .metric strong {
+      display: block;
+      font-size: 24px;
+      margin-bottom: 3px;
+    }
+    section {
+      margin: 0 0 22px;
+      background: #fff;
+      border: 1px solid #e5e5ea;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    section.panel {
+      display: none;
+    }
+    section.panel.active {
+      display: block;
+    }
+    h2 {
+      margin: 0;
+      padding: 12px 14px;
+      font-size: 16px;
+      background: var(--surface-soft);
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .table-wrap {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 860px;
+    }
+    th, td {
+      padding: 9px 10px;
+      border-bottom: 1px solid #f0f0f2;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th {
+      background: var(--surface-soft);
+      color: #6e6e73;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .danger {
+      background: #ffe9e7;
+      color: #8f1d12;
+    }
+    .warn {
+      background: #fff3d8;
+      color: #7b4d00;
+    }
+    .ok {
+      background: #e6f6e8;
+      color: #176028;
+    }
+    .muted {
+      color: var(--muted);
+    }
+    .empty {
+      padding: 14px;
+      color: var(--muted);
+    }
+    .note {
+      margin: 0;
+      padding: 10px 14px;
+      color: #6e6e73;
+      background: #fff8e8;
+      border-bottom: 1px solid #f5dfaa;
+      font-size: 13px;
+    }
+    .filterbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      background: var(--surface-soft);
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .filterbar label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #1d1d1f;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .filterbar input {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font: inherit;
+    }
+    .profile-form {
+      display: grid;
+      gap: 14px;
+      max-width: 560px;
+      padding: 16px;
+    }
+    .profile-form label {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .profile-form input {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    .profile-form input[type="color"] {
+      width: 88px;
+      height: 44px;
+      padding: 4px;
+    }
+    .profile-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #profile-state {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .handoff-settings {
+      padding: 14px;
+      border-top: 1px solid #e5e5ea;
+      background: var(--surface-soft);
+    }
+    .handoff-settings h3 { margin: 0 0 9px; font-size: 14px; }
+    .handoff-settings textarea {
+      display: block;
+      width: min(760px, 100%);
+      min-height: 76px;
+      margin-bottom: 10px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      line-height: 1.38;
+      background: #fff;
+    }
+    #complaint-settings-state { margin-left: 9px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 800px) {
+      .dashboard-header-row { align-items: stretch; flex-direction: column; }
+      .dashboard-date-panel { min-width: 0; text-align: left; }
+      .dashboard-date-panel label { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="dashboard-header-row">
+      <div>
+        <h1 id="dashboard-title">AI Agent Monitor</h1>
+      </div>
+      <div class="dashboard-date-panel">
+        <div class="today-label">Today</div>
+        <div class="today-date" id="today-date">Loading...</div>
+        <label for="dashboard-date">Dashboard Date <input id="dashboard-date" type="date" /></label>
+      </div>
+    </div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <button id="profile-nav" type="button">Profile</button>
+  </nav>
+  <main>
+    <div class="summary" id="summary"></div>
+    <div class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button class="tab active" type="button" data-tab="customers">Customers</button>
+      <button class="tab" type="button" data-tab="order-customers">Customer List</button>
+      <button class="tab" type="button" data-tab="handoff">Handoff</button>
+      <button class="tab" type="button" data-tab="orders">Orders</button>
+      <button class="tab" type="button" data-tab="followups">Follow-ups</button>
+      <button class="tab" id="no-reply-tab" type="button" data-tab="no-reply">No Reply</button>
+      <button class="tab" type="button" data-tab="deleted">Deleted</button>
+    </div>
+    <section id="customers" class="panel active">
+      <h2>Customer List</h2>
+      <div class="subtabs" id="customer-label-tabs"></div>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="order-customers" class="panel">
+      <h2>Submitted Order Customers</h2>
+      <div class="filterbar">
+        <label for="order-customers-date">Date <input id="order-customers-date" type="date" /></label>
+        <button id="order-customers-all" type="button">All Dates</button>
+        <span class="muted" id="order-customers-count"></span>
+      </div>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="handoff" class="panel">
+      <h2>Handoff Queue</h2>
+      <div class="filterbar">
+        <label for="handoff-date">Date <input id="handoff-date" type="date" /></label>
+        <button id="handoff-all" type="button">All Dates</button>
+      </div>
+      <div class="table-wrap"></div>
+      <form class="handoff-settings" id="complaint-settings-form">
+        <h3>Complaint Acknowledgement</h3>
+        <textarea id="complaint-acknowledgement" name="acknowledgement"></textarea>
+        <button type="submit">Save Message</button>
+        <span id="complaint-settings-state"></span>
+      </form>
+    </section>
+    <section id="orders" class="panel">
+      <h2>Orders Table</h2>
+      <div class="filterbar">
+        <label for="orders-date">Date <input id="orders-date" type="date" /></label>
+        <button id="orders-all" type="button">All Dates</button>
+      </div>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="followups" class="panel">
+      <h2>Follow-Up Monitor</h2>
+      <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are placed in a dispatch queue and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute. In live WhatsApp mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
+      <div class="subtabs" id="followup-label-tabs"></div>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="no-reply" class="panel">
+      <h2>No Reply Monitor</h2>
+      <p class="note">Shows customer messages that have no recorded AI reply after ${escapeHtml(config.noReplyAlertMinutes)} minute(s). Send the case to Handoff for manual reply, or resolve it after staff have already replied.</p>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="deleted" class="panel"><h2>Deleted / Expired Customers</h2><div class="table-wrap"></div></section>
+    <section id="profile" class="panel">
+      <h2>Profile</h2>
+      <form class="profile-form" id="profile-form">
+        <label for="profile-name">Dashboard Name <input id="profile-name" name="name" maxlength="80" placeholder="AI Agent Monitor" /></label>
+        <label for="profile-color">Dashboard Color <input id="profile-color" name="accentColor" type="color" value="#0071e3" /></label>
+        <div class="profile-actions">
+          <button type="submit">Save Profile</button>
+          <span id="profile-state"></span>
+        </div>
+      </form>
+      <form class="profile-form" method="post" action="/admin/logout">
+        <div class="profile-actions">
+          <button type="submit">Logout</button>
+          <span class="muted">Sign out from this admin dashboard.</span>
+        </div>
+      </form>
+    </section>
+  </main>
+  <script>
+    const sections = {
+      customers: document.querySelector("#customers .table-wrap"),
+      orderCustomers: document.querySelector("#order-customers .table-wrap"),
+      handoff: document.querySelector("#handoff .table-wrap"),
+      orders: document.querySelector("#orders .table-wrap"),
+      followups: document.querySelector("#followups .table-wrap"),
+      noReply: document.querySelector("#no-reply .table-wrap"),
+      deleted: document.querySelector("#deleted .table-wrap")
+    };
+    let dashboardData = null;
+    let activeCustomerLabel = "ALL";
+    let activeFollowupLabel = "ALL";
+    let activeDashboardDate = localDateInput(new Date());
+    let activeOrderCustomersDate = localDateInput(new Date());
+    let activeHandoffDate = localDateInput(new Date());
+    let activeOrdersDate = localDateInput(new Date());
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+
+    function fmtTime(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return esc(value);
+      return date.toLocaleString();
+    }
+
+    function localDateInput(value) {
+      const date = value instanceof Date ? value : new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+
+    function matchesDate(value, selectedDate) {
+      if (!selectedDate) return true;
+      return localDateInput(value) === selectedDate;
+    }
+
+    function dashboardDate() {
+      return activeDashboardDate || localDateInput(new Date());
+    }
+
+    function rowsForDate(rows, key, selectedDate = dashboardDate()) {
+      if (!selectedDate) return rows;
+      return rows.filter(row => matchesDate(row[key], selectedDate));
+    }
+
+    function dashboardCustomers() {
+      return rowsForDate(dashboardData ? dashboardData.customers : [], "firstSeenAt");
+    }
+
+    function dashboardFollowups() {
+      return rowsForDate(dashboardData ? dashboardData.followups : [], "nextDueAt");
+    }
+
+    function dashboardNoReplyAlerts() {
+      return rowsForDate(dashboardData ? dashboardData.noReplyAlerts : [], "receivedAt");
+    }
+
+    function dashboardDeletedCustomers() {
+      return rowsForDate(dashboardData ? dashboardData.deletedCustomers : [], "deletedAt");
+    }
+
+    function dashboardStats(data) {
+      const selectedDate = dashboardDate();
+      const handoffRows = rowsForDate(data.handoffQueue || [], "createdAt", selectedDate);
+      const followupRows = rowsForDate(data.followups || [], "nextDueAt", selectedDate);
+      return {
+        customers: rowsForDate(data.customers || [], "firstSeenAt", selectedDate).length,
+        handoff: handoffRows.length,
+        complaints: handoffRows.filter(row => row.type === "complaint").length,
+        orders: rowsForDate(data.orders || [], "createdAt", selectedDate).length,
+        orderCustomers: new Set(rowsForDate(data.orderCustomers || [], "createdAt", selectedDate).map(row => row.customerId).filter(Boolean)).size,
+        followupsDue: followupRows.filter(row => row.status === "due").length,
+        followupsQueued: followupRows.filter(row => row.queueStatus).length,
+        deleted: rowsForDate(data.deletedCustomers || [], "deletedAt", selectedDate).length,
+        noReplyAlerts: rowsForDate(data.noReplyAlerts || [], "receivedAt", selectedDate).length,
+      };
+    }
+
+    function pill(value) {
+      const text = String(value || "");
+      let cls = "pill";
+      if (/human|required|delete|expired|due/i.test(text)) cls += " danger";
+      else if (/waiting|scheduled|pending/i.test(text)) cls += " warn";
+      else if (/active|submitted|completed|sent/i.test(text)) cls += " ok";
+      return '<span class="' + cls + '">' + esc(text) + '</span>';
+    }
+
+    function table(rows, columns) {
+      if (!rows.length) return '<div class="empty">No records yet.</div>';
+      return '<table><thead><tr>' + columns.map(c => '<th>' + esc(c.label) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map(row => '<tr>' + columns.map(c => {
+          const value = c.render ? c.render(row) : esc(row[c.key]);
+          return '<td>' + value + '</td>';
+        }).join('') + '</tr>').join('') + '</tbody></table>';
+    }
+
+    function applyDashboardProfile(profile = {}) {
+      const name = String(profile.name || "AI Agent Monitor").trim() || "AI Agent Monitor";
+      const accentColor = /^#[0-9a-fA-F]{6}$/.test(String(profile.accentColor || "")) ? profile.accentColor : "#0071e3";
+      document.querySelector("#dashboard-title").textContent = name;
+      document.documentElement.style.setProperty("--accent", accentColor);
+      document.querySelector("#profile-name").value = name;
+      document.querySelector("#profile-color").value = accentColor;
+    }
+
+    async function loadDashboard() {
+      const selectedDate = dashboardDate();
+      const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
+      const data = await response.json();
+      dashboardData = data;
+      applyDashboardProfile(data.profile);
+      document.querySelector("#today-date").textContent = new Date().toLocaleDateString(undefined, {
+        weekday: "short",
+        year: "numeric",
+        month: "short",
+        day: "numeric"
+      });
+      const stats = dashboardStats(data);
+      const summaryItems = [
+        ['Customers', stats.customers],
+        ['Handoff', stats.handoff],
+        ['Complaints', stats.complaints],
+        ['Orders', stats.orders],
+        ['No Reply Alerts', stats.noReplyAlerts]
+      ];
+      document.querySelector('#summary').innerHTML = summaryItems.map(item =>
+        '<div class="metric"><strong>' + esc(item[1]) + '</strong><span>' + esc(item[0]) + '</span></div>'
+      ).join('');
+      updateDashboardTabs(stats);
+
+      renderCustomerLabelTabs(dashboardCustomers());
+      renderCustomers();
+      renderHandoff();
+      renderComplaintSettings();
+      renderOrderCustomers();
+      renderOrders();
+
+      renderFollowupLabelTabs(dashboardFollowups());
+      renderFollowups();
+      renderNoReplyAlerts();
+
+      sections.deleted.innerHTML = table(dashboardDeletedCustomers(), [
+        { label: 'Customer', key: 'id' },
+        { label: 'Product', key: 'product' },
+        { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
+        { label: 'First Seen', key: 'firstSeenAt', render: r => fmtTime(r.firstSeenAt) },
+        { label: 'Deleted At', key: 'deletedAt', render: r => fmtTime(r.deletedAt) },
+        { label: 'Reason', key: 'deleteReason' }
+      ]);
+    }
+
+    function renderHandoff() {
+      const rows = dashboardData ? dashboardData.handoffQueue : [];
+      const filtered = rows.filter(row => matchesDate(row.createdAt, activeHandoffDate));
+      sections.handoff.innerHTML = table(filtered, [
+        { label: 'Type', key: 'type', render: r => pill(r.type) },
+        { label: 'Customer', key: 'customerId' },
+        { label: 'Product', key: 'product' },
+        { label: 'Category', key: 'category' },
+        { label: 'Customer Message', key: 'customerMessage' },
+        { label: 'Reason', key: 'reason' },
+        { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
+        { label: 'Action', key: 'caseId', render: r => r.type === 'complaint' ? '<div class="actions"><button type="button" data-complaint-reply="' + esc(r.customerId) + '">Reply</button><button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button></div>' : '' }
+      ]);
+      document.querySelectorAll("button[data-complaint-reply]").forEach(button => button.addEventListener("click", () => {
+        window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.complaintReply);
+      }));
+      document.querySelectorAll("button[data-complaint-resolve]").forEach(button => button.addEventListener("click", async () => {
+        await request("/admin/handoff/complaint/resolve", { caseId: button.dataset.complaintResolve });
+        loadDashboard();
+      }));
+    }
+
+    function renderComplaintSettings() {
+      const settings = dashboardData ? dashboardData.complaintSettings || {} : {};
+      document.querySelector("#complaint-acknowledgement").value = settings.acknowledgement || "";
+    }
+
+    async function saveComplaintSettings(event) {
+      event.preventDefault();
+      const state = document.querySelector("#complaint-settings-state");
+      state.textContent = "Saving...";
+      try {
+        const settings = await request("/admin/complaint-settings", {
+          acknowledgement: document.querySelector("#complaint-acknowledgement").value
+        });
+        dashboardData.complaintSettings = settings;
+        state.textContent = "Saved";
+      } catch (error) {
+      state.textContent = error.message;
+      }
+    }
+
+    async function saveProfile(event) {
+      event.preventDefault();
+      const state = document.querySelector("#profile-state");
+      state.textContent = "Saving...";
+      try {
+        const result = await request("/admin/profile", {
+          name: document.querySelector("#profile-name").value,
+          accentColor: document.querySelector("#profile-color").value
+        });
+        dashboardData.profile = result.profile;
+        applyDashboardProfile(result.profile);
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
+
+    function orderCustomerRows() {
+      const rows = dashboardData ? dashboardData.orderCustomers || [] : [];
+      return rows.filter(row => matchesDate(row.createdAt, activeOrderCustomersDate));
+    }
+
+    function bindReachedWarehouseButtons() {
+      document.querySelectorAll("button[data-reached-warehouse]").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        button.textContent = "Updating...";
+        try {
+          await request("/admin/orders/reached-warehouse", { orderId: button.dataset.reachedWarehouse });
+          await loadDashboard();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = error.message;
+        }
+      }));
+    }
+
+    function renderOrderCustomers() {
+      const filtered = orderCustomerRows();
+      const uniqueCustomers = new Set(filtered.map(row => row.customerId).filter(Boolean)).size;
+      document.querySelector("#order-customers-count").textContent =
+        "Total customers: " + uniqueCustomers + " | Orders: " + filtered.length;
+      sections.orderCustomers.innerHTML = table(filtered, [
+        { label: 'Order Time', key: 'orderTimestamp', render: r => fmtTime(r.orderTimestamp) },
+        { label: 'Customer', key: 'customerId' },
+        { label: 'Product', key: 'product' },
+        { label: 'Order Option', key: 'package' },
+        { label: 'Price', key: 'packagePrice' },
+        { label: 'Qty', key: 'quantity' },
+        { label: 'Add-on', key: 'addOnChoice' },
+        { label: 'Name', key: 'name' },
+        { label: 'Phone', key: 'phone' },
+        { label: 'Address', key: 'address' },
+        { label: 'Status', key: 'statusDisplay', render: r => pill(r.statusDisplay) },
+        { label: 'Action', key: 'id', render: r => r.status === 'pending_admin_order'
+          ? '<button type="button" data-reached-warehouse="' + esc(r.id) + '">Reached Warehouse</button>'
+          : '<span class="muted">-</span>' }
+      ]);
+      bindReachedWarehouseButtons();
+    }
+
+    function renderOrders() {
+      const rows = dashboardData ? dashboardData.orders : [];
+      const filtered = rows.filter(row => matchesDate(row.createdAt, activeOrdersDate));
+      sections.orders.innerHTML = table(filtered, [
+        { label: 'Order Timestamp', key: 'orderTimestamp', render: r => fmtTime(r.orderTimestamp) },
+        { label: 'Order ID', key: 'id' },
+        { label: 'WhatsApp ID', key: 'customerId' },
+        { label: 'Order Record', key: 'orderRecord' },
+        { label: 'Submitted Details', key: 'rawMessage' },
+        { label: 'Status', key: 'statusDisplay', render: r => pill(r.statusDisplay) },
+        { label: 'Status Updated', key: 'statusUpdatedAt', render: r => fmtTime(r.statusUpdatedAt) }
+      ]);
+    }
+
+    function syncPanelDatesToDashboard() {
+      activeHandoffDate = dashboardDate();
+      activeOrderCustomersDate = dashboardDate();
+      activeOrdersDate = dashboardDate();
+      const handoffDate = document.querySelector("#handoff-date");
+      const orderCustomersDate = document.querySelector("#order-customers-date");
+      const ordersDate = document.querySelector("#orders-date");
+      if (handoffDate) handoffDate.value = activeHandoffDate;
+      if (orderCustomersDate) orderCustomersDate.value = activeOrderCustomersDate;
+      if (ordersDate) ordersDate.value = activeOrdersDate;
+    }
+
+    function setupDashboardDate() {
+      const input = document.querySelector("#dashboard-date");
+      input.value = activeDashboardDate;
+      syncPanelDatesToDashboard();
+      input.addEventListener("change", () => {
+        activeDashboardDate = input.value || localDateInput(new Date());
+        syncPanelDatesToDashboard();
+        loadDashboard();
+      });
+    }
+
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Action failed.");
+      return result;
+    }
+
+    function setTabLabel(tabId, label, counts) {
+      const tab = document.querySelector('.tab[data-tab="' + tabId + '"]');
+      if (!tab) return;
+      const badges = counts.map(item => {
+        const cls = item.soft ? "tab-count soft" : "tab-count";
+        const title = item.title ? ' title="' + esc(item.title) + '"' : "";
+        return '<span class="' + cls + '"' + title + '>' + esc(item.value) + '</span>';
+      }).join("");
+      tab.innerHTML = '<span>' + esc(label) + '</span>' + badges;
+    }
+
+    function updateDashboardTabs(stats) {
+      setTabLabel("customers", "Customers", [{ value: stats.customers }]);
+      setTabLabel("order-customers", "Customer List", [{ value: stats.orderCustomers }]);
+      setTabLabel("handoff", "Handoff", [
+        { value: stats.handoff, title: "Handoff" },
+        { value: stats.complaints, title: "Complaints", soft: true }
+      ]);
+      setTabLabel("orders", "Orders", [{ value: stats.orders }]);
+      setTabLabel("followups", "Follow-ups", [
+        { value: stats.followupsDue, title: "Due" },
+        { value: stats.followupsQueued, title: "Queued", soft: true }
+      ]);
+      setTabLabel("no-reply", "No Reply", [{ value: stats.noReplyAlerts }]);
+      setTabLabel("deleted", "Deleted", [{ value: stats.deleted }]);
+    }
+
+    function renderNoReplyAlerts() {
+      const rows = dashboardNoReplyAlerts();
+      if (!rows.length) {
+        sections.noReply.innerHTML = '<div class="empty">No unanswered customer messages waiting for review.</div>';
+        return;
+      }
+      sections.noReply.innerHTML = table(rows, [
+        { label: 'Received', key: 'receivedAt', render: r => fmtTime(r.receivedAt) },
+        { label: 'Customer', key: 'customerId' },
+        { label: 'Product', key: 'product' },
+        { label: 'Waiting', key: 'waitingMinutes', render: r => pill(r.waitingMinutes + ' min') },
+        { label: 'Customer Message', key: 'customerMessage' },
+        { label: 'Reason', key: 'reason' },
+        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-no-reply-reply="' + esc(r.customerId) + '">Reply</button><button type="button" data-no-reply-handoff="' + esc(r.customerId) + '">Send to Handoff</button><button type="button" data-no-reply-resolve="' + esc(r.customerId) + '" data-message-id="' + esc(r.inboundMessageId) + '">Mark Resolved</button></div>' }
+      ]);
+      document.querySelectorAll("button[data-no-reply-reply]").forEach(button => button.addEventListener("click", () => {
+        window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.noReplyReply);
+      }));
+      document.querySelectorAll("button[data-no-reply-handoff]").forEach(button => button.addEventListener("click", async () => {
+        await request("/admin/no-reply/handoff", { customerId: button.dataset.noReplyHandoff });
+        loadDashboard();
+      }));
+      document.querySelectorAll("button[data-no-reply-resolve]").forEach(button => button.addEventListener("click", async () => {
+        await request("/admin/no-reply/resolve", {
+          customerId: button.dataset.noReplyResolve,
+          inboundMessageId: button.dataset.messageId
+        });
+        loadDashboard();
+      }));
+    }
+
+    function renderCustomerLabelTabs(customers) {
+      const labels = ["ALL", "NEW"];
+      for (let day = 1; day <= 10; day += 1) labels.push("DAY " + day);
+      labels.push("OPTED OUT");
+      labels.push("DELETE");
+      const counts = new Map(labels.map(label => [label, 0]));
+      counts.set("ALL", customers.length);
+      for (const customer of customers) {
+        counts.set(customer.labelDisplay, (counts.get(customer.labelDisplay) || 0) + 1);
+      }
+      if (!labels.includes(activeCustomerLabel)) activeCustomerLabel = "ALL";
+      document.querySelector("#customer-label-tabs").innerHTML = labels.map(label => {
+        const active = label === activeCustomerLabel ? " active" : "";
+        return '<button type="button" class="subtab' + active + '" data-label="' + esc(label) + '">' +
+          esc(label) + ' (' + esc(counts.get(label) || 0) + ')</button>';
+      }).join("");
+      document.querySelectorAll("#customer-label-tabs .subtab").forEach(button => {
+        button.addEventListener("click", () => {
+          activeCustomerLabel = button.dataset.label;
+          renderCustomerLabelTabs(dashboardCustomers());
+          renderCustomers();
+        });
+      });
+    }
+
+    function renderCustomers() {
+      const customers = dashboardCustomers();
+      const filtered = activeCustomerLabel === "ALL"
+        ? customers
+        : customers.filter(customer => customer.labelDisplay === activeCustomerLabel);
+      sections.customers.innerHTML = table(filtered, [
+        { label: 'WhatsApp ID', key: 'whatsappId' },
+        { label: 'Product', key: 'product' },
+        { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
+        { label: 'Status', key: 'status', render: r => pill(r.status) },
+        { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
+        { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
+        { label: 'Inbound', key: 'inboundCount' }
+      ]);
+    }
+
+    function renderFollowupLabelTabs(followups) {
+      const labels = ["ALL", "NEW"];
+      for (let day = 1; day <= 10; day += 1) labels.push("DAY " + day);
+      labels.push("OPTED OUT");
+      labels.push("DELETE");
+      const counts = new Map(labels.map(label => [label, 0]));
+      counts.set("ALL", followups.length);
+      for (const row of followups) {
+        counts.set(row.labelDisplay, (counts.get(row.labelDisplay) || 0) + 1);
+      }
+      if (!labels.includes(activeFollowupLabel)) activeFollowupLabel = "ALL";
+      document.querySelector("#followup-label-tabs").innerHTML = labels.map(label => {
+        const active = label === activeFollowupLabel ? " active" : "";
+        return '<button type="button" class="subtab' + active + '" data-label="' + esc(label) + '">' +
+          esc(label) + ' (' + esc(counts.get(label) || 0) + ')</button>';
+      }).join("");
+      document.querySelectorAll("#followup-label-tabs .subtab").forEach(button => {
+        button.addEventListener("click", () => {
+          activeFollowupLabel = button.dataset.label;
+          renderFollowupLabelTabs(dashboardFollowups());
+          renderFollowups();
+        });
+      });
+    }
+
+    function renderFollowups() {
+      const followups = dashboardFollowups();
+      const filtered = activeFollowupLabel === "ALL"
+        ? followups
+        : followups.filter(row => row.labelDisplay === activeFollowupLabel);
+      sections.followups.innerHTML = table(filtered, [
+        { label: 'Customer', key: 'customerId' },
+        { label: 'Product', key: 'product' },
+        { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
+        { label: 'Follow-Up Stage', key: 'nextFollowup', render: r => esc(followupStageName(r.nextFollowup)) },
+        { label: 'Scheduled Send Time', key: 'nextDueAt', render: r => fmtTime(r.nextDueAt) },
+        { label: 'Status', key: 'status', render: r => pill(r.status) },
+        { label: 'Dispatch Queue', key: 'queueStatus', render: r => r.queueStatus ? pill(r.queueStatus + (r.queueAttempts ? ' / attempt ' + r.queueAttempts : '')) : '-' },
+        { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
+        { label: 'Sent Count', key: 'sentCount', render: r => esc((r.sentCount || 0) + ' / ' + (r.totalFollowups || 0)) },
+        { label: 'First Follow-Up Sent', key: 'sentFirst', render: r => fmtTime(r.sentFirst) },
+        { label: 'Second Follow-Up Sent', key: 'sentDay1', render: r => fmtTime(r.sentDay1) }
+      ]);
+    }
+
+    function followupStageName(value) {
+      if (value === "first_day_followup") return "First follow-up";
+      if (value === "day_1_followup") return "Second follow-up";
+      const dayMatch = String(value || "").match(/^day_(\d+)_followup$/);
+      if (dayMatch) return "Day " + dayMatch[1] + " follow-up";
+      return "-";
+    }
+
+    function setupDateFilter(inputId, allId, getValue, setValue, render) {
+      const input = document.querySelector(inputId);
+      input.value = getValue();
+      input.addEventListener("change", () => {
+        setValue(input.value);
+        render();
+      });
+      document.querySelector(allId).addEventListener("click", () => {
+        setValue("");
+        input.value = "";
+        render();
+      });
+    }
+
+    setupDateFilter("#handoff-date", "#handoff-all", () => activeHandoffDate, value => activeHandoffDate = value, renderHandoff);
+    setupDateFilter("#order-customers-date", "#order-customers-all", () => activeOrderCustomersDate, value => activeOrderCustomersDate = value, renderOrderCustomers);
+    setupDateFilter("#orders-date", "#orders-all", () => activeOrdersDate, value => activeOrdersDate = value, renderOrders);
+    function openDashboardTab(tabId) {
+      document.querySelector("main").classList.toggle("profile-only", tabId === "profile");
+      document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab.dataset.tab === tabId));
+      document.querySelector("#profile-nav").classList.toggle("active", tabId === "profile");
+      document.querySelectorAll('.panel').forEach(panel => panel.classList.toggle('active', panel.id === tabId));
+    }
+
+    document.querySelector("#complaint-settings-form").addEventListener("submit", saveComplaintSettings);
+    document.querySelector("#profile-form").addEventListener("submit", saveProfile);
+    document.querySelector('#refresh').addEventListener('click', loadDashboard);
+    document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
+    document.querySelectorAll('.tab').forEach(button => {
+      button.addEventListener('click', () => openDashboardTab(button.dataset.tab));
+    });
+    setupDashboardDate();
+    if (new URLSearchParams(window.location.search).get("tab") === "profile") openDashboardTab("profile");
+    loadDashboard();
+    setInterval(loadDashboard, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function adminChatPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WhatsApp Chat Inbox</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #fff; --soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; min-height: 18px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    main { max-width: 1320px; margin: 0 auto; padding: 18px; }
+    .chat-shell { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); min-height: calc(100vh - 150px); border: 1px solid #e5e5ea; border-radius: 10px; background: var(--surface); overflow: hidden; }
+    .sidebar { border-right: 1px solid #e5e5ea; background: var(--soft); display: grid; grid-template-rows: auto 1fr; min-width: 0; }
+    .sidebar-tools { padding: 12px; border-bottom: 1px solid #e5e5ea; display: grid; gap: 8px; }
+    .sidebar-tools label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .sidebar-tools input { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    .customer-list { overflow: auto; }
+    .customer-item { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid #e5e5ea; border-radius: 0; padding: 12px; background: transparent; color: #1d1d1f; }
+    .customer-item:hover, .customer-item.active { background: #fff; }
+    .customer-item strong { display: block; overflow-wrap: anywhere; }
+    .customer-item span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .pane { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+    .chat-header { padding: 14px 16px; border-bottom: 1px solid #e5e5ea; background: #fff; }
+    .chat-header strong { display: block; overflow-wrap: anywhere; }
+    .chat-header span { color: var(--muted); font-size: 13px; }
+    .thread { padding: 18px; overflow: auto; background: #f7f7f8; }
+    .row { display: flex; margin: 0 0 10px; }
+    .row.customer { justify-content: flex-start; }
+    .row.agent, .row.staff, .row.admin { justify-content: flex-end; }
+    .bubble { max-width: min(680px, 86%); padding: 9px 11px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.38; border: 1px solid #e5e5ea; background: #fff; }
+    .row.customer .bubble { background: #fff; }
+    .row.agent .bubble { background: #e8f2ff; border-color: #cfe4ff; }
+    .row.staff .bubble { background: #dff6dd; border-color: #bee8ba; }
+    .row.admin .bubble { background: #fff8e8; border-color: #f5dfaa; }
+    .meta { margin-bottom: 5px; color: var(--muted); font-size: 11px; font-weight: 700; }
+    .composer { padding: 12px; border-top: 1px solid #e5e5ea; background: #fff; }
+    .composer-state { min-height: 18px; color: var(--muted); font-size: 12px; margin-bottom: 7px; }
+    .composer-row { display: flex; gap: 8px; align-items: end; }
+    textarea { flex: 1; min-height: 58px; max-height: 160px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; }
+    textarea:focus, input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    .composer button { min-width: 80px; background: var(--accent); border-color: var(--accent); color: #fff; }
+    .empty { color: var(--muted); padding: 18px; }
+    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="chat-title">WhatsApp Chat Inbox</h1>
+    <div class="sub" id="status">Loading conversations...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <div class="chat-shell">
+      <aside class="sidebar">
+        <div class="sidebar-tools">
+          <label for="chat-date">Conversation Date <input id="chat-date" type="date" /></label>
+          <input id="search" placeholder="Search customer or product..." />
+        </div>
+        <div class="customer-list" id="customer-list"></div>
+      </aside>
+      <section class="pane">
+        <div class="chat-header" id="chat-header"><strong>No customer selected</strong><span>Select a customer on the left.</span></div>
+        <div class="thread" id="thread"><div class="empty">No conversation selected.</div></div>
+        <form class="composer" id="composer">
+          <div class="composer-state" id="composer-state"></div>
+          <div class="composer-row">
+            <textarea id="reply-text" maxlength="${escapeHtml(config.maxReplyChars)}" placeholder="Type manual WhatsApp reply..." disabled></textarea>
+            <button id="send-reply" type="submit" disabled>Send</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </main>
+  <script>
+    let data = null;
+    let activeCustomerId = new URLSearchParams(window.location.search).get("customerId") || "";
+    const list = document.querySelector("#customer-list");
+    const thread = document.querySelector("#thread");
+    const header = document.querySelector("#chat-header");
+    const chatDate = document.querySelector("#chat-date");
+    const search = document.querySelector("#search");
+    const replyText = document.querySelector("#reply-text");
+    const sendButton = document.querySelector("#send-reply");
+    const state = document.querySelector("#composer-state");
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function fmtTime(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    }
+    function applyProfile(profile = {}) {
+      const name = String(profile.name || "").trim();
+      const accentColor = /^#[0-9a-fA-F]{6}$/.test(String(profile.accentColor || "")) ? profile.accentColor : "#0071e3";
+      document.documentElement.style.setProperty("--accent", accentColor);
+      document.querySelector("#chat-title").textContent = name ? name + " Chat Inbox" : "WhatsApp Chat Inbox";
+    }
+    function localDateInput(value) {
+      const date = value instanceof Date ? value : new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Request failed");
+      return result;
+    }
+    function customerRows() {
+      const q = search.value.trim().toLowerCase();
+      const rows = data ? data.customers || [] : [];
+      return rows.filter(customer => {
+        if (!q) return true;
+        return [customer.id, customer.product, customer.name, customer.status, customer.labelDisplay]
+          .some(value => String(value || "").toLowerCase().includes(q));
+      }).sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
+    }
+    function renderList() {
+      const rows = customerRows();
+      if (!rows.length) {
+        list.innerHTML = '<div class="empty">No customers found.</div>';
+        return;
+      }
+      if (!activeCustomerId || !rows.some(customer => customer.id === activeCustomerId)) {
+        activeCustomerId = rows[0].id;
+      }
+      list.innerHTML = rows.map(customer => {
+        const active = customer.id === activeCustomerId ? " active" : "";
+        return '<button type="button" class="customer-item' + active + '" data-customer-id="' + esc(customer.id) + '">' +
+          '<strong>' + esc(customer.id) + '</strong>' +
+          '<span>' + esc(customer.product || '-') + ' | ' + esc(customer.status || '-') + '</span>' +
+          '<span>Last: ' + esc(fmtTime(customer.lastMessageAt)) + '</span>' +
+        '</button>';
+      }).join("");
+      list.querySelectorAll("button[data-customer-id]").forEach(button => {
+        button.addEventListener("click", () => {
+          activeCustomerId = button.dataset.customerId;
+          render();
+        });
+      });
+    }
+    function renderThread() {
+      const customer = (data.customers || []).find(item => item.id === activeCustomerId);
+      replyText.disabled = !customer;
+      sendButton.disabled = !customer;
+      if (!customer) {
+        header.innerHTML = '<strong>No customer selected</strong><span>Select a customer on the left.</span>';
+        thread.innerHTML = '<div class="empty">No conversation selected.</div>';
+        return;
+      }
+      header.innerHTML = '<strong>' + esc(customer.id) + '</strong><span>' +
+        esc(customer.product || '-') + ' | ' + esc(customer.status || '-') + ' | ' + esc(customer.guardrail || '') +
+        '</span>';
+      const messages = (data.conversationMessages || [])
+        .filter(message => message.to === activeCustomerId || message.from === activeCustomerId)
+        .slice()
+        .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+      if (!messages.length) {
+        thread.innerHTML = '<div class="empty">No messages for this customer yet.</div>';
+        return;
+      }
+      thread.innerHTML = messages.map(message => {
+        const role = message.direction === "inbound" ? "customer" : message.channel === "business_admin" ? "staff" : message.channel === "admin" ? "admin" : "agent";
+        const label = role === "customer" ? "Customer" : role === "staff" ? "You" : role === "admin" ? "Admin alert" : "AI agent";
+        return '<div class="row ' + role + '"><div class="bubble">' +
+          '<div class="meta">' + esc(label) + ' | ' + esc(fmtTime(message.createdAt)) + '</div>' +
+          esc(message.body || '') +
+        '</div></div>';
+      }).join("");
+      thread.scrollTop = thread.scrollHeight;
+    }
+    function render() {
+      renderList();
+      renderThread();
+    }
+    async function load() {
+      const selectedDate = chatDate.value || localDateInput(new Date());
+      const response = await fetch("/admin/dashboard-data?date=" + encodeURIComponent(selectedDate));
+      data = await response.json();
+      applyProfile(data.profile);
+      document.querySelector("#status").textContent = "Loaded " + (data.customers || []).length + " customer(s) for " + selectedDate + ".";
+      render();
+    }
+    document.querySelector("#composer").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = replyText.value.trim();
+      if (!activeCustomerId || !text) return;
+      sendButton.disabled = true;
+      state.textContent = "Sending to " + activeCustomerId + "...";
+      try {
+        await request("/admin/manual-reply", { customerId: activeCustomerId, text });
+        replyText.value = "";
+        state.textContent = "Sent.";
+        await load();
+      } catch (error) {
+        state.textContent = error.message;
+      } finally {
+        sendButton.disabled = false;
+        replyText.focus();
+      }
+    });
+    search.addEventListener("input", render);
+    chatDate.value = localDateInput(new Date());
+    chatDate.addEventListener("change", () => {
+      activeCustomerId = "";
+      load().catch(error => {
+        document.querySelector("#status").textContent = error.message;
+      });
+    });
+    document.querySelector("#refresh").addEventListener("click", load);
+    load().catch(error => {
+      document.querySelector("#status").textContent = error.message;
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function replyLibraryPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reply Library</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #fff; --soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; min-height: 18px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    main { max-width: 1280px; margin: 0 auto; padding: 22px; display: grid; gap: 14px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--soft); border-bottom: 1px solid #e5e5ea; }
+    .note { padding: 10px 14px; color: var(--muted); font-size: 13px; border-bottom: 1px solid #f0f0f2; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; min-width: 760px; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; line-height: 1.4; }
+    th { background: var(--soft); color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    td.reply { white-space: pre-wrap; max-width: 380px; }
+    .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #e6f6e8; color: #176028; font-size: 12px; font-weight: 700; }
+    .pill.off { background: #f0f0f2; color: var(--muted); }
+    .empty { padding: 14px; color: var(--muted); }
+    .editor { padding: 14px; display: grid; gap: 12px; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
+    .field { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
+    .field.wide { grid-column: 1 / -1; }
+    input, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    input:focus, textarea:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    textarea { min-height: 88px; resize: vertical; line-height: 1.42; }
+    textarea.reply { min-height: 118px; }
+    .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+    .editor-actions label { display: inline-flex; align-items: center; gap: 7px; margin-right: auto; font-size: 13px; font-weight: 700; }
+    .editor-actions input { width: auto; padding: 0; }
+    #faq-state, #sales-state { color: var(--muted); font-size: 13px; min-height: 18px; }
+    @media (max-width: 720px) { main { padding: 14px; } .fields { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Reply Library</h1>
+    <div class="sub" id="page-state">Loading general replies...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <section>
+      <h2>General FAQ</h2>
+      <div class="note">For business-level questions only, such as delivery, location, COD, payment, pickup, and stock arrival. Product-specific FAQs stay inside each product setup.</div>
+      <div class="table-wrap" id="faq-list"></div>
+    </section>
+    <section>
+      <h2 id="faq-title">New General FAQ</h2>
+      <form id="faq-form" class="editor">
+        <input id="faq-id" type="hidden" />
+        <div class="fields">
+          <label class="field wide" for="faq-topic">Topic <input id="faq-topic" required /></label>
+          <label class="field wide" for="faq-examples">Example Customer Questions <textarea id="faq-examples" required></textarea></label>
+          <label class="field wide" for="faq-reply">Approved Reply <textarea class="reply" id="faq-reply" required></textarea></label>
+        </div>
+        <div class="editor-actions">
+          <label for="faq-active"><input id="faq-active" type="checkbox" checked /> Active</label>
+          <button id="new-faq" type="button">New General FAQ</button>
+          <button class="primary" id="save-faq" type="submit">Save FAQ</button>
+        </div>
+        <div id="faq-state"></div>
+      </form>
+    </section>
+    <section>
+      <h2>General Sales Replies</h2>
+      <div class="note">For sales objections and hesitation replies that can apply across products. Sales replies are general only.</div>
+      <div class="table-wrap" id="sales-list"></div>
+    </section>
+    <section>
+      <h2 id="sales-title">New General Sales Reply</h2>
+      <form id="sales-form" class="editor">
+        <input id="sales-id" type="hidden" />
+        <div class="fields">
+          <label class="field wide" for="sales-objection">Objection Type <input id="sales-objection" placeholder="price_concern, thinking_first, fear_concern" required /></label>
+          <label class="field wide" for="sales-intent">Intent Description <textarea id="sales-intent" required></textarea></label>
+          <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
+          <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
+          <label class="field wide" for="sales-followup">Optional Follow-Up Prompt <textarea id="sales-followup"></textarea></label>
+        </div>
+        <div class="editor-actions">
+          <label for="sales-active"><input id="sales-active" type="checkbox" checked /> Active</label>
+          <button id="new-sales" type="button">New General Sales Reply</button>
+          <button class="primary" id="save-sales" type="submit">Save Sales Reply</button>
+        </div>
+        <div id="sales-state"></div>
+      </form>
+    </section>
+  </main>
+  <script>
+    let faqLibrary = { general: [] };
+    let salesLibrary = { general: [] };
+    function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]); }
+    function renderFaqRows(records) {
+      if (!records.length) return '<div class="empty">No general FAQs yet.</div>';
+      return '<table><thead><tr><th>Topic</th><th>Example Questions</th><th>Approved Reply</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(faq => {
+        const questions = (faq.example_questions || []).map(esc).join('<br>');
+        const status = faq.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
+        return '<tr><td>' + esc(faq.topic) + '</td><td>' + questions + '</td><td class="reply">' + esc(faq.approved_reply) + '</td><td>' + status + '</td><td><button type="button" class="edit-faq" data-id="' + esc(faq.id) + '">Edit</button> <button type="button" class="delete-faq" data-id="' + esc(faq.id) + '" data-topic="' + esc(faq.topic || faq.id) + '">Delete</button></td></tr>';
+      }).join('') + '</tbody></table>';
+    }
+    function renderSalesRows(records) {
+      if (!records.length) return '<div class="empty">No general sales replies yet.</div>';
+      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Follow-Up</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(reply => {
+        const examples = (reply.example_messages || []).map(esc).join('<br>');
+        const status = reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
+        return '<tr><td>' + esc(reply.objection_type) + '</td><td>' + esc(reply.intent || "") + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td class="reply">' + esc(reply.followup_prompt || "") + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(reply.objection_type || reply.id) + '">Delete</button></td></tr>';
+      }).join('') + '</tbody></table>';
+    }
+    function renderFaq() {
+      document.querySelector("#faq-list").innerHTML = renderFaqRows(faqLibrary.general || []);
+      document.querySelectorAll(".edit-faq").forEach(button => button.addEventListener("click", () => editFaq(button.dataset.id)));
+      document.querySelectorAll(".delete-faq").forEach(button => button.addEventListener("click", () => deleteFaq(button.dataset.id, button.dataset.topic)));
+    }
+    function renderSales() {
+      document.querySelector("#sales-list").innerHTML = renderSalesRows(salesLibrary.general || []);
+      document.querySelectorAll(".edit-sales").forEach(button => button.addEventListener("click", () => editSales(button.dataset.id)));
+      document.querySelectorAll(".delete-sales").forEach(button => button.addEventListener("click", () => deleteSales(button.dataset.id, button.dataset.label)));
+    }
+    function newFaq() {
+      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = "";
+    }
+    function editFaq(id) {
+      const faq = (faqLibrary.general || []).find(item => item.id === id); if (!faq) return;
+      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic").value = faq.topic || ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = "";
+    }
+    function newSales() {
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-objection").value = ""; document.querySelector("#sales-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-followup").value = ""; document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+    }
+    function editSales(id) {
+      const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-objection").value = reply.objection_type || ""; document.querySelector("#sales-intent").value = reply.intent || ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-followup").value = reply.followup_prompt || ""; document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+    }
+    async function loadFaq() {
+      const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
+    }
+    async function loadSales() {
+      const response = await fetch("/admin/sales-replies-data"); salesLibrary = await response.json(); if (!response.ok) throw new Error(salesLibrary.error || "Could not load sales replies"); renderSales();
+    }
+    async function saveFaq(event) {
+      event.preventDefault(); const button = document.querySelector("#save-faq"); const state = document.querySelector("#faq-state"); button.disabled = true; state.textContent = "Saving...";
+      try {
+        const response = await fetch("/admin/faq-library/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#faq-id").value, scope: "general", topic: document.querySelector("#faq-topic").value, exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#faq-reply").value, active: document.querySelector("#faq-active").checked }) });
+        const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); faqLibrary = result.data; renderFaq(); editFaq(result.faq.id); state.textContent = "Saved";
+      } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
+    }
+    async function saveSales(event) {
+      event.preventDefault(); const button = document.querySelector("#save-sales"); const state = document.querySelector("#sales-state"); button.disabled = true; state.textContent = "Saving...";
+      try {
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", objectionType: document.querySelector("#sales-objection").value, intent: document.querySelector("#sales-intent").value, exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, followupPrompt: document.querySelector("#sales-followup").value, active: document.querySelector("#sales-active").checked }) });
+        const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
+      } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
+    }
+    async function deleteFaq(id, topic) {
+      if (!window.confirm('Delete FAQ "' + (topic || id) + '"?')) return;
+      const response = await fetch("/admin/faq-library/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope: "general", id }) });
+      const result = await response.json(); if (!response.ok) { document.querySelector("#faq-state").textContent = result.error || "Delete failed"; return; }
+      faqLibrary = result.data; renderFaq(); newFaq(); document.querySelector("#faq-state").textContent = "Deleted";
+    }
+    async function deleteSales(id, label) {
+      if (!window.confirm('Delete sales reply "' + (label || id) + '"?')) return;
+      const response = await fetch("/admin/sales-replies/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope: "general", id }) });
+      const result = await response.json(); if (!response.ok) { document.querySelector("#sales-state").textContent = result.error || "Delete failed"; return; }
+      salesLibrary = result.data; renderSales(); newSales(); document.querySelector("#sales-state").textContent = "Deleted";
+    }
+    document.querySelector("#new-faq").addEventListener("click", newFaq);
+    document.querySelector("#new-sales").addEventListener("click", newSales);
+    document.querySelector("#faq-form").addEventListener("submit", saveFaq);
+    document.querySelector("#sales-form").addEventListener("submit", saveSales);
+    document.querySelector("#refresh").addEventListener("click", () => { loadFaq(); loadSales(); });
+    Promise.all([loadFaq(), loadSales()]).then(() => { newFaq(); newSales(); document.querySelector("#page-state").textContent = "General replies ready"; }).catch(error => { document.querySelector("#page-state").textContent = error.message; });
+  </script>
+</body>
+</html>`;
+}
+
+function faqLibraryPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reply Library</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #fff; --soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; min-height: 18px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    main { max-width: 1380px; margin: 0 auto; padding: 22px; display: grid; gap: 14px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--soft); border-bottom: 1px solid #e5e5ea; }
+    .section-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; background: var(--soft); border-bottom: 1px solid #e5e5ea; }
+    .section-tools label { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; }
+    select, input, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    select:focus, input:focus, textarea:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    select { min-width: 230px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; min-width: 760px; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; line-height: 1.4; }
+    th { background: var(--soft); color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    td.reply { white-space: pre-wrap; max-width: 360px; }
+    .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #e6f6e8; color: #176028; font-size: 12px; font-weight: 700; }
+    .pill.off { background: #f0f0f2; color: var(--muted); }
+    .empty { padding: 14px; color: var(--muted); }
+    .editor { padding: 14px; display: grid; gap: 12px; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
+    .field { display: grid; gap: 7px; color: #1d1d1f; font-size: 13px; font-weight: 700; }
+    .field.wide { grid-column: 1 / -1; }
+    textarea { min-height: 92px; resize: vertical; line-height: 1.42; }
+    textarea.reply { min-height: 112px; }
+    .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+    .editor-actions label { display: inline-flex; align-items: center; gap: 7px; margin-right: auto; font-size: 13px; font-weight: 700; }
+    .editor-actions input { width: auto; padding: 0; }
+    #save-state, #sales-save-state { color: var(--muted); font-size: 13px; min-height: 18px; }
+    @media (max-width: 720px) { main { padding: 14px; } .fields { grid-template-columns: 1fr; } select { min-width: 0; max-width: 100%; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Reply Library</h1>
+    <div class="sub" id="page-state">Loading approved replies and sales replies...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <section>
+      <h2>General FAQ</h2>
+      <div class="table-wrap" id="general-list"></div>
+    </section>
+    <section>
+      <h2>Product FAQ</h2>
+      <div class="section-tools">
+        <label for="list-product">Product <select id="list-product"></select></label>
+        <button id="new-product-faq" type="button">New Product FAQ</button>
+      </div>
+      <div class="table-wrap" id="product-list"></div>
+    </section>
+    <section>
+      <h2 id="editor-title">New General FAQ</h2>
+      <form id="faq-form" class="editor">
+        <input id="faq-id" type="hidden" />
+        <div class="fields">
+          <label class="field" for="faq-scope">Scope
+            <select id="faq-scope">
+              <option value="general">General</option>
+              <option value="product">Product</option>
+            </select>
+          </label>
+          <label class="field" for="faq-product">Product
+            <select id="faq-product" disabled></select>
+          </label>
+          <label class="field wide" for="faq-topic">Topic
+            <input id="faq-topic" required />
+          </label>
+          <label class="field wide" for="faq-examples">Example Customer Questions
+            <textarea id="faq-examples" required></textarea>
+          </label>
+          <label class="field wide" for="faq-reply">Approved Reply
+            <textarea class="reply" id="faq-reply" required></textarea>
+          </label>
+        </div>
+        <div class="editor-actions">
+          <label for="faq-active"><input id="faq-active" type="checkbox" checked /> Active</label>
+          <button id="new-general-faq" type="button">New General FAQ</button>
+          <button class="primary" id="save-faq" type="submit">Save FAQ</button>
+        </div>
+        <div id="save-state"></div>
+      </form>
+    </section>
+    <section>
+      <h2>General Sales Replies</h2>
+      <div class="table-wrap" id="sales-general-list"></div>
+    </section>
+    <section>
+      <h2>Product Sales Replies</h2>
+      <div class="section-tools">
+        <label for="sales-list-product">Product <select id="sales-list-product"></select></label>
+        <button id="sales-new-product-reply" type="button">New Product Sales Reply</button>
+      </div>
+      <div class="table-wrap" id="sales-product-list"></div>
+    </section>
+    <section>
+      <h2 id="sales-editor-title">New General Sales Reply</h2>
+      <form id="sales-reply-form" class="editor">
+        <input id="sales-reply-id" type="hidden" />
+        <div class="fields">
+          <label class="field" for="sales-reply-scope">Scope
+            <select id="sales-reply-scope">
+              <option value="general">General</option>
+              <option value="product">Product</option>
+            </select>
+          </label>
+          <label class="field" for="sales-reply-product">Product
+            <select id="sales-reply-product"></select>
+          </label>
+          <label class="field wide" for="sales-reply-objection">Objection Type
+            <input id="sales-reply-objection" placeholder="price_concern, thinking_first, fear_concern" required />
+          </label>
+          <label class="field wide" for="sales-reply-intent">Intent Description
+            <textarea id="sales-reply-intent" required placeholder="Customer feels the price is expensive or asks for discount."></textarea>
+          </label>
+          <label class="field wide" for="sales-reply-examples">Example Customer Messages
+            <textarea id="sales-reply-examples" required placeholder="Mahal&#10;Ada kurang?&#10;Boleh discount?"></textarea>
+          </label>
+          <label class="field wide" for="sales-reply-approved">Approved Sales Reply
+            <textarea class="reply" id="sales-reply-approved" required></textarea>
+          </label>
+          <label class="field wide" for="sales-reply-followup">Optional Follow-Up Prompt
+            <textarea id="sales-reply-followup" placeholder="Mau saya hold promo untuk kita dulu?"></textarea>
+          </label>
+        </div>
+        <div class="editor-actions">
+          <label for="sales-reply-active"><input id="sales-reply-active" type="checkbox" checked /> Active</label>
+          <button id="sales-new-general-reply" type="button">New General Sales Reply</button>
+          <button class="primary" id="sales-save-reply" type="submit">Save Sales Reply</button>
+        </div>
+        <div id="sales-save-state"></div>
+      </form>
+    </section>
+  </main>
+  <script>
+    let library = { general: [], products: [] };
+    let selectedProductId = "";
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+
+    function productById(id) {
+      return library.products.find(function(product) { return product.id === id; });
+    }
+
+    function renderRows(records, scope, productId) {
+      if (!records.length) return '<div class="empty">No approved FAQs yet.</div>';
+      return '<table><thead><tr><th>Topic</th><th>Example Questions</th><th>Approved Reply</th><th>Status</th><th></th></tr></thead><tbody>' +
+        records.map(function(faq) {
+          const questions = (faq.example_questions || []).map(esc).join('<br>');
+          const status = faq.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
+          return '<tr><td>' + esc(faq.topic) + '</td><td>' + questions + '</td><td class="reply">' +
+            esc(faq.approved_reply) + '</td><td>' + status + '</td><td><button type="button" class="edit-faq" data-scope="' +
+            esc(scope) + '" data-product="' + esc(productId || "") + '" data-id="' + esc(faq.id) + '">Edit</button> ' +
+            '<button type="button" class="delete-faq" data-scope="' + esc(scope) + '" data-product="' +
+            esc(productId || "") + '" data-id="' + esc(faq.id) + '" data-topic="' + esc(faq.topic || faq.id) +
+            '">Delete</button></td></tr>';
+        }).join('') + '</tbody></table>';
+    }
+
+    function fillProductOptions() {
+      const options = library.products.map(function(product) {
+        return '<option value="' + esc(product.id) + '">' + esc(product.name) + '</option>';
+      }).join('');
+      document.querySelector("#list-product").innerHTML = options;
+      document.querySelector("#faq-product").innerHTML = options;
+      if (!selectedProductId && library.products[0]) selectedProductId = library.products[0].id;
+      document.querySelector("#list-product").value = selectedProductId;
+      document.querySelector("#faq-product").value = selectedProductId;
+    }
+
+    function bindEditButtons() {
+      document.querySelectorAll(".edit-faq").forEach(function(button) {
+        button.addEventListener("click", function() {
+          editFaq(button.dataset.scope, button.dataset.product, button.dataset.id);
+        });
+      });
+      document.querySelectorAll(".delete-faq").forEach(function(button) {
+        button.addEventListener("click", function() {
+          deleteFaq(button.dataset.scope, button.dataset.product, button.dataset.id, button.dataset.topic);
+        });
+      });
+    }
+
+    function render() {
+      fillProductOptions();
+      document.querySelector("#general-list").innerHTML = renderRows(library.general, "general", "");
+      const product = productById(selectedProductId);
+      document.querySelector("#product-list").innerHTML = renderRows(product ? product.faqs : [], "product", selectedProductId);
+      bindEditButtons();
+    }
+
+    function setScope(scope) {
+      const isProduct = scope === "product";
+      document.querySelector("#faq-scope").value = scope;
+      document.querySelector("#faq-product").disabled = !isProduct;
+    }
+
+    function newFaq(scope) {
+      document.querySelector("#faq-id").value = "";
+      document.querySelector("#faq-topic").value = "";
+      document.querySelector("#faq-examples").value = "";
+      document.querySelector("#faq-reply").value = "";
+      document.querySelector("#faq-active").checked = true;
+      setScope(scope);
+      document.querySelector("#editor-title").textContent = scope === "product" ? "New Product FAQ" : "New General FAQ";
+      document.querySelector("#save-state").textContent = "";
+      document.querySelector("#faq-topic").focus();
+    }
+
+    function editFaq(scope, productId, id) {
+      const records = scope === "general" ? library.general : ((productById(productId) || {}).faqs || []);
+      const faq = records.find(function(record) { return record.id === id; });
+      if (!faq) return;
+      if (productId) {
+        selectedProductId = productId;
+        render();
+      }
+      setScope(scope);
+      document.querySelector("#faq-product").value = productId || selectedProductId;
+      document.querySelector("#faq-id").value = faq.id;
+      document.querySelector("#faq-topic").value = faq.topic || "";
+      document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n");
+      document.querySelector("#faq-reply").value = faq.approved_reply || "";
+      document.querySelector("#faq-active").checked = faq.active !== false;
+      document.querySelector("#editor-title").textContent = "Edit " + (scope === "product" ? "Product" : "General") + " FAQ";
+      document.querySelector("#save-state").textContent = "";
+    }
+
+    async function loadLibrary() {
+      const response = await fetch("/admin/faq-library-data");
+      library = await response.json();
+      if (!response.ok) throw new Error(library.error || "Could not load FAQ library");
+      if (!selectedProductId && library.products[0]) selectedProductId = library.products[0].id;
+      render();
+      document.querySelector("#page-state").textContent = "Approved replies ready";
+    }
+
+    async function saveFaq(event) {
+      event.preventDefault();
+      const button = document.querySelector("#save-faq");
+      const state = document.querySelector("#save-state");
+      button.disabled = true;
+      state.textContent = "Saving...";
+      const body = {
+        id: document.querySelector("#faq-id").value,
+        scope: document.querySelector("#faq-scope").value,
+        productId: document.querySelector("#faq-product").value,
+        topic: document.querySelector("#faq-topic").value,
+        exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/),
+        approvedReply: document.querySelector("#faq-reply").value,
+        active: document.querySelector("#faq-active").checked
+      };
+      try {
+        const response = await fetch("/admin/faq-library/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Save failed");
+        library = result.data;
+        if (body.scope === "product") selectedProductId = body.productId;
+        render();
+        editFaq(body.scope, body.productId, result.faq.id);
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function deleteFaq(scope, productId, id, topic) {
+      const label = topic || id;
+      if (!window.confirm('Delete FAQ "' + label + '"? This cannot be undone.')) return;
+      const state = document.querySelector("#save-state");
+      state.textContent = "Deleting...";
+      try {
+        const response = await fetch("/admin/faq-library/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope, productId, id })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Delete failed");
+        library = result.data;
+        if (scope === "product" && productId) selectedProductId = productId;
+        render();
+        newFaq(scope);
+        state.textContent = "Deleted";
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
+
+    document.querySelector("#list-product").addEventListener("change", function(event) {
+      selectedProductId = event.target.value;
+      render();
+    });
+    document.querySelector("#faq-scope").addEventListener("change", function(event) {
+      setScope(event.target.value);
+    });
+    document.querySelector("#new-product-faq").addEventListener("click", function() { newFaq("product"); });
+    document.querySelector("#new-general-faq").addEventListener("click", function() { newFaq("general"); });
+    let salesLibrary = { general: [], products: [] };
+    let salesSelectedProductId = "";
+
+    function salesProductById(id) {
+      return salesLibrary.products.find(function(product) { return product.id === id; });
+    }
+
+    function renderSalesRows(records, scope, productId) {
+      if (!records.length) return '<div class="empty">No sales replies yet.</div>';
+      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Follow-Up</th><th>Status</th><th></th></tr></thead><tbody>' +
+        records.map(function(reply) {
+          const examples = (reply.example_messages || []).map(esc).join('<br>');
+          const status = reply.legacy_standard_reply
+            ? '<span class="pill off">Legacy</span>'
+            : reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
+          return '<tr><td>' + esc(reply.objection_type) + '</td><td>' + esc(reply.intent || "") + '</td><td>' + examples +
+            '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td class="reply">' + esc(reply.followup_prompt || "") +
+            '</td><td>' + status + '</td><td><button type="button" class="sales-edit-reply" data-scope="' + esc(scope) +
+            '" data-product="' + esc(productId || "") + '" data-id="' + esc(reply.id) + '">Edit</button> ' +
+            '<button type="button" class="sales-delete-reply" data-scope="' + esc(scope) + '" data-product="' +
+            esc(productId || "") + '" data-id="' + esc(reply.id) + '" data-label="' + esc(reply.objection_type || reply.id) +
+            '">Delete</button></td></tr>';
+        }).join('') + '</tbody></table>';
+    }
+
+    function fillSalesProductOptions() {
+      const options = salesLibrary.products.map(function(product) {
+        return '<option value="' + esc(product.id) + '">' + esc(product.name) + '</option>';
+      }).join('');
+      document.querySelector("#sales-list-product").innerHTML = options;
+      document.querySelector("#sales-reply-product").innerHTML = options;
+      if (!salesSelectedProductId && salesLibrary.products[0]) salesSelectedProductId = salesLibrary.products[0].id;
+      document.querySelector("#sales-list-product").value = salesSelectedProductId;
+      document.querySelector("#sales-reply-product").value = salesSelectedProductId;
+    }
+
+    function bindSalesButtons() {
+      document.querySelectorAll(".sales-edit-reply").forEach(function(button) {
+        button.addEventListener("click", function() {
+          editSalesReply(button.dataset.scope, button.dataset.product, button.dataset.id);
+        });
+      });
+      document.querySelectorAll(".sales-delete-reply").forEach(function(button) {
+        button.addEventListener("click", function() {
+          deleteSalesReply(button.dataset.scope, button.dataset.product, button.dataset.id, button.dataset.label);
+        });
+      });
+    }
+
+    function renderSales() {
+      fillSalesProductOptions();
+      document.querySelector("#sales-general-list").innerHTML = renderSalesRows(salesLibrary.general, "general", "");
+      const product = salesProductById(salesSelectedProductId);
+      document.querySelector("#sales-product-list").innerHTML = renderSalesRows(product ? product.salesReplies : [], "product", salesSelectedProductId);
+      bindSalesButtons();
+    }
+
+    function setSalesScope(scope) {
+      const isProduct = scope === "product";
+      document.querySelector("#sales-reply-scope").value = scope;
+      document.querySelector("#sales-reply-product").disabled = !isProduct;
+    }
+
+    function newSalesReply(scope) {
+      document.querySelector("#sales-reply-id").value = "";
+      document.querySelector("#sales-reply-objection").value = "";
+      document.querySelector("#sales-reply-intent").value = "";
+      document.querySelector("#sales-reply-examples").value = "";
+      document.querySelector("#sales-reply-approved").value = "";
+      document.querySelector("#sales-reply-followup").value = "";
+      document.querySelector("#sales-reply-active").checked = true;
+      setSalesScope(scope);
+      document.querySelector("#sales-editor-title").textContent = scope === "product" ? "New Product Sales Reply" : "New General Sales Reply";
+      document.querySelector("#sales-save-state").textContent = "";
+    }
+
+    function editSalesReply(scope, productId, id) {
+      const records = scope === "general" ? salesLibrary.general : ((salesProductById(productId) || {}).salesReplies || []);
+      const reply = records.find(function(record) { return record.id === id; });
+      if (!reply) return;
+      if (productId) {
+        salesSelectedProductId = productId;
+        renderSales();
+      }
+      setSalesScope(scope);
+      document.querySelector("#sales-reply-product").value = productId || salesSelectedProductId;
+      document.querySelector("#sales-reply-id").value = reply.id;
+      document.querySelector("#sales-reply-objection").value = reply.objection_type || "";
+      document.querySelector("#sales-reply-intent").value = reply.intent || "";
+      document.querySelector("#sales-reply-examples").value = (reply.example_messages || []).join("\\n");
+      document.querySelector("#sales-reply-approved").value = reply.approved_reply || "";
+      document.querySelector("#sales-reply-followup").value = reply.followup_prompt || "";
+      document.querySelector("#sales-reply-active").checked = reply.active !== false;
+      document.querySelector("#sales-editor-title").textContent = "Edit " + (scope === "product" ? "Product" : "General") + " Sales Reply";
+      document.querySelector("#sales-save-state").textContent = "";
+    }
+
+    async function loadSalesLibrary() {
+      const response = await fetch("/admin/sales-replies-data");
+      salesLibrary = await response.json();
+      if (!response.ok) throw new Error(salesLibrary.error || "Could not load sales reply library");
+      if (!salesSelectedProductId && salesLibrary.products[0]) salesSelectedProductId = salesLibrary.products[0].id;
+      renderSales();
+    }
+
+    async function saveSalesReply(event) {
+      event.preventDefault();
+      const button = document.querySelector("#sales-save-reply");
+      const state = document.querySelector("#sales-save-state");
+      button.disabled = true;
+      state.textContent = "Saving...";
+      const body = {
+        id: document.querySelector("#sales-reply-id").value,
+        scope: document.querySelector("#sales-reply-scope").value,
+        productId: document.querySelector("#sales-reply-product").value,
+        objectionType: document.querySelector("#sales-reply-objection").value,
+        intent: document.querySelector("#sales-reply-intent").value,
+        exampleMessages: document.querySelector("#sales-reply-examples").value.split(/\\r?\\n/),
+        approvedReply: document.querySelector("#sales-reply-approved").value,
+        followupPrompt: document.querySelector("#sales-reply-followup").value,
+        active: document.querySelector("#sales-reply-active").checked
+      };
+      try {
+        const response = await fetch("/admin/sales-replies/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Save failed");
+        salesLibrary = result.data;
+        if (body.scope === "product") salesSelectedProductId = body.productId;
+        renderSales();
+        editSalesReply(body.scope, body.productId, result.salesReply.id);
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function deleteSalesReply(scope, productId, id, label) {
+      if (!window.confirm('Delete sales reply "' + (label || id) + '"? This cannot be undone.')) return;
+      const state = document.querySelector("#sales-save-state");
+      state.textContent = "Deleting...";
+      try {
+        const response = await fetch("/admin/sales-replies/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope, productId, id })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Delete failed");
+        salesLibrary = result.data;
+        if (scope === "product" && productId) salesSelectedProductId = productId;
+        renderSales();
+        newSalesReply(scope);
+        state.textContent = "Deleted";
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
+
+    document.querySelector("#sales-list-product").addEventListener("change", function(event) {
+      salesSelectedProductId = event.target.value;
+      renderSales();
+    });
+    document.querySelector("#sales-reply-scope").addEventListener("change", function(event) {
+      setSalesScope(event.target.value);
+    });
+    document.querySelector("#sales-new-product-reply").addEventListener("click", function() { newSalesReply("product"); });
+    document.querySelector("#sales-new-general-reply").addEventListener("click", function() { newSalesReply("general"); });
+    document.querySelector("#sales-reply-form").addEventListener("submit", saveSalesReply);
+
+    document.querySelector("#faq-form").addEventListener("submit", saveFaq);
+    document.querySelector("#refresh").addEventListener("click", function() {
+      loadLibrary();
+      loadSalesLibrary();
+    });
+    loadLibrary().then(function() { newFaq("general"); }).catch(function(error) {
+      document.querySelector("#page-state").textContent = error.message;
+    });
+    loadSalesLibrary().then(function() { newSalesReply("general"); }).catch(function(error) {
+      document.querySelector("#sales-save-state").textContent = error.message;
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function salesRepliesPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sales Replies</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #fff; --soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; min-height: 18px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    main { max-width: 1380px; margin: 0 auto; padding: 22px; display: grid; gap: 14px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--soft); border-bottom: 1px solid #e5e5ea; }
+    .section-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; background: var(--soft); border-bottom: 1px solid #e5e5ea; }
+    .section-tools label { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; }
+    select, input, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    select:focus, input:focus, textarea:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    select { min-width: 230px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; min-width: 900px; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; line-height: 1.4; }
+    th { background: var(--soft); color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    td.reply { white-space: pre-wrap; max-width: 360px; }
+    .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #e6f6e8; color: #176028; font-size: 12px; font-weight: 700; }
+    .pill.off { background: #f0f0f2; color: var(--muted); }
+    .empty { padding: 14px; color: var(--muted); }
+    .editor { padding: 14px; display: grid; gap: 12px; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
+    .field { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
+    .field.wide { grid-column: 1 / -1; }
+    textarea { min-height: 82px; resize: vertical; line-height: 1.42; font-weight: 400; }
+    textarea.reply { min-height: 120px; }
+    .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    #save-state { min-height: 18px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 760px) { main { padding: 14px; } .fields { grid-template-columns: 1fr; } select { min-width: 0; width: 100%; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Sales Replies</h1>
+    <div class="sub" id="page-state">Loading sales reply library...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <section>
+      <h2>General Sales Replies</h2>
+      <div class="table-wrap" id="general-list"></div>
+    </section>
+    <section>
+      <h2>Product Sales Replies</h2>
+      <div class="section-tools">
+        <label for="list-product">Product <select id="list-product"></select></label>
+        <button id="new-product-reply" type="button">New Product Sales Reply</button>
+      </div>
+      <div class="table-wrap" id="product-list"></div>
+    </section>
+    <section>
+      <h2 id="editor-title">New General Sales Reply</h2>
+      <form id="reply-form" class="editor">
+        <input id="reply-id" type="hidden" />
+        <div class="fields">
+          <label class="field" for="reply-scope">Scope
+            <select id="reply-scope">
+              <option value="general">General</option>
+              <option value="product">Product</option>
+            </select>
+          </label>
+          <label class="field" for="reply-product">Product
+            <select id="reply-product"></select>
+          </label>
+          <label class="field wide" for="reply-objection">Objection Type
+            <input id="reply-objection" placeholder="price_concern, thinking_first, fear_concern" required />
+          </label>
+          <label class="field wide" for="reply-intent">Intent Description
+            <textarea id="reply-intent" required placeholder="Customer feels the price is expensive or asks for discount."></textarea>
+          </label>
+          <label class="field wide" for="reply-examples">Example Customer Messages
+            <textarea id="reply-examples" required placeholder="Mahal&#10;Ada kurang?&#10;Boleh discount?"></textarea>
+          </label>
+          <label class="field wide" for="reply-approved">Approved Sales Reply
+            <textarea class="reply" id="reply-approved" required></textarea>
+          </label>
+          <label class="field wide" for="reply-followup">Optional Follow-Up Prompt
+            <textarea id="reply-followup" placeholder="Mau saya hold promo untuk kita dulu?"></textarea>
+          </label>
+        </div>
+        <div class="editor-actions">
+          <label for="reply-active"><input id="reply-active" type="checkbox" checked /> Active</label>
+          <button id="new-general-reply" type="button">New General Sales Reply</button>
+          <button class="primary" id="save-reply" type="submit">Save Sales Reply</button>
+        </div>
+        <div id="save-state"></div>
+      </form>
+    </section>
+  </main>
+  <script>
+    let library = { general: [], products: [] };
+    let selectedProductId = "";
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+
+    function productById(id) {
+      return library.products.find(function(product) { return product.id === id; });
+    }
+
+    function renderRows(records, scope, productId) {
+      if (!records.length) return '<div class="empty">No sales replies yet.</div>';
+      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Follow-Up</th><th>Status</th><th></th></tr></thead><tbody>' +
+        records.map(function(reply) {
+          const examples = (reply.example_messages || []).map(esc).join('<br>');
+          const status = reply.legacy_standard_reply
+            ? '<span class="pill off">Legacy</span>'
+            : reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
+          return '<tr><td>' + esc(reply.objection_type) + '</td><td>' + esc(reply.intent || "") + '</td><td>' + examples +
+            '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td class="reply">' + esc(reply.followup_prompt || "") +
+            '</td><td>' + status + '</td><td><button type="button" class="edit-reply" data-scope="' + esc(scope) +
+            '" data-product="' + esc(productId || "") + '" data-id="' + esc(reply.id) + '">Edit</button> ' +
+            '<button type="button" class="delete-reply" data-scope="' + esc(scope) + '" data-product="' +
+            esc(productId || "") + '" data-id="' + esc(reply.id) + '" data-label="' + esc(reply.objection_type || reply.id) +
+            '">Delete</button></td></tr>';
+        }).join('') + '</tbody></table>';
+    }
+
+    function fillProductOptions() {
+      const options = library.products.map(function(product) {
+        return '<option value="' + esc(product.id) + '">' + esc(product.name) + '</option>';
+      }).join('');
+      document.querySelector("#list-product").innerHTML = options;
+      document.querySelector("#reply-product").innerHTML = options;
+      if (!selectedProductId && library.products[0]) selectedProductId = library.products[0].id;
+      document.querySelector("#list-product").value = selectedProductId;
+      document.querySelector("#reply-product").value = selectedProductId;
+    }
+
+    function bindButtons() {
+      document.querySelectorAll(".edit-reply").forEach(function(button) {
+        button.addEventListener("click", function() {
+          editReply(button.dataset.scope, button.dataset.product, button.dataset.id);
+        });
+      });
+      document.querySelectorAll(".delete-reply").forEach(function(button) {
+        button.addEventListener("click", function() {
+          deleteReply(button.dataset.scope, button.dataset.product, button.dataset.id, button.dataset.label);
+        });
+      });
+    }
+
+    function render() {
+      fillProductOptions();
+      document.querySelector("#general-list").innerHTML = renderRows(library.general, "general", "");
+      const product = productById(selectedProductId);
+      document.querySelector("#product-list").innerHTML = renderRows(product ? product.salesReplies : [], "product", selectedProductId);
+      bindButtons();
+    }
+
+    function setScope(scope) {
+      const isProduct = scope === "product";
+      document.querySelector("#reply-scope").value = scope;
+      document.querySelector("#reply-product").disabled = !isProduct;
+    }
+
+    function newReply(scope) {
+      document.querySelector("#reply-id").value = "";
+      document.querySelector("#reply-objection").value = "";
+      document.querySelector("#reply-intent").value = "";
+      document.querySelector("#reply-examples").value = "";
+      document.querySelector("#reply-approved").value = "";
+      document.querySelector("#reply-followup").value = "";
+      document.querySelector("#reply-active").checked = true;
+      setScope(scope);
+      document.querySelector("#editor-title").textContent = scope === "product" ? "New Product Sales Reply" : "New General Sales Reply";
+      document.querySelector("#save-state").textContent = "";
+      document.querySelector("#reply-objection").focus();
+    }
+
+    function editReply(scope, productId, id) {
+      const records = scope === "general" ? library.general : ((productById(productId) || {}).salesReplies || []);
+      const reply = records.find(function(record) { return record.id === id; });
+      if (!reply) return;
+      if (productId) {
+        selectedProductId = productId;
+        render();
+      }
+      setScope(scope);
+      document.querySelector("#reply-product").value = productId || selectedProductId;
+      document.querySelector("#reply-id").value = reply.id;
+      document.querySelector("#reply-objection").value = reply.objection_type || "";
+      document.querySelector("#reply-intent").value = reply.intent || "";
+      document.querySelector("#reply-examples").value = (reply.example_messages || []).join("\\n");
+      document.querySelector("#reply-approved").value = reply.approved_reply || "";
+      document.querySelector("#reply-followup").value = reply.followup_prompt || "";
+      document.querySelector("#reply-active").checked = reply.active !== false;
+      document.querySelector("#editor-title").textContent = "Edit " + (scope === "product" ? "Product" : "General") + " Sales Reply";
+      document.querySelector("#save-state").textContent = "";
+    }
+
+    async function loadLibrary() {
+      const response = await fetch("/admin/sales-replies-data");
+      library = await response.json();
+      if (!response.ok) throw new Error(library.error || "Could not load sales reply library");
+      if (!selectedProductId && library.products[0]) selectedProductId = library.products[0].id;
+      render();
+      document.querySelector("#page-state").textContent = "Approved sales replies ready";
+    }
+
+    async function saveReply(event) {
+      event.preventDefault();
+      const button = document.querySelector("#save-reply");
+      const state = document.querySelector("#save-state");
+      button.disabled = true;
+      state.textContent = "Saving...";
+      const body = {
+        id: document.querySelector("#reply-id").value,
+        scope: document.querySelector("#reply-scope").value,
+        productId: document.querySelector("#reply-product").value,
+        objectionType: document.querySelector("#reply-objection").value,
+        intent: document.querySelector("#reply-intent").value,
+        exampleMessages: document.querySelector("#reply-examples").value.split(/\\r?\\n/),
+        approvedReply: document.querySelector("#reply-approved").value,
+        followupPrompt: document.querySelector("#reply-followup").value,
+        active: document.querySelector("#reply-active").checked
+      };
+      try {
+        const response = await fetch("/admin/sales-replies/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Save failed");
+        library = result.data;
+        if (body.scope === "product") selectedProductId = body.productId;
+        render();
+        editReply(body.scope, body.productId, result.salesReply.id);
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function deleteReply(scope, productId, id, label) {
+      if (!window.confirm('Delete sales reply "' + (label || id) + '"? This cannot be undone.')) return;
+      const state = document.querySelector("#save-state");
+      state.textContent = "Deleting...";
+      try {
+        const response = await fetch("/admin/sales-replies/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope, productId, id })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Delete failed");
+        library = result.data;
+        if (scope === "product" && productId) selectedProductId = productId;
+        render();
+        newReply(scope);
+        state.textContent = "Deleted";
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
+
+    document.querySelector("#list-product").addEventListener("change", function(event) {
+      selectedProductId = event.target.value;
+      render();
+    });
+    document.querySelector("#reply-scope").addEventListener("change", function(event) {
+      setScope(event.target.value);
+    });
+    document.querySelector("#new-product-reply").addEventListener("click", function() { newReply("product"); });
+    document.querySelector("#new-general-reply").addEventListener("click", function() { newReply("general"); });
+    document.querySelector("#reply-form").addEventListener("submit", saveReply);
+    document.querySelector("#refresh").addEventListener("click", loadLibrary);
+    loadLibrary().then(function() { newReply("general"); }).catch(function(error) {
+      document.querySelector("#page-state").textContent = error.message;
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function productFlowPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Product Flow</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #ffffff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; min-height: 18px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .55; cursor: wait; }
+    main { padding: 22px; max-width: 1280px; margin: 0 auto; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; margin-bottom: 14px; border: 1px solid #e5e5ea; border-radius: 8px; background: var(--surface); }
+    .toolbar label { display: inline-flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; }
+    .toolbar-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .status-badge { border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 700; background: #fff3d8; color: #7b4d00; }
+    .status-badge.ready { background: #e6f6e8; color: #176028; }
+    select { min-width: 230px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; background: #fff; }
+    section { margin-bottom: 14px; background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    .create-fields { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 14px; }
+    .create-fields label { display: grid; gap: 7px; flex: 1 1 280px; color: #1d1d1f; font-size: 13px; font-weight: 700; }
+    .create-fields input, .field input { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    .steps { padding: 14px; display: grid; gap: 12px; }
+    .step { display: grid; grid-template-columns: 46px 1fr; gap: 12px; align-items: start; padding-bottom: 12px; border-bottom: 1px solid #f0f0f2; }
+    .step:last-child { border-bottom: 0; padding-bottom: 0; }
+    .number { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 8px; color: var(--accent); background: #eaf4ff; font-size: 13px; font-weight: 700; }
+    .field label, .group-title { display: block; margin-bottom: 7px; color: #1d1d1f; font-size: 13px; font-weight: 700; }
+    textarea { display: block; width: 100%; min-height: 72px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; line-height: 1.42; background: #fff; }
+    textarea.long { min-height: 200px; }
+    textarea.medium { min-height: 126px; }
+    textarea:focus, select:focus, input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    .image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+    .image-slot { min-width: 0; padding: 10px; border: 1px solid #e5e5ea; border-radius: 8px; background: var(--surface-soft); }
+    .image-slot label { display: block; min-height: 34px; margin-bottom: 7px; font-size: 12px; font-weight: 700; color: #1d1d1f; }
+    .image-slot img { display: block; width: 100%; height: 190px; object-fit: contain; background: #f5f5f7; border-radius: 6px; margin-bottom: 9px; }
+    .image-slot input { display: block; width: 100%; font-size: 12px; color: var(--muted); }
+    .order-options-panel { padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
+    .order-options-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .order-options-head h3 { margin: 0; font-size: 16px; }
+    .order-options-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .option-list { display: grid; gap: 10px; }
+    .option-card { border: 1px solid #e5e5ea; border-radius: 10px; background: #fff; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+    .option-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; background: #f5f5f7; border-bottom: 1px solid #e5e5ea; }
+    .option-card-title { display: flex; align-items: center; gap: 8px; font-weight: 800; }
+    .option-index { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 999px; background: #eaf4ff; color: var(--accent); font-size: 12px; }
+    .option-grid { display: grid; grid-template-columns: minmax(220px, 1.3fr) minmax(120px, .6fr) minmax(100px, .4fr); gap: 10px; padding: 12px; }
+    .option-extra { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 12px 12px; }
+    .option-card label { display: grid; gap: 6px; margin: 0; font-size: 12px; font-weight: 700; color: #1d1d1f; }
+    .option-card input, .option-card textarea { width: 100%; min-height: 40px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: inherit; background: #fff; }
+    .option-card textarea { min-height: 82px; }
+    .option-card .check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: #1d1d1f; }
+    .option-card .check input { width: auto; min-height: 0; }
+    .option-card .remove-option { padding: 6px 10px; border-color: #ffd1d1; color: #9b1c12; background: #fff7f7; }
+    .empty-options { padding: 12px; border: 1px dashed #d2d2d7; border-radius: 8px; color: var(--muted); background: #fff; }
+    .knowledge-panel { padding: 14px; border-top: 1px solid #e5e5ea; background: #fff; }
+    .knowledge-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .knowledge-head h3 { margin: 0; font-size: 16px; }
+    .knowledge-note { color: var(--muted); font-size: 13px; }
+    .knowledge-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .knowledge-list { display: grid; gap: 8px; }
+    .knowledge-item { padding: 10px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
+    .knowledge-item strong { display: block; margin-bottom: 4px; }
+    .knowledge-meta { margin-top: 5px; color: var(--muted); font-size: 12px; }
+    .knowledge-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .knowledge-actions button { padding: 6px 9px; font-size: 12px; }
+    .knowledge-actions .danger { color: #9b1c12; border-color: #ffd1d1; background: #fff7f7; }
+    .knowledge-empty { color: var(--muted); padding: 10px; border: 1px dashed #d2d2d7; border-radius: 8px; background: #fff; }
+    .actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 14px; border-top: 1px solid #e5e5ea; background: var(--surface-soft); }
+    #save-state { color: var(--muted); font-size: 13px; margin-right: auto; }
+    @media (max-width: 680px) {
+      main { padding: 14px; }
+      .step { grid-template-columns: 1fr; }
+      .order-options-head { align-items: stretch; flex-direction: column; }
+      .option-grid, .option-extra { grid-template-columns: 1fr; }
+      .knowledge-grid { grid-template-columns: 1fr; }
+      .number { margin-bottom: -4px; }
+      select { min-width: 0; max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Product Flow</h1>
+    <div class="sub" id="page-state">Loading products...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <div class="toolbar">
+      <label for="product-select">Product <select id="product-select"></select></label>
+      <div class="toolbar-tools">
+        <span class="status-badge" id="flow-readiness">Setup</span>
+        <button id="show-create-product" type="button">New Product</button>
+      </div>
+    </div>
+    <section id="create-product-panel" hidden>
+      <h2>New Product</h2>
+      <form id="create-product-form" class="create-fields">
+        <label for="new-product-name">Product Name<input id="new-product-name" name="name" required /></label>
+        <button class="primary" id="create-product" type="submit">Create Product</button>
+        <button id="cancel-create-product" type="button">Cancel</button>
+      </form>
+    </section>
+    <section>
+      <h2>Order Supply</h2>
+      <form id="supply-form">
+        <div class="steps">
+          <div class="step">
+            <div class="number">URL</div>
+            <div class="field">
+              <label for="shoppingLink">Shopping Link for Order Admin</label>
+              <input id="shoppingLink" name="shoppingLink" type="url" placeholder="https://supplier.example.com/product" />
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <span id="supply-save-state"></span>
+          <button class="primary" id="save-supply" type="submit">Save Shopping Link</button>
+        </div>
+      </form>
+    </section>
+    <section>
+      <h2>WhatsApp Opening Flow</h2>
+      <form id="flow-form">
+        <div class="order-options-panel">
+          <div class="order-options-head">
+            <div>
+              <h3>Order Options</h3>
+              <p>Set how this product is sold. Add-ons are only needed for combo-style offers.</p>
+            </div>
+            <button id="add-order-option" type="button">Add Option</button>
+          </div>
+          <div class="option-list" id="order-options"></div>
+        </div>
+        <div class="knowledge-panel">
+          <div class="knowledge-head">
+            <div>
+              <h3>Extracted Product Knowledge</h3>
+              <div class="knowledge-note">Upload product/price photos, or scan existing product images. Approve image chunks before the agent uses them.</div>
+            </div>
+            <div class="toolbar-tools">
+              <button id="extract-existing-images" type="button">Extract From Existing Images</button>
+              <button id="clean-pending-facts" type="button">Remove Fact Rows</button>
+              <span id="knowledge-status" class="knowledge-note"></span>
+            </div>
+          </div>
+          <div class="knowledge-grid">
+            <div>
+              <div class="group-title">Pending Review</div>
+              <div class="knowledge-list" id="pending-knowledge"></div>
+            </div>
+            <div>
+              <div class="group-title">Approved Knowledge</div>
+              <div class="knowledge-list" id="approved-knowledge"></div>
+            </div>
+          </div>
+        </div>
+        <div class="steps">
+          <div class="step">
+            <div class="number">01</div>
+            <div class="field"><label for="greeting">Greeting</label><textarea id="greeting" name="greeting"></textarea></div>
+          </div>
+          <div class="step">
+            <div class="number">02-04</div>
+            <div><div class="group-title">Product Info Photos</div><div class="image-grid" id="info-images"></div></div>
+          </div>
+          <div class="step">
+            <div class="number">05</div>
+            <div class="field"><label for="description">Product Description</label><textarea class="long" id="description" name="description"></textarea></div>
+          </div>
+          <div class="step">
+            <div class="number">06-09</div>
+            <div><div class="group-title">Testimonial Photos</div><div class="image-grid" id="testimonial-images"></div></div>
+          </div>
+          <div class="step">
+            <div class="number">10</div>
+            <div class="field"><label for="testimonialText">Testimonial Text</label><textarea id="testimonialText" name="testimonialText"></textarea></div>
+          </div>
+          <div class="step">
+            <div class="number">11</div>
+            <div><div class="group-title">Price Photo</div><div class="image-grid" id="price-image"></div></div>
+          </div>
+          <div class="step">
+            <div class="number">11A</div>
+            <div><div class="group-title">Optional Sales Photo</div><div class="image-grid" id="sales-image"></div></div>
+          </div>
+          <div class="step">
+            <div class="number">12</div>
+            <div class="field"><label for="priceText">Price Text</label><textarea class="medium" id="priceText" name="priceText"></textarea></div>
+          </div>
+          <div class="step">
+            <div class="number">13</div>
+            <div class="field"><label for="packageQuestion">Closing / Order Option Question</label><textarea id="packageQuestion" name="packageQuestion"></textarea></div>
+          </div>
+        </div>
+        <div class="actions">
+          <span id="save-state"></span>
+          <button class="primary" id="save-flow" type="submit">Save Flow</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  <script>
+    let products = [];
+    let selectedProduct = null;
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+
+    function status(text) {
+      document.querySelector("#save-state").textContent = text;
+      document.querySelector("#page-state").textContent = selectedProduct ? selectedProduct.name : text;
+    }
+
+    function renderReadiness() {
+      const badge = document.querySelector("#flow-readiness");
+      const ready = selectedProduct && selectedProduct.ready;
+      badge.textContent = ready ? "Ready" : "Setup";
+      badge.classList.toggle("ready", Boolean(ready));
+    }
+
+    function updateSelectedOptionLabel() {
+      if (!selectedProduct) return;
+      const option = document.querySelector("#product-select option[value='" + CSS.escape(selectedProduct.id) + "']");
+      if (option) option.textContent = selectedProduct.name + (selectedProduct.ready ? "" : " (Setup)");
+    }
+
+    function imageSlotHtml(image) {
+      const version = selectedProduct ? Date.now() : "";
+      const url = image.url ? image.url + "?v=" + version : "";
+      return '<div class="image-slot">' +
+        '<label for="image-' + esc(image.key) + '">' + esc(image.label) + '</label>' +
+        (url ? '<img src="' + esc(url) + '" alt="' + esc(image.label) + '" />' : '') +
+        '<input id="image-' + esc(image.key) + '" type="file" accept="image/png,image/jpeg,image/webp" data-slot="' + esc(image.key) + '" />' +
+      '</div>';
+    }
+
+    function renderImages() {
+      const images = selectedProduct.images || [];
+      document.querySelector("#info-images").innerHTML = images.filter(image => image.key.indexOf("infoPhoto") === 0).map(imageSlotHtml).join("");
+      document.querySelector("#testimonial-images").innerHTML = images.filter(image => image.key.indexOf("testimonialPhoto") === 0).map(imageSlotHtml).join("");
+      document.querySelector("#price-image").innerHTML = images.filter(image => image.key === "pricePhoto").map(imageSlotHtml).join("");
+      document.querySelector("#sales-image").innerHTML = images.filter(image => image.key === "salesPhoto").map(imageSlotHtml).join("");
+      document.querySelectorAll("input[data-slot]").forEach(input => input.addEventListener("change", uploadImage));
+    }
+
+    function optionCardHtml(option, index) {
+      const addOns = (option.add_ons || []).join("\\n");
+      const aliases = (option.aliases || []).join("\\n");
+      return '<div class="option-card" data-option-index="' + index + '">' +
+        '<div class="option-card-head">' +
+          '<div class="option-card-title"><span class="option-index">' + esc(index + 1) + '</span><span>' + esc(option.name || "New option") + '</span></div>' +
+          '<button class="remove-option" type="button" data-remove-option="' + index + '">Delete</button>' +
+        '</div>' +
+        '<div class="option-grid">' +
+          '<label>Option name<input data-option-field="name" value="' + esc(option.name || "") + '" placeholder="Special Combo" /></label>' +
+          '<label>Price<input data-option-field="price" value="' + esc(option.price || "") + '" placeholder="B$55" /></label>' +
+          '<label>Quantity<input data-option-field="quantity" type="number" min="1" value="' + esc(option.quantity || 1) + '" /></label>' +
+        '</div>' +
+        '<div class="option-extra">' +
+          '<label>Add-ons / Combo choices<textarea data-option-field="add_ons" placeholder="Only for combo options\\nBio Collagen Mask x 5\\nGreen Mask Stick x 2">' + esc(addOns) + '</textarea></label>' +
+          '<label>Customer keywords / aliases<textarea data-option-field="aliases" placeholder="combo\\n1 unit\\nspecial combo">' + esc(aliases) + '</textarea></label>' +
+        '</div>' +
+        '<div class="option-extra">' +
+          '<label class="check"><input data-option-field="requires_add_on" type="checkbox" ' + (option.requires_add_on ? 'checked' : '') + ' /> Customer must choose an add-on for this option</label>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderOrderOptions() {
+      const options = selectedProduct.orderOptions || [];
+      document.querySelector("#order-options").innerHTML = options.map(optionCardHtml).join("") || '<div class="empty-options">No order options yet. Add at least one option before real testing.</div>';
+      document.querySelectorAll("button[data-remove-option]").forEach(button => {
+        button.addEventListener("click", () => {
+          selectedProduct.orderOptions = (selectedProduct.orderOptions || []).filter((_, index) => index !== Number(button.dataset.removeOption));
+          renderOrderOptions();
+        });
+      });
+    }
+
+    function knowledgeItemHtml(fact, status) {
+      const category = fact.category ? String(fact.category).replace(/_/g, " ") : "";
+      const safeText = fact.customer_safe === false ? "needs review" : "";
+      const isImageChunk = fact.kind === "image_chunk";
+      const title = isImageChunk
+        ? ["image chunk", category, fact.title || "Image knowledge"].filter(Boolean).join(" | ")
+        : [category, fact.label || "Fact"].filter(Boolean).join(" | ");
+      const body = isImageChunk
+        ? (fact.summary || fact.extracted_text || fact.embedding_text || "")
+        : (fact.value || "");
+      return '<div class="knowledge-item">' +
+        '<strong>' + esc(title) + '</strong>' +
+        '<div>' + esc(body) + '</div>' +
+        '<div class="knowledge-meta">' + esc([fact.confidence ? "confidence: " + fact.confidence : "", safeText, fact.sourceFilename || "", fact.sourceLabel || fact.sourceSlot || "", fact.approval_note || ""].filter(Boolean).join(" | ")) + '</div>' +
+        '<div class="knowledge-actions">' +
+          (status === "pending" ? '<button type="button" data-approve-fact="' + esc(fact.id) + '">Approve</button>' : '') +
+          '<button class="danger" type="button" data-delete-fact="' + esc(fact.id) + '" data-fact-status="' + esc(status) + '">Delete</button>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderKnowledge() {
+      const knowledge = selectedProduct.extractedKnowledge || {};
+      const pending = knowledge.pending || [];
+      const approved = knowledge.approved || [];
+      const last = knowledge.lastExtraction;
+      document.querySelector("#knowledge-status").textContent = last
+        ? (last.status === "completed"
+            ? "Last extraction: " + (last.imageChunkAdded || last.imageChunksAdded || 0) + " image chunk(s)"
+            : "Last extraction: " + last.status + (last.reason ? " - " + last.reason : ""))
+        : "No image extraction yet";
+      document.querySelector("#pending-knowledge").innerHTML = pending.map(fact => knowledgeItemHtml(fact, "pending")).join("") || '<div class="knowledge-empty">No pending image chunks.</div>';
+      document.querySelector("#approved-knowledge").innerHTML = approved.map(fact => knowledgeItemHtml(fact, "approved")).join("") || '<div class="knowledge-empty">No approved image chunks yet.</div>';
+      document.querySelectorAll("button[data-approve-fact]").forEach(button => {
+        button.addEventListener("click", () => approveFact(button.dataset.approveFact));
+      });
+      document.querySelectorAll("button[data-delete-fact]").forEach(button => {
+        button.addEventListener("click", () => deleteFact(button.dataset.deleteFact, button.dataset.factStatus));
+      });
+    }
+
+    async function approveFact(factId) {
+      if (!selectedProduct) return;
+      status("Approving knowledge...");
+      const response = await fetch("/admin/product-flow/knowledge/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productId: selectedProduct.id, factId })
+      });
+      const data = await response.json();
+      if (!response.ok) return status(data.error || "Approve failed");
+      selectedProduct = data.product;
+      products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+      renderKnowledge();
+      status("Knowledge approved");
+    }
+
+    async function deleteFact(factId, factStatus) {
+      if (!selectedProduct) return;
+      status("Deleting knowledge...");
+      const response = await fetch("/admin/product-flow/knowledge/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productId: selectedProduct.id, factId, status: factStatus })
+      });
+      const data = await response.json();
+      if (!response.ok) return status(data.error || "Delete failed");
+      selectedProduct = data.product;
+      products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+      renderKnowledge();
+      status("Knowledge deleted");
+    }
+
+    async function extractExistingKnowledge() {
+      if (!selectedProduct) return;
+      const button = document.querySelector("#extract-existing-images");
+      button.disabled = true;
+      status("Extracting knowledge from existing images...");
+      try {
+        const response = await fetch("/admin/product-flow/knowledge/extract-existing", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ productId: selectedProduct.id })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          status(data.error || "Extraction failed");
+          return;
+        }
+        selectedProduct = data.product;
+        products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+        renderKnowledge();
+        const extraction = data.extraction || {};
+        status("Extraction complete: " + (extraction.imageChunksAdded || 0) + " image chunk(s) from " + (extraction.imagesCompleted || 0) + " image(s)");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function cleanPendingFacts() {
+      if (!selectedProduct) return;
+      const button = document.querySelector("#clean-pending-facts");
+      button.disabled = true;
+      status("Removing separate fact rows...");
+      try {
+        const response = await fetch("/admin/product-flow/knowledge/clean-pending", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ productId: selectedProduct.id })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          status(data.error || "Clean failed");
+          return;
+        }
+        selectedProduct = data.product;
+        products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+        renderKnowledge();
+        status("Removed separate fact rows: " + (data.result && data.result.removed || 0) + " pending, " + (data.result && data.result.approvedRemoved || 0) + " approved");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function readOrderOptions() {
+      return Array.from(document.querySelectorAll(".option-card")).map(card => {
+        const get = field => card.querySelector('[data-option-field="' + field + '"]');
+        return {
+          name: get("name").value,
+          price: get("price").value,
+          quantity: Number(get("quantity").value || 1),
+          add_ons: get("add_ons").value.split(/\\r?\\n/),
+          aliases: get("aliases").value.split(/\\r?\\n/),
+          requires_add_on: get("requires_add_on").checked
+        };
+      }).filter(option => option.name.trim());
+    }
+
+    function renderProduct() {
+      if (!selectedProduct) return;
+      document.querySelector("#shoppingLink").value = selectedProduct.shoppingLink || "";
+      ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
+        document.querySelector("#" + field).value = selectedProduct[field] || "";
+      });
+      renderOrderOptions();
+      renderKnowledge();
+      renderImages();
+      renderReadiness();
+      status(selectedProduct.ready ? "Ready for opening flow" : "Setup in progress");
+    }
+
+    async function loadProducts(preferredId) {
+      const response = await fetch("/admin/product-flow-data");
+      const data = await response.json();
+      products = data.products || [];
+      const select = document.querySelector("#product-select");
+      select.innerHTML = products.map(product =>
+        '<option value="' + esc(product.id) + '">' + esc(product.name + (product.ready ? "" : " (Setup)")) + '</option>'
+      ).join("");
+      const requested = preferredId || select.value || (products[0] && products[0].id);
+      selectedProduct = products.find(product => product.id === requested) || products[0] || null;
+      if (selectedProduct) {
+        select.value = selectedProduct.id;
+        renderProduct();
+      } else {
+        renderReadiness();
+        status("No configured products");
+      }
+    }
+
+    function readFileDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.addEventListener("load", () => resolve(reader.result));
+        reader.addEventListener("error", reject);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function uploadImage(event) {
+      const input = event.target;
+      const file = input.files && input.files[0];
+      if (!file || !selectedProduct) return;
+      status("Uploading " + file.name + "...");
+      const response = await fetch("/admin/product-flow/image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          productId: selectedProduct.id,
+          slot: input.dataset.slot,
+          originalName: file.name,
+          dataUrl: await readFileDataUrl(file)
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        status(data.error || "Upload failed");
+        return;
+      }
+      selectedProduct = data.product;
+      products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+      renderImages();
+      renderKnowledge();
+      renderReadiness();
+      updateSelectedOptionLabel();
+      status(data.extraction && data.extraction.status === "completed"
+        ? "Image saved, " + (data.extraction.imageChunkAdded ? "1 image chunk extracted" : "no new image chunk")
+        : "Image saved");
+    }
+
+    async function saveFlow(event) {
+      event.preventDefault();
+      if (!selectedProduct) return;
+      const button = document.querySelector("#save-flow");
+      button.disabled = true;
+      status("Saving...");
+      const body = { productId: selectedProduct.id, shoppingLink: selectedProduct.shoppingLink || "" };
+      ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
+        body[field] = document.querySelector("#" + field).value;
+      });
+      body.orderOptions = readOrderOptions();
+      try {
+        const response = await fetch("/admin/product-flow/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          status(data.error || "Save failed");
+          return;
+        }
+        selectedProduct = data.product;
+        products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+        renderReadiness();
+        updateSelectedOptionLabel();
+        status("Saved");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function saveSupply(event) {
+      event.preventDefault();
+      if (!selectedProduct) return;
+      const button = document.querySelector("#save-supply");
+      const message = document.querySelector("#supply-save-state");
+      button.disabled = true;
+      message.textContent = "Saving...";
+      try {
+        const response = await fetch("/admin/product-flow/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            productId: selectedProduct.id,
+            shoppingLink: document.querySelector("#shoppingLink").value
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          message.textContent = data.error || "Save failed";
+          return;
+        }
+        selectedProduct = data.product;
+        products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+        renderProduct();
+        updateSelectedOptionLabel();
+        message.textContent = "Shopping link saved";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function createProduct(event) {
+      event.preventDefault();
+      const input = document.querySelector("#new-product-name");
+      const name = input.value.trim();
+      if (!name) return;
+      const button = document.querySelector("#create-product");
+      button.disabled = true;
+      try {
+        const response = await fetch("/admin/product-flow/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          status(data.error || "Create failed");
+          return;
+        }
+        document.querySelector("#create-product-panel").hidden = true;
+        input.value = "";
+        await loadProducts(data.product.id);
+        status("Product created");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    document.querySelector("#product-select").addEventListener("change", event => {
+      selectedProduct = products.find(product => product.id === event.target.value) || null;
+      renderProduct();
+    });
+    document.querySelector("#show-create-product").addEventListener("click", () => {
+      document.querySelector("#create-product-panel").hidden = false;
+      document.querySelector("#new-product-name").focus();
+    });
+    document.querySelector("#cancel-create-product").addEventListener("click", () => {
+      document.querySelector("#create-product-panel").hidden = true;
+      document.querySelector("#new-product-name").value = "";
+    });
+    document.querySelector("#create-product-form").addEventListener("submit", createProduct);
+    document.querySelector("#supply-form").addEventListener("submit", saveSupply);
+    document.querySelector("#flow-form").addEventListener("submit", saveFlow);
+    document.querySelector("#extract-existing-images").addEventListener("click", extractExistingKnowledge);
+    document.querySelector("#clean-pending-facts").addEventListener("click", cleanPendingFacts);
+    document.querySelector("#add-order-option").addEventListener("click", () => {
+      if (!selectedProduct) return;
+      selectedProduct.orderOptions = [
+        ...(selectedProduct.orderOptions || []),
+        { name: "", price: "", quantity: 1, aliases: [], requires_add_on: false, add_ons: [] }
+      ];
+      renderOrderOptions();
+    });
+    document.querySelector("#refresh").addEventListener("click", () => loadProducts(selectedProduct && selectedProduct.id));
+    loadProducts();
+  </script>
+</body>
+</html>`;
+}
+
+function analyticsPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Agent Analytics</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #ffffff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); color: #1d1d1f; border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    main { padding: 22px; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 18px; }
+    .metric { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+    .metric strong { display: block; font-size: 26px; margin-bottom: 3px; }
+    .filterbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid #e5e5ea;
+      border-radius: 8px;
+    }
+    .filterbar label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #1d1d1f;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .filterbar input {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font: inherit;
+    }
+    .charts {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .chart-card {
+      background: var(--surface);
+      border: 1px solid #e5e5ea;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .chart-card h2 {
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .bar-chart {
+      display: grid;
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(22px, 1fr);
+      align-items: end;
+      gap: 6px;
+      height: 230px;
+      padding: 16px 14px 10px;
+      border-bottom: 1px solid #f0f0f2;
+    }
+    .bar-item {
+      min-width: 0;
+      height: 100%;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      gap: 6px;
+      align-items: end;
+    }
+    .bar-wrap {
+      height: 100%;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+    }
+    .bar {
+      width: 100%;
+      min-height: 2px;
+      max-width: 34px;
+      border-radius: 4px 4px 0 0;
+      background: var(--accent);
+      color: #fff;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding-top: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      box-sizing: border-box;
+    }
+    .bar.zero {
+      background: #d2d2d7;
+      color: #6e6e73;
+    }
+    .bar-label {
+      min-height: 28px;
+      color: #6e6e73;
+      font-size: 11px;
+      line-height: 1.1;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+    .chart-note {
+      padding: 10px 14px;
+      color: #6e6e73;
+      font-size: 13px;
+    }
+    .followup-chart {
+      display: grid;
+      gap: 12px;
+      padding: 16px 14px;
+    }
+    .followup-row {
+      display: grid;
+      grid-template-columns: 130px 1fr 70px;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+    }
+    .followup-label {
+      font-weight: 700;
+      color: #1d1d1f;
+    }
+    .followup-track {
+      height: 30px;
+      display: grid;
+      grid-template-columns: 1fr;
+      border-radius: 5px;
+      background: #f0f0f2;
+      overflow: hidden;
+      position: relative;
+    }
+    .followup-bar {
+      min-width: 2px;
+      background: var(--accent);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      padding-left: 8px;
+      font-weight: 700;
+      box-sizing: border-box;
+      white-space: nowrap;
+    }
+    .followup-rate {
+      font-weight: 700;
+      color: #1d1d1f;
+      text-align: right;
+    }
+    .followup-meta {
+      grid-column: 2 / 4;
+      color: #6e6e73;
+      font-size: 12px;
+    }
+    section { margin: 0 0 22px; background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 560px; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid #f0f0f2; text-align: left; font-size: 13px; }
+    th { background: var(--surface-soft); color: #6e6e73; font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    .empty { padding: 14px; color: #6e6e73; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AI Agent Analytics</h1>
+    <div class="sub" id="generated">Loading analytics...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <div class="filterbar">
+      <label for="analytics-date">Analytics Date <input id="analytics-date" type="date" /></label>
+    </div>
+    <div class="summary" id="analytics-summary"></div>
+    <div class="charts">
+      <section class="chart-card">
+        <h2>Customers By Hour</h2>
+        <div id="customers-hourly-chart"></div>
+      </section>
+      <section class="chart-card">
+        <h2>Customers Across Seven Days</h2>
+        <div id="customers-seven-day-chart"></div>
+      </section>
+      <section class="chart-card">
+        <h2>Follow-Up Reply Performance</h2>
+        <div id="followup-performance-chart"></div>
+      </section>
+    </div>
+    <section>
+      <h2>New Customers By Product</h2>
+      <div class="table-wrap" id="new-customers-by-product"></div>
+    </section>
+    <section>
+      <h2>New Orders By Product</h2>
+      <div class="table-wrap" id="new-orders-by-product"></div>
+    </section>
+  </main>
+  <script>
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function fmtTime(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return esc(value);
+      return date.toLocaleString();
+    }
+    function localDateInput(value) {
+      const date = value instanceof Date ? value : new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+    function table(rows, columns) {
+      if (!rows.length) return '<div class="empty">No records yet.</div>';
+      return '<table><thead><tr>' + columns.map(c => '<th>' + esc(c.label) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map(row => '<tr>' + columns.map(c => '<td>' + esc(row[c.key]) + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
+    }
+    function barChart(rows, note) {
+      const max = Math.max(1, ...rows.map(row => Number(row.count || 0)));
+      return '<div class="bar-chart">' + rows.map(row => {
+        const count = Number(row.count || 0);
+        const height = Math.max(count === 0 ? 2 : 8, Math.round((count / max) * 100));
+        const zeroClass = count === 0 ? ' zero' : '';
+        return '<div class="bar-item" title="' + esc(row.label + ': ' + count) + '">' +
+          '<div class="bar-wrap"><div class="bar' + zeroClass + '" style="height:' + height + '%">' + esc(count) + '</div></div>' +
+          '<div class="bar-label">' + esc(row.label) + '</div>' +
+        '</div>';
+      }).join('') + '</div><div class="chart-note">' + esc(note) + '</div>';
+    }
+    function followupPerformanceChart(rows) {
+      const max = Math.max(1, ...rows.map(row => Number(row.sent || 0)));
+      return '<div class="followup-chart">' + rows.map(row => {
+        const sent = Number(row.sent || 0);
+        const replies = Number(row.replies || 0);
+        const width = Math.max(sent === 0 ? 2 : 8, Math.round((sent / max) * 100));
+        return '<div class="followup-row">' +
+          '<div class="followup-label">' + esc(row.label) + '</div>' +
+          '<div class="followup-track"><div class="followup-bar" style="width:' + width + '%">' + esc(replies + ' replied / ' + sent + ' sent') + '</div></div>' +
+          '<div class="followup-rate">' + esc(row.rateLabel) + '</div>' +
+          '<div class="followup-meta">Reply rate for this follow-up message on the selected date</div>' +
+        '</div>';
+      }).join('') + '</div>';
+    }
+    async function loadAnalytics() {
+      const selectedDate = document.querySelector('#analytics-date').value || localDateInput(new Date());
+      const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
+      const data = await response.json();
+      const analytics = data.analytics;
+      document.querySelector('#generated').textContent = 'Date ' + analytics.date + ' | Generated ' + fmtTime(data.generatedAt);
+      const metrics = [
+        ['New Customers', analytics.totalNewCustomersToday],
+        ['Total Orders', analytics.totalOrdersToday],
+        ['Total Sales', analytics.totalSalesTodayDisplay]
+      ];
+      document.querySelector('#analytics-summary').innerHTML = metrics.map(item =>
+        '<div class="metric"><strong>' + esc(item[1]) + '</strong><span>' + esc(item[0]) + '</span></div>'
+      ).join('');
+      document.querySelector('#customers-hourly-chart').innerHTML = barChart(
+        analytics.customerCharts.hourly,
+        'Total new customers by hour for ' + analytics.date
+      );
+      document.querySelector('#customers-seven-day-chart').innerHTML = barChart(
+        analytics.customerCharts.sevenDays,
+        'Total new customers per day, ending ' + analytics.date
+      );
+      document.querySelector('#followup-performance-chart').innerHTML = followupPerformanceChart(
+        analytics.customerCharts.followups
+      );
+      document.querySelector('#new-customers-by-product').innerHTML = table(analytics.newCustomersByProductToday, [
+        { label: 'Product', key: 'product' },
+        { label: 'New Customers Today', key: 'count' }
+      ]);
+      document.querySelector('#new-orders-by-product').innerHTML = table(analytics.newOrdersByProductToday, [
+        { label: 'Product', key: 'product' },
+        { label: 'New Orders Today', key: 'count' }
+      ]);
+    }
+    document.querySelector('#analytics-date').value = localDateInput(new Date());
+    document.querySelector('#analytics-date').addEventListener('change', loadAnalytics);
+    document.querySelector('#refresh').addEventListener('click', loadAnalytics);
+    loadAnalytics();
+    setInterval(loadAnalytics, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function compliancePageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Compliance & Security</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #ffffff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); color: #1d1d1f; border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font-weight: 600; cursor: pointer; }
+    nav a:hover, button:hover { border-color: #a8a8ad; }
+    main { padding: 22px; display: grid; gap: 18px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    .content { padding: 14px; }
+    .tool-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 8px; align-items: start; }
+    input { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; }
+    input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    pre { white-space: pre-wrap; word-break: break-word; background: #f5f5f7; padding: 12px; border-radius: 8px; max-height: 320px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; }
+    th { background: var(--surface-soft); color: #6e6e73; font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    .danger { color: #9b1c12; }
+    .muted { color: var(--muted); }
+    @media (max-width: 720px) { .tool-row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Compliance & Security</h1>
+    <div class="sub" id="generated">Loading compliance status...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <section>
+      <h2>Customer Data Tools</h2>
+      <div class="content">
+        <div class="tool-row">
+          <input id="customer-id" placeholder="Customer WhatsApp ID" />
+          <button id="export-customer" type="button">Export Customer Data</button>
+          <button id="delete-customer" class="danger" type="button">Delete Customer</button>
+        </div>
+        <p class="muted">Deletion moves the customer out of active customers and records the action in the audit log.</p>
+        <pre id="customer-result">No customer action yet.</pre>
+      </div>
+    </section>
+    <section>
+      <h2>Reset Demo Data</h2>
+      <div class="content">
+        <p class="muted">Use this before a fresh test. It clears demo customers, orders, message logs, deleted customers, and writes an audit event.</p>
+        <button id="reset-demo" class="danger" type="button">Reset Demo Data</button>
+      </div>
+    </section>
+    <section>
+      <h2>Generate Test Customers</h2>
+      <div class="content">
+        <p class="muted">Creates local simulated customers only. No real WhatsApp messages are sent.</p>
+        <div class="tool-row">
+          <input id="test-customer-count" type="number" min="1" max="500" value="100" />
+          <button id="generate-test-customers" type="button">Generate Test Customers</button>
+        </div>
+      </div>
+    </section>
+    <section><h2>Data Retention Policy</h2><div class="content" id="retention"></div></section>
+    <section><h2>Automation Guardrails</h2><div class="content" id="automation-guardrails"></div></section>
+    <section><h2>WhatsApp Go-Live Readiness</h2><div class="content" id="whatsapp-readiness"></div></section>
+    <section><h2>Security Checklist</h2><div class="content" id="security"></div></section>
+    <section><h2>Privacy Notice Template</h2><div class="content" id="privacy"></div></section>
+    <section><h2>Human Handoff Rules</h2><div class="content" id="handoff-rules"></div></section>
+    <section><h2>Audit Log</h2><div class="content" id="audit-log"></div></section>
+  </main>
+  <script>
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function fmtTime(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return esc(value);
+      return date.toLocaleString();
+    }
+    function list(items, render) {
+      return '<ul>' + items.map(item => '<li>' + render(item) + '</li>').join('') + '</ul>';
+    }
+    function table(rows, columns) {
+      if (!rows.length) return '<p class="muted">No records yet.</p>';
+      return '<table><thead><tr>' + columns.map(c => '<th>' + esc(c.label) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map(row => '<tr>' + columns.map(c => '<td>' + (c.render ? c.render(row) : esc(row[c.key])) + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
+    }
+    async function loadCompliance() {
+      const response = await fetch('/admin/compliance-data');
+      const data = await response.json();
+      document.querySelector('#generated').textContent = 'Generated ' + fmtTime(data.generatedAt);
+      document.querySelector('#retention').innerHTML = table(data.retentionPolicy, [
+        { label: 'Data', key: 'item' },
+        { label: 'Rule', key: 'rule' }
+      ]);
+      document.querySelector('#automation-guardrails').innerHTML = table(data.automationGuardrails, [
+        { label: 'Guardrail', key: 'item' },
+        { label: 'Status', key: 'status' }
+      ]);
+      document.querySelector('#whatsapp-readiness').innerHTML = table(data.whatsappReadiness, [
+        { label: 'Launch Item', key: 'item' },
+        { label: 'Status', key: 'status' }
+      ]);
+      document.querySelector('#security').innerHTML = table(data.securityChecklist, [
+        { label: 'Security Item', key: 'item' },
+        { label: 'Status', key: 'status' }
+      ]);
+      document.querySelector('#privacy').innerHTML = list(data.privacyNotice, item => esc(item));
+      document.querySelector('#handoff-rules').innerHTML = list(data.handoffRules, item => esc(item));
+      document.querySelector('#audit-log').innerHTML = table(data.auditLog, [
+        { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
+        { label: 'Actor', key: 'actor' },
+        { label: 'Action', key: 'action' },
+        { label: 'Customer', key: 'customerId' },
+        { label: 'Result', key: 'result' },
+        { label: 'Reason', key: 'reason' }
+      ]);
+    }
+    async function exportCustomer() {
+      const customerId = document.querySelector('#customer-id').value.trim();
+      if (!customerId) return;
+      const response = await fetch('/admin/customer/export?customerId=' + encodeURIComponent(customerId));
+      const data = await response.json();
+      document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
+      loadCompliance();
+    }
+    async function deleteCustomer() {
+      const customerId = document.querySelector('#customer-id').value.trim();
+      if (!customerId) return;
+      const reason = 'Manual deletion from compliance page';
+      const response = await fetch('/admin/customer/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customerId, reason })
+      });
+      const data = await response.json();
+      document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
+      loadCompliance();
+    }
+    async function resetDemoData() {
+      const ok = confirm('Reset all demo customers, orders, deleted customers, message logs, and audit log?');
+      if (!ok) return;
+      const response = await fetch('/admin/reset-demo-data', { method: 'POST' });
+      const data = await response.json();
+      document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
+      loadCompliance();
+    }
+    async function generateTestCustomers() {
+      const count = Number(document.querySelector('#test-customer-count').value || 100);
+      const button = document.querySelector('#generate-test-customers');
+      button.disabled = true;
+      button.textContent = 'Generating...';
+      document.querySelector('#customer-result').textContent = 'Generating ' + count + ' simulated customer(s)...';
+      try {
+        const response = await fetch('/admin/generate-test-customers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ count })
+        });
+        const text = await response.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = { ok: false, status: response.status, error: text || 'Unexpected empty response' };
+        }
+        document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
+        loadCompliance();
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Generate Test Customers';
+      }
+    }
+    document.querySelector('#refresh').addEventListener('click', loadCompliance);
+    document.querySelector('#export-customer').addEventListener('click', exportCustomer);
+    document.querySelector('#delete-customer').addEventListener('click', deleteCustomer);
+    document.querySelector('#reset-demo').addEventListener('click', resetDemoData);
+    document.querySelector('#generate-test-customers').addEventListener('click', generateTestCustomers);
+    loadCompliance();
+    setInterval(loadCompliance, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function demoChatHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WhatsApp Agent Demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      --surface: #ffffff;
+      --surface-soft: #fbfbfd;
+      --line: #d2d2d7;
+      --muted: #6e6e73;
+      --accent: #0071e3;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #f5f5f7;
+    }
+    .admin-shell {
+      width: 100%;
+      min-height: 100vh;
+    }
+    .admin-header {
+      padding: 16px 22px 10px;
+      background: rgba(251,251,253,.9);
+      color: #1d1d1f;
+      border-bottom: 1px solid rgba(210,210,215,.8);
+      backdrop-filter: saturate(180%) blur(16px);
+    }
+    .admin-header h1 {
+      margin: 0;
+      font-size: 20px;
+    }
+    .admin-header .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 22px 14px;
+      background: rgba(251,251,253,.9);
+      border-bottom: 1px solid rgba(210,210,215,.8);
+      backdrop-filter: saturate(180%) blur(16px);
+    }
+    nav a {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 11px;
+      background: var(--surface);
+      color: #1d1d1f;
+      text-decoration: none;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    nav a:hover { border-color: #a8a8ad; }
+    main {
+      width: min(760px, 100%);
+      min-height: calc(100vh - 118px);
+      margin: 0 auto;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: #fbfbfd;
+      border-left: 1px solid #e5e5ea;
+      border-right: 1px solid #e5e5ea;
+    }
+    header {
+      padding: 16px 18px;
+      background: rgba(255,255,255,.92);
+      color: #1d1d1f;
+      border-bottom: 1px solid #e5e5ea;
+      backdrop-filter: saturate(180%) blur(16px);
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .status {
+      margin-top: 4px;
+      color: #6e6e73;
+      font-size: 13px;
+    }
+    .demo-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      color: #6e6e73;
+      font-size: 13px;
+    }
+    .demo-controls select {
+      min-width: 220px;
+      border: 1px solid #d2d2d7;
+      border-radius: 8px;
+      padding: 7px 9px;
+      font: inherit;
+      background: white;
+    }
+    .product-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .product-buttons button {
+      border: 1px solid #d2d2d7;
+      background: #fff;
+      color: #1d1d1f;
+      padding: 7px 9px;
+      font-size: 12px;
+    }
+    .product-buttons button.active {
+      border-color: var(--accent);
+      background: #e8f2ff;
+      color: #0057b8;
+    }
+    #messages {
+      overflow-y: auto;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .bubble {
+      max-width: min(560px, 88%);
+      padding: 10px 12px;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      line-height: 1.38;
+      box-shadow: 0 1px 2px rgba(0,0,0,.06);
+      font-size: 15px;
+    }
+    .customer {
+      align-self: flex-end;
+      background: #e8f2ff;
+    }
+    .agent {
+      align-self: flex-start;
+      background: #fff;
+    }
+    .agent img {
+      max-width: 100%;
+      display: block;
+      border-radius: 6px;
+      margin-bottom: 8px;
+    }
+    form {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      padding: 14px;
+      background: rgba(255,255,255,.92);
+      border-top: 1px solid #e5e5ea;
+    }
+    textarea {
+      min-height: 44px;
+      max-height: 150px;
+      resize: vertical;
+      border: 1px solid #d2d2d7;
+      border-radius: 8px;
+      padding: 11px 12px;
+      font: inherit;
+      background: white;
+    }
+    textarea:focus {
+      outline: 3px solid rgba(0,113,227,.18);
+      border-color: var(--accent);
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 0 18px;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: .55;
+      cursor: wait;
+    }
+    .quick {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 0 14px 12px;
+      background: rgba(255,255,255,.92);
+    }
+    .quick button {
+      background: #f5f5f7;
+      color: #1d1d1f;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="admin-shell">
+    <div class="admin-header">
+      <h1 id="demo-admin-title">Customer Demo</h1>
+      <div class="sub">Test the customer-facing WhatsApp flow.</div>
+    </div>
+    <nav>
+      <a href="/admin/dashboard">Dashboard</a>
+      <a href="/admin/chat">Chat Inbox</a>
+      <a href="/admin/analytics">Analytics</a>
+      <a href="/admin/reply-library">Reply Library</a>
+      <a href="/admin/product-flow">Product Flow</a>
+      <a href="/admin/compliance">Compliance</a>
+      <a href="/demo/chat">Customer Demo</a>
+      <a href="/admin/dashboard?tab=profile">Profile</a>
+    </nav>
+  <main>
+    <header>
+      <h1>WhatsApp Product Demo</h1>
+      <div class="status">You are acting as <span id="customer-id-label"></span></div>
+      <div class="demo-controls">
+        <label for="demo-product">Demo product</label>
+        <select id="demo-product"></select>
+      </div>
+      <div class="product-buttons" id="demo-product-buttons"></div>
+    </header>
+    <section id="messages" aria-live="polite"></section>
+    <div>
+      <div class="quick">
+        <button type="button" id="start-from-ad">Start from ad</button>
+        <button type="button" data-text="Tanya dulu">Tanya dulu</button>
+        <button type="button" data-text="Business location kat mana?">Business location</button>
+        <button type="button" data-text="Saya mau order Package B">Order Package B</button>
+        <button type="button" data-text="Full name: Ali\\nFull address: Kiulap\\nPhone number: 6731234567\\nOrder Package: B">Fill details</button>
+        <button type="button" id="new-customer">New customer</button>
+        <button type="button" id="followup-today">Test 8pm follow-up</button>
+        <button type="button" id="followup-day1">Test DAY 1 follow-up</button>
+        <button type="button" id="delete-day11">Test DAY 11 delete</button>
+      </div>
+      <form id="chat-form">
+        <textarea id="message" placeholder="Type customer message..." autofocus></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+    </div>
+  </main>
+  </div>
+  <script>
+    const demoProducts = ${JSON.stringify(catalog.products.map((product) => ({
+      id: product.id,
+      name: product.name,
+      adKeyword: product.ad_keywords?.[0] || product.name,
+      ready: product.openingFlowEnabled !== false,
+    })))};
+    const messages = document.querySelector("#messages");
+    const form = document.querySelector("#chat-form");
+    const input = document.querySelector("#message");
+    const send = document.querySelector("#send");
+    const productSelect = document.querySelector("#demo-product");
+    const productButtons = document.querySelector("#demo-product-buttons");
+    let customerId = localStorage.getItem("demoCustomerId") || "customer_" + Date.now();
+    let selectedProductId = localStorage.getItem("demoProductId") || ${JSON.stringify(catalog.default_product_id)};
+    localStorage.setItem("demoCustomerId", customerId);
+    document.querySelector("#customer-id-label").textContent = customerId;
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+
+    function applyProfile(profile = {}) {
+      const name = String(profile.name || "").trim();
+      const accentColor = /^#[0-9a-fA-F]{6}$/.test(String(profile.accentColor || "")) ? profile.accentColor : "#0071e3";
+      document.documentElement.style.setProperty("--accent", accentColor);
+      document.querySelector("#demo-admin-title").textContent = name ? name + " Customer Demo" : "Customer Demo";
+    }
+
+    function selectedProduct() {
+      return demoProducts.find(product => product.id === selectedProductId) || demoProducts[0] || {};
+    }
+
+    function renderProductOptions() {
+      productSelect.innerHTML = demoProducts.map(product =>
+        '<option value="' + esc(product.id) + '">' + esc(product.name + (product.ready ? "" : " (Setup)")) + '</option>'
+      ).join("");
+      if (!demoProducts.some(product => product.id === selectedProductId) && demoProducts[0]) {
+        selectedProductId = demoProducts[0].id;
+      }
+      productSelect.value = selectedProductId;
+      productButtons.innerHTML = demoProducts.map(product =>
+        '<button type="button" class="' + (product.id === selectedProductId ? 'active' : '') +
+        '" data-product-id="' + esc(product.id) + '">' + esc(product.name) + '</button>'
+      ).join("");
+      productButtons.querySelectorAll("button[data-product-id]").forEach(button => {
+        button.addEventListener("click", () => switchDemoProduct(button.dataset.productId));
+      });
+    }
+
+    function switchDemoProduct(productId) {
+      selectedProductId = productId;
+      localStorage.setItem("demoProductId", selectedProductId);
+      productSelect.value = selectedProductId;
+      renderProductOptions();
+      customerId = "customer_" + Date.now();
+      localStorage.setItem("demoCustomerId", customerId);
+      document.querySelector("#customer-id-label").textContent = customerId;
+      messages.innerHTML = "";
+      addBubble("agent", "Switched demo product to " + selectedProduct().name + ". Click Start from ad to test this product.");
+    }
+
+    function addBubble(role, content) {
+      const bubble = document.createElement("div");
+      bubble.className = "bubble " + role;
+      if (typeof content === "string") {
+        bubble.textContent = content;
+      } else {
+        bubble.append(content);
+      }
+      messages.append(bubble);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function sendMessage(text) {
+      if (!text.trim()) return;
+      addBubble("customer", text);
+      input.value = "";
+      send.disabled = true;
+      try {
+        const product = selectedProduct();
+        const adSource = {
+          referralHeadline: "Facebook ad " + (product.adKeyword || product.name || selectedProductId),
+          productId: product.id || selectedProductId,
+        };
+        const source = { productId: product.id || selectedProductId };
+        if (text.toLowerCase().includes("berminat")) {
+          source.referralHeadline = adSource.referralHeadline;
+        }
+        const response = await fetch("/demo/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: customerId,
+            text,
+            productId: product.id || selectedProductId,
+            source
+          })
+        });
+        const data = await response.json();
+        for (const message of data.messages || []) {
+          if (message.type === "image") {
+            const wrap = document.createElement("div");
+            const img = document.createElement("img");
+            img.src = message.url;
+            img.alt = message.caption || "Product image";
+            wrap.append(img);
+            if (message.caption) {
+              const caption = document.createElement("div");
+              caption.textContent = message.caption;
+              wrap.append(caption);
+            }
+            addBubble("agent", wrap);
+          } else {
+            addBubble("agent", message.body || "");
+          }
+        }
+      } catch (error) {
+        addBubble("agent", "Demo error: " + error.message);
+      } finally {
+        send.disabled = false;
+        input.focus();
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      sendMessage(input.value);
+    });
+
+    document.querySelectorAll(".quick button").forEach((button) => {
+      if (button.dataset.text) {
+        button.addEventListener("click", () => sendMessage(button.dataset.text.replace(/\\\\n/g, "\\n")));
+      }
+    });
+
+    document.querySelector("#start-from-ad").addEventListener("click", () => {
+      const product = selectedProduct();
+      sendMessage(product.name || selectedProductId);
+    });
+
+    document.querySelector("#new-customer").addEventListener("click", () => {
+      customerId = "customer_" + Date.now();
+      localStorage.setItem("demoCustomerId", customerId);
+      document.querySelector("#customer-id-label").textContent = customerId;
+      messages.innerHTML = "";
+      addBubble("agent", "New customer created. Select a product, then click Start from ad to see product info and images.");
+    });
+
+    productSelect.addEventListener("change", () => {
+      switchDemoProduct(productSelect.value);
+    });
+
+    async function runFollowup(now, label) {
+      const response = await fetch("/demo/followups/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ now })
+      });
+      const data = await response.json();
+      addBubble("agent", label + "\\nSent: " + data.sent + "\\nDeleted: " + (data.deleted || 0));
+      for (const item of data.customers || []) {
+        if (item.customerId === customerId && item.message) {
+          addBubble("agent", item.message);
+        }
+      }
+      for (const item of data.deletedCustomers || []) {
+        if (item.customerId === customerId) {
+          addBubble("agent", "Customer deleted from active list: " + item.deleteReason);
+        }
+      }
+      if (!data.sent) {
+        addBubble("agent", "No follow-up due for this customer at that time.");
+      }
+    }
+
+    async function setCustomerFirstSeen(hour) {
+      const firstSeen = new Date();
+      firstSeen.setHours(hour, 0, 0, 0);
+      await fetch("/demo/customer/time", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ customerId, firstSeenAt: firstSeen.toISOString() })
+      });
+    }
+
+    renderProductOptions();
+
+    fetch("/admin/dashboard-data")
+      .then(response => response.ok ? response.json() : null)
+      .then(data => { if (data && data.profile) applyProfile(data.profile); })
+      .catch(() => {});
+
+    document.querySelector("#followup-today").addEventListener("click", () => {
+      const now = new Date();
+      now.setHours(20, 0, 0, 0);
+      setCustomerFirstSeen(18).then(() => {
+        runFollowup(now.toISOString(), "Testing first 8pm follow-up");
+      });
+    });
+
+    document.querySelector("#followup-day1").addEventListener("click", () => {
+      const now = new Date();
+      now.setDate(now.getDate() + 1);
+      now.setHours(20, 0, 0, 0);
+      runFollowup(now.toISOString(), "Testing DAY 1 8pm follow-up");
+    });
+
+    document.querySelector("#delete-day11").addEventListener("click", () => {
+      const now = new Date();
+      now.setDate(now.getDate() + 11);
+      now.setHours(9, 0, 0, 0);
+      runFollowup(now.toISOString(), "Testing DAY 11 delete");
+    });
+  </script>
+</body>
+</html>`;
+}
+
