@@ -3694,6 +3694,7 @@ function whatsappWebStatusHtml() {
     </section>
   </main>
   <script>
+    let lastQr = "";
     async function loadStatus() {
       const response = await fetch("/admin/whatsapp-web/status", { cache: "no-store" });
       const data = await response.json();
@@ -3708,8 +3709,12 @@ function whatsappWebStatusHtml() {
         (data.lastError ? " | Error: " + data.lastError : "");
       if (data.qr) {
         qr.style.display = "block";
-        qr.src = "/admin/whatsapp-web/qr.svg?t=" + Date.now();
+        if (data.qr !== lastQr) {
+          lastQr = data.qr;
+          qr.src = "/admin/whatsapp-web/qr.svg?t=" + Date.now();
+        }
       } else {
+        lastQr = "";
         qr.style.display = "none";
         qr.removeAttribute("src");
       }
