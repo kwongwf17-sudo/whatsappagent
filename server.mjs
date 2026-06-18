@@ -3313,7 +3313,7 @@ async function sendOutboundSequence(to, messages, meta = {}) {
 async function sendWhatsAppMessage(to, message) {
   if (config.transportMode === "web") {
     if (!webTransport) throw new Error("WhatsApp Web transport is not initialized.");
-    const messageId = await webTransport.send(to, message);
+    const messageId = await webTransport.send(to, messageForWebTransport(message));
     console.log(`Sent WhatsApp Web ${message.type} to ${to}`);
     return messageId || `web_${Date.now()}`;
   }
@@ -3367,6 +3367,29 @@ async function sendWhatsAppMessage(to, message) {
   const data = text ? JSON.parse(text) : {};
   console.log(`Sent WhatsApp ${message.type} to ${to}`);
   return data.messages?.[0]?.id || "";
+}
+
+function messageForWebTransport(message = {}) {
+  if (message.type !== "image") return message;
+  return {
+    ...message,
+    url: resolveWebMediaPath(message.url),
+  };
+}
+
+function resolveWebMediaPath(url = "") {
+  const value = String(url || "");
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("/assets/")) {
+    const relativePath = decodeURIComponent(value.split("?")[0].slice("/assets/".length));
+    const filePath = path.resolve(config.assetsDir, relativePath);
+    const root = `${config.assetsDir}${path.sep}`.toLowerCase();
+    if (!filePath.toLowerCase().startsWith(root)) {
+      throw new Error(`Forbidden asset path: ${value}`);
+    }
+    return filePath;
+  }
+  return value;
 }
 
 function wait(milliseconds) {
