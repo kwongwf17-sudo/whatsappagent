@@ -3271,7 +3271,7 @@ async function sendOutbound(to, messages, meta = {}) {
 async function sendOutboundSequence(to, messages, meta = {}) {
   for (const [index, message] of messages.entries()) {
     try {
-      if (config.demoMode) {
+      if (config.demoMode || meta.businessAccountId === DEMO_ACCOUNT_ID) {
         await store.appendOutbox({ direction: "outbound", to, ...meta, ...message });
         console.log(`Demo outbound to ${to}: ${message.type} ${message.body || message.caption || message.url || message.name}`);
         continue;
@@ -9320,7 +9320,16 @@ function demoChatHtml() {
             source
           })
         });
-        const data = await response.json();
+        const responseText = await response.text();
+        let data;
+        try {
+          data = JSON.parse(responseText);
+        } catch (error) {
+          throw new Error(responseText || ("HTTP " + response.status));
+        }
+        if (!response.ok) {
+          throw new Error(data.error || responseText || ("HTTP " + response.status));
+        }
         for (const message of data.messages || []) {
           if (message.type === "image") {
             const wrap = document.createElement("div");
