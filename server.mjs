@@ -719,6 +719,10 @@ const server = http.createServer(async (req, res) => {
       return sendQrSvg(res);
     }
 
+    if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/qr-only") {
+      return sendHtml(res, 200, whatsappWebQrOnlyHtml());
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/whatsapp-web/pairing-code") {
       if (!webTransport) {
         return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
@@ -3559,8 +3563,8 @@ async function sendQrSvg(res) {
     const QRCode = await import("qrcode");
     const svg = await QRCode.toString(qr, {
       type: "svg",
-      margin: 1,
-      width: 320,
+      margin: 4,
+      width: 640,
     });
     res.writeHead(200, {
       "Content-Type": "image/svg+xml",
@@ -3571,6 +3575,42 @@ async function sendQrSvg(res) {
     await recordSystemError("qr_render", error);
     return sendText(res, 500, "QR render failed");
   }
+}
+
+function whatsappWebQrOnlyHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsApp Web QR</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: Arial, sans-serif; background: #f8fafc; color: #111827; }
+    main { text-align: center; padding: 22px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { color: #6b7280; margin: 8px 0 18px; }
+    img { display: block; width: min(640px, calc(100vw - 44px)); height: auto; background: #fff; border: 1px solid #d8dee4; border-radius: 18px; padding: 18px; box-shadow: 0 12px 30px rgba(15,23,42,.12); }
+    a, button { display: inline-block; margin-top: 16px; border: 1px solid #cfd4dc; background: #fff; border-radius: 10px; padding: 11px 14px; color: #111827; text-decoration: none; font-weight: 700; font-size: 15px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Scan This QR</h1>
+    <p>Use the main WhatsApp Business phone: Settings &gt; Linked Devices &gt; Link a Device.</p>
+    <img id="qr" src="/admin/whatsapp-web/qr.svg?t=${Date.now()}" alt="WhatsApp Web QR code">
+    <div>
+      <button type="button" onclick="refreshQr()">Refresh QR</button>
+      <a href="/admin/whatsapp-web">Back to Connector</a>
+    </div>
+  </main>
+  <script>
+    function refreshQr() {
+      document.querySelector("#qr").src = "/admin/whatsapp-web/qr.svg?t=" + Date.now();
+    }
+    setInterval(refreshQr, 20000);
+  </script>
+</body>
+</html>`;
 }
 
 function publicPrivacyHtml() {
@@ -3680,7 +3720,7 @@ function whatsappWebStatusHtml() {
     .connected { color: #176f37; background: #dcfce7; }
     .qr_required, .starting { color: #8a5a00; background: #fef3c7; }
     .error, .disconnected { color: #9f1c1c; background: #fee2e2; }
-    #qr { display: none; margin-top: 16px; width: 320px; height: 320px; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 10px; }
+    #qr { display: none; margin-top: 16px; width: min(520px, calc(100vw - 96px)); height: auto; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 14px; }
     .pairing { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
     .pairing-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .pairing input { border: 1px solid #cfd4dc; border-radius: 8px; padding: 10px 12px; min-width: 260px; font: inherit; }
@@ -3708,7 +3748,8 @@ function whatsappWebStatusHtml() {
       <p>Status: <span id="status" class="status">Loading...</span></p>
       <p id="details" class="muted"></p>
       <img id="qr" alt="WhatsApp Web QR code">
-      <p class="muted">If QR is shown: open WhatsApp Business on the phone, go to Linked devices, then scan this QR.</p>
+      <p class="muted">If QR is shown: open WhatsApp Business on the main phone, go to Linked devices, then scan this QR.</p>
+      <p><a href="/admin/whatsapp-web/qr-only" target="_blank" rel="noopener">Open large QR scan page</a></p>
       <div class="pairing">
         <h2>Alternative: Pairing Code</h2>
         <p class="muted">If QR keeps expiring, enter the WhatsApp Business number and use the code in WhatsApp Business &gt; Linked devices &gt; Link with phone number instead.</p>
