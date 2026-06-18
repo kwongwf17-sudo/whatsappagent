@@ -719,6 +719,19 @@ const server = http.createServer(async (req, res) => {
       return sendQrSvg(res);
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/whatsapp-web/pairing-code") {
+      if (!webTransport) {
+        return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
+      }
+      const body = await readJsonBody(req);
+      try {
+        const code = await webTransport.requestPairingCode(body.phoneNumber || "");
+        return sendJson(res, 200, { code, status: webTransport.getStatus() });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message, status: webTransport.getStatus() });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/admin/complaint-settings") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       return sendJson(res, 200, await store.getComplaintSettings(adminSession.accountId));
@@ -3668,6 +3681,11 @@ function whatsappWebStatusHtml() {
     .qr_required, .starting { color: #8a5a00; background: #fef3c7; }
     .error, .disconnected { color: #9f1c1c; background: #fee2e2; }
     #qr { display: none; margin-top: 16px; width: 320px; height: 320px; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 10px; }
+    .pairing { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+    .pairing-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .pairing input { border: 1px solid #cfd4dc; border-radius: 8px; padding: 10px 12px; min-width: 260px; font: inherit; }
+    .pairing button { border: 0; border-radius: 8px; padding: 11px 14px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
+    .pairing-code { display: none; margin-top: 14px; font-size: 30px; font-weight: 800; letter-spacing: 3px; }
     .muted { color: var(--muted); }
     code { background: #f1f5f9; padding: 2px 5px; border-radius: 5px; }
   </style>
@@ -3691,6 +3709,16 @@ function whatsappWebStatusHtml() {
       <p id="details" class="muted"></p>
       <img id="qr" alt="WhatsApp Web QR code">
       <p class="muted">If QR is shown: open WhatsApp Business on the phone, go to Linked devices, then scan this QR.</p>
+      <div class="pairing">
+        <h2>Alternative: Pairing Code</h2>
+        <p class="muted">If QR keeps expiring, enter the WhatsApp Business number and use the code in WhatsApp Business &gt; Linked devices &gt; Link with phone number instead.</p>
+        <div class="pairing-row">
+          <input id="phone" type="text" placeholder="e.g. 6737504957">
+          <button id="pair" type="button">Get Pairing Code</button>
+        </div>
+        <div id="pairing-code" class="pairing-code"></div>
+        <p id="pairing-state" class="muted"></p>
+      </div>
     </section>
   </main>
   <script>
@@ -3718,8 +3746,35 @@ function whatsappWebStatusHtml() {
         qr.style.display = "none";
         qr.removeAttribute("src");
       }
+      if (data.pairingCode) {
+        const codeEl = document.querySelector("#pairing-code");
+        codeEl.style.display = "block";
+        codeEl.textContent = data.pairingCode;
+      }
+    }
+    async function requestPairingCode() {
+      const state = document.querySelector("#pairing-state");
+      const codeEl = document.querySelector("#pairing-code");
+      state.textContent = "Requesting pairing code...";
+      codeEl.style.display = "none";
+      codeEl.textContent = "";
+      const response = await fetch("/admin/whatsapp-web/pairing-code", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phoneNumber: document.querySelector("#phone").value })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        state.textContent = data.error || "Could not request pairing code.";
+        return;
+      }
+      codeEl.style.display = "block";
+      codeEl.textContent = data.code;
+      state.textContent = "Enter this code in WhatsApp Business linked device pairing.";
+      loadStatus();
     }
     document.querySelector("#refresh").addEventListener("click", loadStatus);
+    document.querySelector("#pair").addEventListener("click", requestPairingCode);
     loadStatus();
     setInterval(loadStatus, 5000);
   </script>
