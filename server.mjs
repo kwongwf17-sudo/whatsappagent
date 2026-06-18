@@ -736,6 +736,18 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/whatsapp-web/disconnect") {
+      if (!webTransport) {
+        return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
+      }
+      try {
+        await webTransport.disconnect({ reconnect: true });
+        return sendJson(res, 200, { ok: true, status: webTransport.getStatus() });
+      } catch (error) {
+        return sendJson(res, 500, { error: error.message, status: webTransport.getStatus() });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/admin/complaint-settings") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       return sendJson(res, 200, await store.getComplaintSettings(adminSession.accountId));
@@ -3726,6 +3738,8 @@ function whatsappWebStatusHtml() {
     .pairing input { border: 1px solid #cfd4dc; border-radius: 8px; padding: 10px 12px; min-width: 260px; font: inherit; }
     .pairing button { border: 0; border-radius: 8px; padding: 11px 14px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
     .pairing-code { display: none; margin-top: 14px; font-size: 30px; font-weight: 800; letter-spacing: 3px; }
+    .danger { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+    .danger button { border: 1px solid #fecaca; border-radius: 8px; padding: 11px 14px; background: #fee2e2; color: #991b1b; font-weight: 800; cursor: pointer; }
     .muted { color: var(--muted); }
     code { background: #f1f5f9; padding: 2px 5px; border-radius: 5px; }
   </style>
@@ -3759,6 +3773,12 @@ function whatsappWebStatusHtml() {
         </div>
         <div id="pairing-code" class="pairing-code"></div>
         <p id="pairing-state" class="muted"></p>
+      </div>
+      <div class="danger">
+        <h2>Disconnect Current WhatsApp</h2>
+        <p class="muted">Use this before connecting a different WhatsApp Business number. It logs out the current linked session and clears the saved QR session.</p>
+        <button id="disconnect" type="button">Disconnect WhatsApp</button>
+        <p id="disconnect-state" class="muted"></p>
       </div>
     </section>
   </main>
@@ -3814,8 +3834,22 @@ function whatsappWebStatusHtml() {
       state.textContent = "Enter this code in WhatsApp Business linked device pairing.";
       loadStatus();
     }
+    async function disconnectWhatsApp() {
+      if (!confirm("Disconnect the current WhatsApp Web session? You will need to scan QR again.")) return;
+      const state = document.querySelector("#disconnect-state");
+      state.textContent = "Disconnecting...";
+      const response = await fetch("/admin/whatsapp-web/disconnect", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        state.textContent = data.error || "Could not disconnect WhatsApp.";
+        return;
+      }
+      state.textContent = "Disconnected. A fresh QR session is starting; scan the new QR with the new phone.";
+      loadStatus();
+    }
     document.querySelector("#refresh").addEventListener("click", loadStatus);
     document.querySelector("#pair").addEventListener("click", requestPairingCode);
+    document.querySelector("#disconnect").addEventListener("click", disconnectWhatsApp);
     loadStatus();
     setInterval(loadStatus, 5000);
   </script>
