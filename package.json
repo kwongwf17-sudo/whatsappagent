@@ -8,6 +8,10 @@
     "check": "node --check server.mjs",
     "test": "node --test lib/*.test.mjs"
   },
+  "dependencies": {
+    "@whiskeysockets/baileys": "latest",
+    "qrcode": "^1.5.4"
+  },
   "engines": {
     "node": ">=20"
   }

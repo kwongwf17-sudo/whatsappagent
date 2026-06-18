@@ -40,6 +40,7 @@ import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
 import { AdminAccountStore } from "./lib/admin_accounts.mjs";
 import { OperationsStore } from "./lib/operations.mjs";
+import { WebWhatsAppTransport } from "./lib/web_whatsapp_transport.mjs";
 import {
   customerOrderStatusReply,
   isLikelyOrderStatusQuestion,
@@ -57,6 +58,7 @@ await loadEnvFile(path.join(__dirname, ".env"));
 await loadEnvFile();
 
 const demoMode = parseBool(getEnv("DEMO_MODE", "true"));
+const transportMode = getEnv("WHATSAPP_TRANSPORT", demoMode ? "demo" : "cloud").toLowerCase();
 function resolveSeedPath(envName, fileName) {
   const bundledPath = path.join(__dirname, "data", fileName);
   const configuredPath = path.resolve(getEnv(envName, bundledPath));
@@ -74,13 +76,14 @@ function resolveSeedPath(envName, fileName) {
 
 const config = {
   demoMode,
+  transportMode,
   port: Number(getEnv("PORT", "3000")),
   webhookPath: normalizePath(getEnv("WHATSAPP_WEBHOOK_PATH", "/webhook")),
   verifyToken: getEnv("WHATSAPP_VERIFY_TOKEN", "demo_verify_token"),
   appSecret: process.env.WHATSAPP_APP_SECRET,
   graphVersion: getEnv("WHATSAPP_GRAPH_VERSION", "v25.0"),
-  phoneNumberId: demoMode ? getEnv("WHATSAPP_PHONE_NUMBER_ID", "") : requireEnv("WHATSAPP_PHONE_NUMBER_ID"),
-  accessToken: demoMode ? getEnv("WHATSAPP_ACCESS_TOKEN", "") : requireEnv("WHATSAPP_ACCESS_TOKEN"),
+  phoneNumberId: demoMode || transportMode === "web" ? getEnv("WHATSAPP_PHONE_NUMBER_ID", "") : requireEnv("WHATSAPP_PHONE_NUMBER_ID"),
+  accessToken: demoMode || transportMode === "web" ? getEnv("WHATSAPP_ACCESS_TOKEN", "") : requireEnv("WHATSAPP_ACCESS_TOKEN"),
   adminWhatsAppNumber: getEnv("ADMIN_WHATSAPP_NUMBER", ""),
   openaiApiKey: usableEnv("OPENAI_API_KEY"),
   openaiModel: getEnv("OPENAI_MODEL", "gpt-5.4-mini"),
@@ -95,6 +98,7 @@ const config = {
   storeBackend: getEnv("WHATSAPP_STORE", "json").toLowerCase(),
   sqlitePath: getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"),
   assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
+  webSessionDir: path.resolve(getEnv("WHATSAPP_WEB_SESSION_DIR", path.join(__dirname, "data", "whatsapp-web-session"))),
   catalogPath: resolveSeedPath("PRODUCT_CATALOG_PATH", "product_catalog.json"),
   generalFaqsPath: resolveSeedPath("GENERAL_FAQS_PATH", "general_faqs.json"),
   salesRepliesPath: resolveSeedPath("SALES_REPLIES_PATH", "sales_replies.json"),
@@ -135,6 +139,9 @@ const sqliteAdapter = config.storeBackend === "sqlite"
 const store = new JsonStore(config.dataDir, { adapter: sqliteAdapter });
 const adminAccounts = new AdminAccountStore(config.dataDir, { adapter: sqliteAdapter });
 const operations = new OperationsStore(config.dataDir, { adapter: sqliteAdapter });
+const webTransport = config.transportMode === "web"
+  ? new WebWhatsAppTransport({ sessionDir: config.webSessionDir, logger: console })
+  : null;
 await adminAccounts.ensureInitialAccount({
   id: config.accountId,
   name: config.businessName,
@@ -696,6 +703,22 @@ const server = http.createServer(async (req, res) => {
       return sendHtml(res, 200, adminChatPageHtml());
     }
 
+    if (req.method === "GET" && url.pathname === "/admin/whatsapp-web") {
+      return sendHtml(res, 200, whatsappWebStatusHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/status") {
+      return sendJson(res, 200, webTransport?.getStatus() || {
+        transport: config.transportMode,
+        status: config.transportMode === "web" ? "not_initialized" : "disabled",
+        qr: "",
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/qr.svg") {
+      return sendQrSvg(res);
+    }
+
     if (req.method === "GET" && url.pathname === "/admin/complaint-settings") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       return sendJson(res, 200, await store.getComplaintSettings(adminSession.accountId));
@@ -765,7 +788,7 @@ const server = http.createServer(async (req, res) => {
       );
       if (!customer) return sendJson(res, 404, { error: "Customer not found." });
       const lastInboundAt = new Date(customer.lastInboundAt || customer.firstSeenAt || 0).getTime();
-      if (!config.demoMode && (!Number.isFinite(lastInboundAt) || Date.now() - lastInboundAt > DAY_MS)) {
+      if (config.transportMode === "cloud" && !config.demoMode && (!Number.isFinite(lastInboundAt) || Date.now() - lastInboundAt > DAY_MS)) {
         return sendJson(res, 409, {
           error: "The 24-hour customer service window has ended. Send an approved WhatsApp template instead.",
         });
@@ -1082,6 +1105,8 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       return sendJson(res, 200, {
         ok: true,
         demoMode: config.demoMode,
+        transportMode: config.transportMode,
+        webTransport: webTransport?.getStatus() || null,
         webhookPath: config.webhookPath,
         model: config.openaiModel,
         extractionModel: config.extractionModel,
@@ -1114,9 +1139,20 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
 
 server.listen(config.port, () => {
   console.log(`WhatsApp AI customer service agent listening on http://localhost:${config.port}`);
-  console.log(`Mode: ${config.demoMode ? "demo/local outbox" : "WhatsApp Cloud API"}`);
+  console.log(`Mode: ${config.demoMode ? "demo/local outbox" : config.transportMode === "web" ? "WhatsApp Web QR" : "WhatsApp Cloud API"}`);
   console.log(`Webhook endpoint: ${config.webhookPath}`);
 });
+
+if (webTransport) {
+  void webTransport.start({
+    onMessage: async (message) => {
+      await processInboundMessage({
+        ...message,
+        live: true,
+      });
+    },
+  }).catch((error) => recordSystemError("web_transport_start", error));
+}
 
 if (config.followupAutorun) {
   setInterval(() => {
@@ -1850,7 +1886,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: customer.followupsSent[item.followupKey] });
       continue;
     }
-    const outsideCustomerServiceWindow = !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
+    const outsideCustomerServiceWindow = config.transportMode === "cloud" && !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
     const templateName = outsideCustomerServiceWindow ? followupTemplateName(item.followupKey) : "";
     if (outsideCustomerServiceWindow) {
       if (templateName) {
@@ -3230,7 +3266,7 @@ async function sendOutboundSequence(to, messages, meta = {}) {
         });
       }
       if (index < messages.length - 1) {
-        if (messageId) {
+        if (messageId && config.transportMode === "cloud") {
           const status = await waitForDeliveredMessage(messageId);
           console.log(`WhatsApp sequence gate ${status} for ${messageId}`);
         }
@@ -3246,6 +3282,13 @@ async function sendOutboundSequence(to, messages, meta = {}) {
 }
 
 async function sendWhatsAppMessage(to, message) {
+  if (config.transportMode === "web") {
+    if (!webTransport) throw new Error("WhatsApp Web transport is not initialized.");
+    const messageId = await webTransport.send(to, message);
+    console.log(`Sent WhatsApp Web ${message.type} to ${to}`);
+    return messageId || `web_${Date.now()}`;
+  }
+
   const image = message.type === "image" ? { link: resolveMediaUrl(message.url) } : null;
   if (image && message.caption) image.caption = message.caption;
   const payload =
@@ -3496,6 +3539,27 @@ function sendHtml(res, statusCode, body) {
   res.end(body);
 }
 
+async function sendQrSvg(res) {
+  const qr = webTransport?.getStatus().qr || "";
+  if (!qr) return sendText(res, 404, "QR not available");
+  try {
+    const QRCode = await import("qrcode");
+    const svg = await QRCode.toString(qr, {
+      type: "svg",
+      margin: 1,
+      width: 320,
+    });
+    res.writeHead(200, {
+      "Content-Type": "image/svg+xml",
+      "Cache-Control": "no-store",
+    });
+    res.end(svg);
+  } catch (error) {
+    await recordSystemError("qr_render", error);
+    return sendText(res, 500, "QR render failed");
+  }
+}
+
 function publicPrivacyHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -3579,6 +3643,81 @@ function publicDataDeletionHtml() {
 
   <h2>Processing Time</h2>
   <p>We aim to process deletion requests within a reasonable time after verifying the request.</p>
+</body>
+</html>`;
+}
+
+function whatsappWebStatusHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsApp Web Connector</title>
+  <style>
+    :root { --accent: #0b7cff; --line: #d8dee4; --muted: #6b7280; --bg: #f6f7fb; }
+    body { margin: 0; font-family: Arial, sans-serif; color: #222; background: var(--bg); }
+    header, nav, main { padding: 18px 24px; }
+    header { background: #fff; border-bottom: 1px solid var(--line); }
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    nav { display: flex; flex-wrap: wrap; gap: 10px; border-bottom: 1px solid var(--line); background: #fff; }
+    nav a, nav button { border: 1px solid #cfd4dc; background: #fff; border-radius: 8px; padding: 10px 13px; color: #222; text-decoration: none; font-weight: 700; font-size: 15px; }
+    .card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 18px; max-width: 760px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+    .status { display: inline-block; border-radius: 999px; padding: 6px 10px; font-weight: 700; background: #f1f5f9; }
+    .connected { color: #176f37; background: #dcfce7; }
+    .qr_required, .starting { color: #8a5a00; background: #fef3c7; }
+    .error, .disconnected { color: #9f1c1c; background: #fee2e2; }
+    #qr { display: none; margin-top: 16px; width: 320px; height: 320px; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 10px; }
+    .muted { color: var(--muted); }
+    code { background: #f1f5f9; padding: 2px 5px; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WhatsApp Web Connector</h1>
+    <p class="muted">Use this only when <code>WHATSAPP_TRANSPORT=web</code>. Scan the QR with the WhatsApp Business phone.</p>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <button id="refresh" type="button">Refresh</button>
+  </nav>
+  <main>
+    <section class="card">
+      <h2>Connection Status</h2>
+      <p>Status: <span id="status" class="status">Loading...</span></p>
+      <p id="details" class="muted"></p>
+      <img id="qr" alt="WhatsApp Web QR code">
+      <p class="muted">If QR is shown: open WhatsApp Business on the phone, go to Linked devices, then scan this QR.</p>
+    </section>
+  </main>
+  <script>
+    async function loadStatus() {
+      const response = await fetch("/admin/whatsapp-web/status", { cache: "no-store" });
+      const data = await response.json();
+      const status = document.querySelector("#status");
+      const qr = document.querySelector("#qr");
+      status.textContent = data.status || "unknown";
+      status.className = "status " + (data.status || "");
+      document.querySelector("#details").textContent =
+        "Transport: " + (data.transport || "") +
+        (data.lastConnectedAt ? " | Connected: " + new Date(data.lastConnectedAt).toLocaleString() : "") +
+        (data.lastDisconnectedAt ? " | Disconnected: " + new Date(data.lastDisconnectedAt).toLocaleString() : "") +
+        (data.lastError ? " | Error: " + data.lastError : "");
+      if (data.qr) {
+        qr.style.display = "block";
+        qr.src = "/admin/whatsapp-web/qr.svg?t=" + Date.now();
+      } else {
+        qr.style.display = "none";
+        qr.removeAttribute("src");
+      }
+    }
+    document.querySelector("#refresh").addEventListener("click", loadStatus);
+    loadStatus();
+    setInterval(loadStatus, 5000);
+  </script>
 </body>
 </html>`;
 }
@@ -5657,6 +5796,7 @@ function adminDashboardHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -6304,6 +6444,7 @@ function adminChatPageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -6543,6 +6684,7 @@ function replyLibraryPageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -6741,6 +6883,7 @@ function faqLibraryPageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -7263,6 +7406,7 @@ function salesRepliesPageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -7612,6 +7756,7 @@ function productFlowPageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -8327,6 +8472,7 @@ function analyticsPageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -8498,6 +8644,7 @@ function compliancePageHtml() {
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
@@ -9134,4 +9281,5 @@ function demoChatHtml() {
 </body>
 </html>`;
 }
+
 
