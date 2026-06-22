@@ -1,6 +1,6 @@
 # WhatsApp AI Customer Service Agent
 
-This module is a one-user demo agent for WhatsApp Business customer service. It can run locally without WhatsApp credentials first, then switch to the Meta WhatsApp Cloud API when you are ready. The current demo product is `Blackhead Remover`.
+This module is a WhatsApp Business customer service agent. It can run locally without WhatsApp credentials first, then switch to the Meta WhatsApp Cloud API when you are ready. The current demo product is `Blackhead Remover`.
 
 ## What It Does
 
@@ -47,9 +47,9 @@ The response shows the text/image messages the bot would send. Demo outbound mes
 whatsapp_agent/data/outbox.json
 ```
 
-## SQLite Storage
+## Storage
 
-For a real WABA pilot, use SQLite instead of JSON files:
+For a single-team WABA pilot, use SQLite instead of JSON files:
 
 ```powershell
 $env:WHATSAPP_STORE="sqlite"
@@ -63,6 +63,28 @@ whatsapp_agent/data/agent.sqlite
 ```
 
 Existing JSON files are imported into SQLite automatically the first time each document is read. Keep uploaded product images in `assets/`, and keep the product catalog in `data/product_catalog.json` for now.
+
+For shared multi-team hosting, use Postgres:
+
+```powershell
+$env:WHATSAPP_STORE="postgres"
+$env:DATABASE_URL="postgres://user:password@host:5432/database"
+```
+
+Postgres uses the same document-store adapter interface as JSON/SQLite, so existing data files can be imported automatically. For the full multi-team hosting notes, see `docs/MULTI_TEAM_ROLLOUT.md`.
+
+For multi-team deployments, product catalogs, uploaded product images, approved FAQs, approved sales replies, and team vector store IDs are stored per business account. Super Admin owns Team Settings and WhatsApp credentials; normal Business Admins manage only their team content and orders.
+
+## Follow-Up Worker
+
+In production, run the web server and follow-up worker separately:
+
+```powershell
+npm start
+npm run worker:followups
+```
+
+The worker starts the app with `WHATSAPP_SKIP_HTTP=true`, so it does not bind to `PORT`. Use it for scheduled follow-up queue dispatch while the web process handles webhooks and dashboard traffic.
 
 ## Demo Order Flow
 
@@ -147,7 +169,7 @@ Open `http://localhost:3000/admin/faq-library` to maintain approved FAQ replies:
 
 For broader product documents or SOP answers that are not in the approved FAQ library, use OpenAI file search:
 
-1. Put product info, FAQ, and SOP documents in `whatsapp_agent/knowledge/`.
+1. Put product info, FAQ, and SOP documents in `whatsapp_agent/knowledge/` for single-team use, or `whatsapp_agent/knowledge/TEAM_ID/` for multi-team use.
 2. Add `OPENAI_API_KEY` to `whatsapp_agent/.env`.
 3. Upload the knowledge base:
 
@@ -155,7 +177,13 @@ For broader product documents or SOP answers that are not in the approved FAQ li
 npm run whatsapp:ingest
 ```
 
-4. Put the printed `OPENAI_VECTOR_STORE_ID` into `whatsapp_agent/.env`.
+For a specific team:
+
+```powershell
+node ingest_knowledge.mjs --account-id TEAM_ID --knowledge-dir knowledge/TEAM_ID
+```
+
+4. For single-team use, put the printed `OPENAI_VECTOR_STORE_ID` into `whatsapp_agent/.env`. For multi-team use, the script saves the vector store ID into Super Admin Team Settings for that team.
 
 ## WhatsApp Cloud API Setup
 
@@ -212,8 +240,8 @@ Use the same verify token as `WHATSAPP_VERIFY_TOKEN`.
 
 ## Next Production Steps
 
-- Replace `product_catalog.json` with your real product flows, product images, FAQ, pricing, and stock rules.
-- For production image sending, set `PUBLIC_BASE_URL` to your HTTPS tunnel/domain or replace catalog image paths with hosted HTTPS links.
-- Use `WHATSAPP_STORE=sqlite` for the first real WABA pilot.
+- Rotate OpenAI, Meta, Super Admin, Admin, and session secrets before deploying.
+- Use `WHATSAPP_STORE=postgres` for multiple teams.
+- Set each team's WhatsApp phone number ID and access token in Super Admin Team Settings.
+- Run both `npm start` and `npm run worker:followups` in production.
 - Add approved WhatsApp message templates for business-initiated messages outside the customer service window.
-- Move follow-up queue and customer records to PostgreSQL before high-volume multi-account ads.

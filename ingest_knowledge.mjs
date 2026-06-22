@@ -8,6 +8,9 @@ import {
   uploadFile,
 } from "./lib/openai.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
+import { AdminAccountStore } from "./lib/admin_accounts.mjs";
+import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
+import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultKnowledgeDir = path.join(__dirname, "knowledge");
@@ -39,18 +42,33 @@ await loadEnvFile(path.join(__dirname, ".env"));
 await loadEnvFile();
 
 const apiKey = requireEnv("OPENAI_API_KEY");
-const vectorStoreName = getEnv("OPENAI_VECTOR_STORE_NAME", "whatsapp_customer_service_knowledge");
-const knowledgeDir = path.resolve(getEnv("KNOWLEDGE_DIR", defaultKnowledgeDir));
-let vectorStoreId = process.env.OPENAI_VECTOR_STORE_ID;
+const teamAccountId = getCliValue("--account-id") || getEnv("TEAM_ACCOUNT_ID", "");
+const vectorStoreName = getEnv(
+  "OPENAI_VECTOR_STORE_NAME",
+  teamAccountId ? `whatsapp_${teamAccountId}_knowledge` : "whatsapp_customer_service_knowledge"
+);
+const knowledgeDir = path.resolve(getCliValue("--knowledge-dir") || getEnv("KNOWLEDGE_DIR", defaultKnowledgeDir));
+const adminAccounts = teamAccountId ? await createAdminAccountStore() : null;
+const teamSettings = teamAccountId ? await adminAccounts.getTeamSettings(teamAccountId) : {};
+let vectorStoreId = teamSettings.openaiVectorStoreId || process.env.OPENAI_VECTOR_STORE_ID;
 
 if (!vectorStoreId) {
   const vectorStore = await createVectorStore(apiKey, vectorStoreName);
   vectorStoreId = vectorStore.id;
   console.log(`Created vector store: ${vectorStoreId}`);
-  console.log("Add this to whatsapp_agent/.env:");
-  console.log(`OPENAI_VECTOR_STORE_ID=${vectorStoreId}`);
+  if (teamAccountId) {
+    await adminAccounts.updateTeamSettings(teamAccountId, { openaiVectorStoreId: vectorStoreId });
+    console.log(`Saved vector store ID to team settings for ${teamAccountId}.`);
+  } else {
+    console.log("Add this to whatsapp_agent/.env:");
+    console.log(`OPENAI_VECTOR_STORE_ID=${vectorStoreId}`);
+  }
 } else {
   console.log(`Using vector store: ${vectorStoreId}`);
+  if (teamAccountId && teamSettings.openaiVectorStoreId !== vectorStoreId) {
+    await adminAccounts.updateTeamSettings(teamAccountId, { openaiVectorStoreId: vectorStoreId });
+    console.log(`Saved vector store ID to team settings for ${teamAccountId}.`);
+  }
 }
 
 const filePaths = await listKnowledgeFiles(knowledgeDir);
@@ -67,6 +85,29 @@ for (const filePath of filePaths) {
 }
 
 console.log("Knowledge ingestion complete.");
+
+async function createAdminAccountStore() {
+  const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
+  const backend = getEnv("WHATSAPP_STORE", "json").toLowerCase();
+  const adapter = backend === "sqlite"
+    ? new SqliteJsonAdapter(dataDir, getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"))
+    : backend === "postgres"
+      ? new PostgresJsonAdapter(dataDir, {
+          connectionString: getEnv("WHATSAPP_POSTGRES_URL", getEnv("DATABASE_URL", "")),
+          tableName: getEnv("WHATSAPP_POSTGRES_TABLE", "json_documents"),
+        })
+      : null;
+  return new AdminAccountStore(dataDir, {
+    adapter,
+    encryptionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "local_team_settings_secret")),
+  });
+}
+
+function getCliValue(name) {
+  const index = process.argv.indexOf(name);
+  if (index < 0) return "";
+  return process.argv[index + 1] || "";
+}
 
 async function listKnowledgeFiles(dir) {
   const entries = await readdir(dir, { withFileTypes: true });

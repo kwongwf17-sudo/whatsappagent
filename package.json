@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
+    "worker:followups": "node followup_worker.mjs",
     "check": "node --check server.mjs",
     "test": "node --test lib/*.test.mjs"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
+    "pg": "^8.13.1",
     "qrcode": "^1.5.4"
   },
   "engines": {

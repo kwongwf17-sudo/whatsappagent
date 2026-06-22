@@ -22,6 +22,7 @@ import {
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
   createEmbeddings,
+  createCustomerServiceResponse,
   createProductFactReply,
   detectComplaintIntent,
   detectOrderStatusIntent,
@@ -38,9 +39,11 @@ import {
 } from "./lib/retrieval.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
+import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
 import { AdminAccountStore } from "./lib/admin_accounts.mjs";
 import { OperationsStore } from "./lib/operations.mjs";
-import { WebWhatsAppTransport } from "./lib/web_whatsapp_transport.mjs";
+import { TeamContentStore } from "./lib/team_content.mjs";
+import { WebWhatsAppManager } from "./lib/web_whatsapp_manager.mjs";
 import {
   customerOrderStatusReply,
   isLikelyOrderStatusQuestion,
@@ -97,6 +100,8 @@ const config = {
   dataDir: path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data"))),
   storeBackend: getEnv("WHATSAPP_STORE", "json").toLowerCase(),
   sqlitePath: getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"),
+  postgresUrl: getEnv("WHATSAPP_POSTGRES_URL", getEnv("DATABASE_URL", "")),
+  postgresTable: getEnv("WHATSAPP_POSTGRES_TABLE", "json_documents"),
   assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
   webSessionDir: path.resolve(getEnv("WHATSAPP_WEB_SESSION_DIR", path.join(__dirname, "data", "whatsapp-web-session"))),
   catalogPath: resolveSeedPath("PRODUCT_CATALOG_PATH", "product_catalog.json"),
@@ -106,6 +111,10 @@ const config = {
   followupAutorun: parseBool(getEnv("FOLLOWUP_AUTORUN", "false")),
   followupIntervalMinutes: Number(getEnv("FOLLOWUP_INTERVAL_MINUTES", "15")),
   followupSendsPerMinute: Number(getEnv("FOLLOWUP_SENDS_PER_MINUTE", "10")),
+  followupSendDelayMinMs: Number(getEnv("FOLLOWUP_SEND_DELAY_MIN_MS", "2000")),
+  followupSendDelayMaxMs: Number(getEnv("FOLLOWUP_SEND_DELAY_MAX_MS", "5000")),
+  followupActiveWindowMinutes: Number(getEnv("FOLLOWUP_ACTIVE_WINDOW_MINUTES", "10")),
+  followupPauseWindowMinutes: Number(getEnv("FOLLOWUP_PAUSE_WINDOW_MINUTES", "5")),
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
@@ -114,6 +123,7 @@ const config = {
   adminSessionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "demo_session_secret")),
   superAdminPassword: usableSecretEnv("SUPER_ADMIN_PASSWORD"),
   appVersion: getEnv("APP_VERSION", "0.1.0-demo"),
+  skipHttpServer: parseBool(getEnv("WHATSAPP_SKIP_HTTP", "false")),
 };
 
 const FOLLOWUP_TEMPLATE_LANGUAGE = "en";
@@ -133,14 +143,26 @@ const FOLLOWUP_TEMPLATE_BY_KEY = {
 const catalog = JSON.parse(await readSeedFile(config.catalogPath, "product_catalog.json"));
 const faqLibrary = await loadFaqLibrary();
 const salesReplyLibrary = await loadSalesReplyLibrary();
+const defaultTeamContent = { catalog, faqLibrary, salesReplyLibrary };
 const sqliteAdapter = config.storeBackend === "sqlite"
   ? new SqliteJsonAdapter(config.dataDir, config.sqlitePath)
   : null;
-const store = new JsonStore(config.dataDir, { adapter: sqliteAdapter });
-const adminAccounts = new AdminAccountStore(config.dataDir, { adapter: sqliteAdapter });
-const operations = new OperationsStore(config.dataDir, { adapter: sqliteAdapter });
-const webTransport = config.transportMode === "web"
-  ? new WebWhatsAppTransport({ sessionDir: config.webSessionDir, logger: console })
+const postgresAdapter = config.storeBackend === "postgres"
+  ? new PostgresJsonAdapter(config.dataDir, {
+      connectionString: config.postgresUrl,
+      tableName: config.postgresTable,
+    })
+  : null;
+const storageAdapter = sqliteAdapter || postgresAdapter;
+const store = new JsonStore(config.dataDir, { adapter: storageAdapter });
+const adminAccounts = new AdminAccountStore(config.dataDir, {
+  adapter: storageAdapter,
+  encryptionSecret: config.adminSessionSecret,
+});
+const operations = new OperationsStore(config.dataDir, { adapter: storageAdapter });
+const teamContentStore = new TeamContentStore(config.dataDir, { adapter: storageAdapter });
+const webTransportManager = config.transportMode === "web"
+  ? new WebWhatsAppManager({ sessionRootDir: config.webSessionDir, logger: console })
   : null;
 await adminAccounts.ensureInitialAccount({
   id: config.accountId,
@@ -157,6 +179,7 @@ const outboundQueues = new Map();
 let testCustomerGenerationActive = false;
 let simulatedOutboxBuffer = null;
 let followupRunPromise = null;
+const followupPacingStartedAt = new Date();
 const webhookDiagnostics = {
   received: 0,
   invalidSignature: 0,
@@ -472,6 +495,21 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/superadmin/system/team-settings") {
+      const body = await readJsonBody(req);
+      try {
+        const account = await adminAccounts.updateTeamSettings(String(body.id || ""), body.settings || {});
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "team_settings_updated",
+          result: account.id,
+        });
+        return sendJson(res, 200, { account });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/superadmin/system/release") {
       const body = await readJsonBody(req);
       try {
@@ -708,43 +746,44 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/status") {
-      return sendJson(res, 200, webTransport?.getStatus() || {
-        transport: config.transportMode,
-        status: config.transportMode === "web" ? "not_initialized" : "disabled",
-        qr: "",
-      });
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendJson(res, 200, await webTransportStatusForAccount(adminSession.accountId));
     }
 
     if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/qr.svg") {
-      return sendQrSvg(res);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendQrSvg(res, adminSession.accountId);
     }
 
     if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/qr-only") {
-      return sendHtml(res, 200, whatsappWebQrOnlyHtml());
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendHtml(res, 200, whatsappWebQrOnlyHtml(adminSession.accountId));
     }
 
     if (req.method === "POST" && url.pathname === "/admin/whatsapp-web/pairing-code") {
-      if (!webTransport) {
+      if (!webTransportManager) {
         return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
       }
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
-        const code = await webTransport.requestPairingCode(body.phoneNumber || "");
-        return sendJson(res, 200, { code, status: webTransport.getStatus() });
+        const code = await webTransportManager.requestPairingCode(adminSession.accountId, body.phoneNumber || "");
+        return sendJson(res, 200, { code, status: webTransportManager.getStatus(adminSession.accountId) });
       } catch (error) {
-        return sendJson(res, 400, { error: error.message, status: webTransport.getStatus() });
+        return sendJson(res, 400, { error: error.message, status: webTransportManager.getStatus(adminSession.accountId) });
       }
     }
 
     if (req.method === "POST" && url.pathname === "/admin/whatsapp-web/disconnect") {
-      if (!webTransport) {
+      if (!webTransportManager) {
         return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
       }
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       try {
-        await webTransport.disconnect({ reconnect: true });
-        return sendJson(res, 200, { ok: true, status: webTransport.getStatus() });
+        await webTransportManager.disconnect(adminSession.accountId, { reconnect: true });
+        return sendJson(res, 200, { ok: true, status: webTransportManager.getStatus(adminSession.accountId) });
       } catch (error) {
-        return sendJson(res, 500, { error: error.message, status: webTransport.getStatus() });
+        return sendJson(res, 500, { error: error.message, status: webTransportManager.getStatus(adminSession.accountId) });
       }
     }
 
@@ -901,7 +940,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/admin/product-flow-data") {
-      return sendJson(res, 200, { products: catalog.products.map(productFlowEditorData) });
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const content = await getTeamContent(adminSession.accountId);
+      return sendJson(res, 200, { products: content.catalog.products.map(productFlowEditorData) });
     }
 
     if (req.method === "GET" && (url.pathname === "/admin/reply-library" || url.pathname === "/admin/faq-library")) {
@@ -909,28 +950,32 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/admin/faq-library-data") {
-      return sendJson(res, 200, faqLibraryData());
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const content = await getTeamContent(adminSession.accountId);
+      return sendJson(res, 200, faqLibraryData(content));
     }
 
     if (req.method === "POST" && url.pathname === "/admin/faq-library/save") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
-        const faq = saveApprovedFaq(body);
-        if (faq.scope === "general") await persistFaqLibrary();
-        else await persistCatalog();
-        return sendJson(res, 200, { faq, data: faqLibraryData() });
+        const content = await getTeamContent(adminSession.accountId);
+        const faq = saveApprovedFaq(body, content);
+        await saveTeamContent(adminSession.accountId, content);
+        return sendJson(res, 200, { faq, data: faqLibraryData(content) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
     }
 
     if (req.method === "POST" && url.pathname === "/admin/faq-library/delete") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
-        const deleted = deleteApprovedFaq(body);
-        if (deleted.scope === "general") await persistFaqLibrary();
-        else await persistCatalog();
-        return sendJson(res, 200, { deleted, data: faqLibraryData() });
+        const content = await getTeamContent(adminSession.accountId);
+        const deleted = deleteApprovedFaq(body, content);
+        await saveTeamContent(adminSession.accountId, content);
+        return sendJson(res, 200, { deleted, data: faqLibraryData(content) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -941,48 +986,58 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/admin/sales-replies-data") {
-      return sendJson(res, 200, salesRepliesData());
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const content = await getTeamContent(adminSession.accountId);
+      return sendJson(res, 200, salesRepliesData(content));
     }
 
 if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
-        const salesReply = saveSalesReply(body);
-        await persistSalesReplies();
-        return sendJson(res, 200, { salesReply, data: salesRepliesData() });
+        const content = await getTeamContent(adminSession.accountId);
+        const salesReply = saveSalesReply(body, content);
+        await saveTeamContent(adminSession.accountId, content);
+        return sendJson(res, 200, { salesReply, data: salesRepliesData(content) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
     }
 
     if (req.method === "POST" && url.pathname === "/admin/sales-replies/delete") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
-        const deleted = deleteSalesReply(body);
-        await persistSalesReplies();
-        return sendJson(res, 200, { deleted, data: salesRepliesData() });
+        const content = await getTeamContent(adminSession.accountId);
+        const deleted = deleteSalesReply(body, content);
+        await saveTeamContent(adminSession.accountId, content);
+        return sendJson(res, 200, { deleted, data: salesRepliesData(content) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/create") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       const name = String(body.name || "").trim();
       if (!name) return sendJson(res, 400, { error: "Product name is required." });
+      const content = await getTeamContent(adminSession.accountId);
       const product = createCatalogProduct(name);
-      catalog.products.push(product);
-      await persistCatalog();
+      content.catalog.products.push(product);
+      await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 201, { product: productFlowEditorData(product) });
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/save") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const product = findCatalogProduct(body.productId);
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
       try {
         updateProductFlowText(product, body);
-        await persistCatalog();
+        await saveTeamContent(adminSession.accountId, content);
         return sendJson(res, 200, { product: productFlowEditorData(product) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
@@ -990,8 +1045,10 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/image") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const product = findCatalogProduct(body.productId);
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
       const slot = PRODUCT_FLOW_IMAGE_SLOTS.find((item) => item.key === body.slot);
       if (!slot) return sendJson(res, 400, { error: "Unknown image slot." });
@@ -1000,8 +1057,9 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       if (image.bytes.length > 10 * 1024 * 1024) {
         return sendJson(res, 400, { error: "Image must be 10 MB or smaller." });
       }
+      const accountAssetId = safeAssetSegment(adminSession.accountId);
       const productAssetId = safeAssetSegment(product.id);
-      const targetDirectory = path.join(config.assetsDir, productAssetId);
+      const targetDirectory = path.join(config.assetsDir, accountAssetId, productAssetId);
       await mkdir(targetDirectory, { recursive: true });
       const originalName = String(body.originalName || "").trim();
       const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName)));
@@ -1009,7 +1067,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         ? `${slot.filename}-${originalBase}.${image.extension}`
         : `${slot.filename}.${image.extension}`;
       await writeFile(path.join(targetDirectory, filename), image.bytes);
-      const assetUrl = `/assets/${productAssetId}/${filename}`;
+      const assetUrl = `/assets/${accountAssetId}/${productAssetId}/${filename}`;
       updateProductFlowImage(product, slot, assetUrl);
       const extraction = await ingestProductImageKnowledge(product, {
         slot,
@@ -1017,43 +1075,51 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         originalName,
         dataUrl: body.dataUrl,
       });
-      await persistCatalog();
+      await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/extract-existing") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const product = findCatalogProduct(body.productId);
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
       const extraction = await extractExistingProductImageKnowledge(product);
-      await persistCatalog();
+      await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/clean-pending") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const product = findCatalogProduct(body.productId);
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
       const result = cleanPendingExtractedFacts(product);
-      await persistCatalog();
+      await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), result });
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/approve") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const product = findCatalogProduct(body.productId);
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
       const result = approveExtractedProductFact(product, String(body.factId || ""));
-      await persistCatalog();
+      await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), result });
     }
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/delete") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const product = findCatalogProduct(body.productId);
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
       const result = deleteExtractedProductFact(product, String(body.factId || ""), String(body.status || "pending"));
-      await persistCatalog();
+      await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), result });
     }
 
@@ -1135,7 +1201,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         ok: true,
         demoMode: config.demoMode,
         transportMode: config.transportMode,
-        webTransport: webTransport?.getStatus() || null,
+        webTransport: await webTransportHealthData(),
         webhookPath: config.webhookPath,
         model: config.openaiModel,
         extractionModel: config.extractionModel,
@@ -1166,24 +1232,26 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
   }
 });
 
-server.listen(config.port, () => {
-  console.log(`WhatsApp AI customer service agent listening on http://localhost:${config.port}`);
-  console.log(`Mode: ${config.demoMode ? "demo/local outbox" : config.transportMode === "web" ? "WhatsApp Web QR" : "WhatsApp Cloud API"}`);
-  console.log(`Webhook endpoint: ${config.webhookPath}`);
-});
-
-if (webTransport) {
-  void webTransport.start({
-    onMessage: async (message) => {
-      await processInboundMessage({
-        ...message,
-        live: true,
-      });
-    },
-  }).catch((error) => recordSystemError("web_transport_start", error));
+if (!config.skipHttpServer) {
+  server.listen(config.port, () => {
+    console.log(`WhatsApp AI customer service agent listening on http://localhost:${config.port}`);
+    console.log(`Mode: ${config.demoMode ? "demo/local outbox" : config.transportMode === "web" ? "WhatsApp Web QR" : "WhatsApp Cloud API"}`);
+    console.log(`Webhook endpoint: ${config.webhookPath}`);
+  });
 }
 
-if (config.followupAutorun) {
+if (!config.skipHttpServer && webTransportManager) {
+  void adminAccounts.listAccounts()
+    .then((accounts) => webTransportManager.start({
+      accounts,
+      onMessage: async (message) => {
+        await processInboundMessage(message);
+      },
+    }))
+    .catch((error) => recordSystemError("web_transport_start", error));
+}
+
+if (!config.skipHttpServer && config.followupAutorun) {
   setInterval(() => {
     void requestFollowupRun().catch((error) => recordSystemError("followup_run", error));
   }, Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
@@ -1245,20 +1313,22 @@ async function handleWebhookPayload(rawBody) {
 
     for (const message of messages) {
       if (alreadyProcessed(message.id)) continue;
+      const businessAccountId = await businessAccountIdForPhoneNumber(message.phoneNumberId);
       const text = getMessageText(message);
       if (!text) {
-        const blocked = await liveAutomationBlock();
+        const blocked = await liveAutomationBlock(businessAccountId);
         if (blocked) {
           await store.appendAuditLog({
             action: "live_reply_suppressed",
             customerId: message.from,
+            businessAccountId,
             result: blocked.code,
           });
           continue;
         }
         await sendOutbound(message.from, [
           textMessage("Thanks for your message. I can help fastest with text questions, or our team can review this shortly."),
-        ]);
+        ], { businessAccountId });
         continue;
       }
 
@@ -1268,6 +1338,7 @@ async function handleWebhookPayload(rawBody) {
         text,
         source: extractMessageSource(message),
         live: true,
+        businessAccountId,
       });
     }
   } catch (error) {
@@ -1276,8 +1347,31 @@ async function handleWebhookPayload(rawBody) {
   }
 }
 
+async function recentConversationContext(customerId, businessAccountId, limit = 10) {
+  const messages = await store.listOutbox(businessAccountId);
+  return messages
+    .filter((message) =>
+      message.channel === "customer" &&
+      String(message.businessAccountId || config.accountId) === String(businessAccountId || config.accountId) &&
+      (message.from === customerId || message.to === customerId)
+    )
+    .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
+    .slice(-limit)
+    .map((message) => ({
+      role: message.direction === "inbound" ? "customer" : "agent",
+      text: message.body || message.caption || "",
+      type: message.type || "text",
+      at: message.createdAt || "",
+    }))
+    .filter((message) => String(message.text || "").trim());
+}
+
 async function processInboundMessage({ id, from, text, source = {}, live = false, businessAccountId = config.accountId }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
+  const content = await getTeamContent(businessAccountId);
+  const teamCatalog = content.catalog;
+  const teamFaqLibrary = content.faqLibrary;
+  const teamSalesReplyLibrary = content.salesReplyLibrary;
   await store.appendOutbox({
     direction: "inbound",
     from,
@@ -1295,9 +1389,10 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     businessAccountId,
     source,
   });
+  const conversationContext = await recentConversationContext(from, businessAccountId);
 
   if (live) {
-    const blocked = await liveAutomationBlock();
+    const blocked = await liveAutomationBlock(businessAccountId);
     if (blocked) {
       const updatedCustomer = await store.updateCustomer(from, () => ({
         handoffStatus: "human_required",
@@ -1320,7 +1415,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
 
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
   const optOutIntent = detectOptOutIntent(text);
-  const textMatchedProduct = findProduct(catalog, text, {}, "");
+  const textMatchedProduct = findProduct(teamCatalog, text, {}, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
   if (isProductNameOnlyOpening) {
     const messageSource = {
@@ -1329,16 +1424,17 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
       productNameMatch: true,
     };
     const plan = await buildConversationPlan({
-      catalog,
+      catalog: teamCatalog,
       customer,
       customerMessage: text,
       source: messageSource,
-      faqLibrary,
-      salesReplyLibrary,
+      faqLibrary: teamFaqLibrary,
+      salesReplyLibrary: teamSalesReplyLibrary,
       productFactMatch: null,
       approvedFaqMatch: null,
       salesReplyMatch: null,
       ragAnswer: null,
+      conversationContext,
     });
     console.log(`Skipping OpenAI for product-name opening flow to ${from}`);
     const updatedCustomer = await store.updateCustomer(from, () => ({
@@ -1435,7 +1531,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     ? null
     : obviousComplaint || await maybeDetectComplaintIntent(text);
   if (complaintIntent) {
-    const product = findProduct(catalog, text, source, customer.productId);
+    const product = findProduct(teamCatalog, text, source, customer.productId);
     const complaint = await store.addComplaintCase({
       businessAccountId,
       customerId: from,
@@ -1512,26 +1608,33 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     };
   }
 
-  const product = findProduct(catalog, text, source, customer.productId);
+  const product = findProduct(teamCatalog, text, source, customer.productId);
   const productNameOpening = isProductNameMessage(product, text);
   const messageSource = productNameOpening ? { ...source, productNameMatch: true } : source;
   const fixedOpeningFlow = usesFixedOpeningFlow(customer, text, messageSource);
   const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse
     ? null
-    : findApprovedFaqLocalMatch(catalog, product, text, { faqLibrary });
+    : findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext });
   const exactSalesReply = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq
     ? null
-    : findSalesReplyExactMatch(catalog, product, text, { salesReplyLibrary });
+    : findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary });
   const approvedFaqMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
     ? null
-    : await maybeSelectApprovedFaq({ customerMessage: text, product });
+    : await maybeSelectApprovedFaq({ customerMessage: text, product, catalog: teamCatalog, faqLibrary: teamFaqLibrary, businessAccountId });
   const productFactMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || approvedFaqMatch
     ? null
-    : await maybeSelectProductFact({ customerMessage: text, product });
+    : await maybeSelectProductFact({ customerMessage: text, product, businessAccountId });
   const salesReplyMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch || approvedFaqMatch
     ? null
-    : await maybeSelectSalesReply({ customerMessage: text, product });
-  const ragAnswer = null;
+    : await maybeSelectSalesReply({ customerMessage: text, product, catalog: teamCatalog, salesReplyLibrary: teamSalesReplyLibrary, businessAccountId });
+  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch || approvedFaqMatch || salesReplyMatch
+    ? null
+    : await maybeCreateRagAnswer({
+        customerMessage: text,
+        customerId: from,
+        product,
+        businessAccountId,
+      });
   if (fixedOpeningFlow) {
     console.log(`Skipping OpenAI for fixed opening flow to ${from}`);
   }
@@ -1539,16 +1642,17 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     console.log(`Skipping OpenAI for Package B interest response from ${from}: ${faqSalesResponse}`);
   }
   const plan = await buildConversationPlan({
-    catalog,
+    catalog: teamCatalog,
     customer,
     customerMessage: text,
     source: messageSource,
-    faqLibrary,
-    salesReplyLibrary,
+    faqLibrary: teamFaqLibrary,
+    salesReplyLibrary: teamSalesReplyLibrary,
     productFactMatch,
     approvedFaqMatch,
     salesReplyMatch,
     ragAnswer,
+    conversationContext,
   });
 
   const updatedCustomer = await store.updateCustomer(from, () => plan.customerPatch || {}, businessAccountId);
@@ -1605,7 +1709,7 @@ async function maybeDetectComplaintIntent(customerMessage) {
   }
 }
 
-async function maybeSelectProductFact({ customerMessage, product }) {
+async function maybeSelectProductFact({ customerMessage, product, businessAccountId = config.accountId }) {
   if (!config.openaiApiKey) return null;
   if (isBusinessOrLogisticsQuestion(customerMessage)) return null;
   if (isUsageDurationQuestion(customerMessage)) return null;
@@ -1695,11 +1799,11 @@ function isProductOriginQuestion(text) {
   return /\b(from\s*where|where\s*(is|are|this|the)?.*(product|barang)|product\s*(from|made)|made\s*in|asal\s*(mana|dari)|dari\s*mana|barang\s*mana|produk\s*(dari|asal))\b/i.test(normalized);
 }
 
-async function maybeSelectApprovedFaq({ customerMessage, product }) {
+async function maybeSelectApprovedFaq({ customerMessage, product, catalog: activeCatalog = catalog, faqLibrary: activeFaqLibrary = faqLibrary, businessAccountId = config.accountId }) {
   if (!config.openaiApiKey) return null;
-  const faqRecords = approvedFaqRecordsForProduct(catalog, product, {
+  const faqRecords = approvedFaqRecordsForProduct(activeCatalog, product, {
     includeGeneral: isGeneralBusinessQuestion(customerMessage),
-    faqLibrary,
+    faqLibrary: activeFaqLibrary,
   });
   if (!faqRecords.length) return null;
   try {
@@ -1735,9 +1839,9 @@ async function maybeSelectApprovedFaq({ customerMessage, product }) {
   }
 }
 
-async function maybeSelectSalesReply({ customerMessage, product }) {
+async function maybeSelectSalesReply({ customerMessage, product, catalog: activeCatalog = catalog, salesReplyLibrary: activeSalesReplyLibrary = salesReplyLibrary, businessAccountId = config.accountId }) {
   if (!config.openaiApiKey) return null;
-  const records = salesReplyRecordsForProduct(catalog, product, { salesReplyLibrary });
+  const records = salesReplyRecordsForProduct(activeCatalog, product, { salesReplyLibrary: activeSalesReplyLibrary });
   if (!records.length) return null;
   try {
     const retrievedRecords = await retrieveSalesReplyRecords({
@@ -1773,6 +1877,30 @@ async function maybeSelectSalesReply({ customerMessage, product }) {
   }
 }
 
+async function maybeCreateRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
+  if (!config.openaiApiKey) return null;
+  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
+  if (!vectorStoreId) return null;
+  try {
+    const answer = await createCustomerServiceResponse({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      vectorStoreId,
+      businessName: config.businessName,
+      supportLanguage: config.supportLanguage,
+      customerId,
+      customerMessage,
+      productName: product?.name || "",
+      productId: product?.id || "",
+    });
+    if (!answer?.reply) return null;
+    return answer;
+  } catch (error) {
+    await recordSystemError("rag_answer", error, `Product: ${product?.id || ""}`, businessAccountId);
+    return null;
+  }
+}
+
 async function embedKnowledgeTexts(texts) {
   return createEmbeddings({
     apiKey: config.openaiApiKey,
@@ -1802,6 +1930,55 @@ function templateMessage(name, languageCode = FOLLOWUP_TEMPLATE_LANGUAGE, compon
   };
 }
 
+function randomFollowupDelayMs() {
+  const min = Math.max(0, Number(config.followupSendDelayMinMs) || 0);
+  const max = Math.max(min, Number(config.followupSendDelayMaxMs) || min);
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function followupPauseUntil(now = new Date()) {
+  const activeMs = Math.max(1, Number(config.followupActiveWindowMinutes) || 10) * 60 * 1000;
+  const pauseMs = Math.max(0, Number(config.followupPauseWindowMinutes) || 0) * 60 * 1000;
+  if (!pauseMs) return null;
+
+  const cycleMs = activeMs + pauseMs;
+  const elapsedMs = Math.max(0, now.getTime() - followupPacingStartedAt.getTime());
+  const cyclePositionMs = elapsedMs % cycleMs;
+  if (cyclePositionMs < activeMs) return null;
+
+  return new Date(now.getTime() + (cycleMs - cyclePositionMs));
+}
+
+function rotateFollowupBatch(batch = []) {
+  const groups = new Map();
+  for (const item of shuffleItems(batch)) {
+    const key = item.followupKey || "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+
+  const rotated = [];
+  const keys = shuffleItems([...groups.keys()]);
+  while (keys.length) {
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index];
+      const next = groups.get(key)?.shift();
+      if (next) rotated.push(next);
+      if (!groups.get(key)?.length) keys.splice(index, 1);
+    }
+  }
+  return rotated;
+}
+
+function shuffleItems(items = []) {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
 function requestFollowupRun(now = new Date(), options = {}) {
   if (followupRunPromise) return followupRunPromise;
   followupRunPromise = runDueFollowups(now, options).finally(() => {
@@ -1811,38 +1988,41 @@ function requestFollowupRun(now = new Date(), options = {}) {
 }
 
 async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
-  if (respectOperationalControl) {
-    const blocked = await liveAutomationBlock();
-    if (blocked) {
-      return {
-        sent: 0,
-        queued: 0,
-        heldForApprovedTemplate: 0,
-        deleted: 0,
-        skipped: await buildFollowupSkippedSummary(now),
-        checkedAt: now.toISOString(),
-        deletedCustomers: [],
-        customers: [],
-        templateRequired: [],
-        templateRequiredCustomers: [],
-        blockedReason: blocked.message,
-      };
-    }
+  const pauseUntil = followupPauseUntil(now);
+  if (pauseUntil) {
+    return {
+      sent: 0,
+      queued: 0,
+      heldForApprovedTemplate: 0,
+      deleted: 0,
+      skipped: await buildFollowupSkippedSummary(now),
+      checkedAt: now.toISOString(),
+      deletedCustomers: [],
+      customers: [],
+      templateRequired: [],
+      templateRequiredCustomers: [],
+      pausedUntil: pauseUntil.toISOString(),
+      blockedReason: "Follow-up pacing cooldown is active.",
+    };
   }
   const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
-  const due = await store.getDueFollowups(catalog, now);
+  const due = await getDueFollowupsForTeams(now);
+  const operationalDue = respectOperationalControl
+    ? await filterOperationalFollowups(due)
+    : due;
   const sendable = due.filter((item) =>
     config.demoMode ||
     isWithinCustomerServiceWindow(item.customer, now) ||
     Boolean(followupTemplateName(item.followupKey))
   );
-  const templateRequired = due.filter((item) =>
+  const operationalSendable = sendable.filter((item) => operationalDue.includes(item));
+  const templateRequired = operationalDue.filter((item) =>
     !config.demoMode &&
     !isWithinCustomerServiceWindow(item.customer, now) &&
     !followupTemplateName(item.followupKey)
   );
   const queued = await operations.enqueueFollowups(
-    sendable.map((item) => ({
+    operationalSendable.map((item) => ({
       businessAccountId: item.customer.businessAccountId || config.accountId,
       customerId: item.customer.id,
       productId: item.product.id,
@@ -1888,14 +2068,57 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
   };
 }
 
-async function dispatchFollowupQueue(now = new Date()) {
-  const batch = await operations.claimFollowupBatch(Math.max(config.followupSendsPerMinute, 1), now);
+async function getDueFollowupsForTeams(now = new Date()) {
   const customers = await store.listCustomers(now);
-  const customerById = new Map(customers.map((customer) => [customer.id, customer]));
+  const contentByAccount = new Map();
+  const due = [];
+  for (const customer of customers) {
+    if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) continue;
+    const accountId = customer.businessAccountId || config.accountId;
+    if (!contentByAccount.has(accountId)) {
+      contentByAccount.set(accountId, await getTeamContent(accountId));
+    }
+    const teamCatalog = contentByAccount.get(accountId).catalog;
+    const product = teamCatalog.products.find((item) => item.id === customer.productId);
+    if (!product) continue;
+    for (const item of productFollowupSequence(product)) {
+      if (customer.followupsSent?.[item.key]) continue;
+      if (now >= followupDueAt(customer.firstSeenAt, item)) {
+        due.push({ customer, product, followup: item.followup, followupKey: item.key });
+      }
+      break;
+    }
+  }
+  return due;
+}
+
+async function filterOperationalFollowups(due = []) {
+  const allowed = [];
+  const blockByAccount = new Map();
+  for (const item of due) {
+    const accountId = item.customer.businessAccountId || config.accountId;
+    if (!blockByAccount.has(accountId)) {
+      blockByAccount.set(accountId, await liveAutomationBlock(accountId));
+    }
+    if (!blockByAccount.get(accountId)) allowed.push(item);
+  }
+  return allowed;
+}
+
+async function dispatchFollowupQueue(now = new Date()) {
+  const pauseUntil = followupPauseUntil(now);
+  if (pauseUntil) return { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], pausedUntil: pauseUntil.toISOString() };
+
+  const batch = rotateFollowupBatch(
+    await operations.claimFollowupBatch(Math.max(config.followupSendsPerMinute, 1), now)
+  );
+  const customers = await store.listCustomers(now);
+  const customerById = new Map(customers.map((customer) => [customerKey(customer.businessAccountId || config.accountId, customer.id), customer]));
   const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [] };
 
   for (const item of batch) {
-    const customer = customerById.get(item.customerId);
+    const itemAccountId = item.businessAccountId || config.accountId;
+    const customer = customerById.get(customerKey(itemAccountId, item.customerId));
     const sentItem = {
       customerId: item.customerId,
       labelDisplay: customer?.labelDisplay || item.labelDisplay,
@@ -1930,17 +2153,18 @@ async function dispatchFollowupQueue(now = new Date()) {
       }
     }
     try {
+      await wait(randomFollowupDelayMs());
       const outboundMessage = templateName
         ? templateMessage(templateName, FOLLOWUP_TEMPLATE_LANGUAGE)
         : textMessage(item.message);
       await sendOutbound(item.customerId, [outboundMessage], {
-        businessAccountId: item.businessAccountId || config.accountId,
+        businessAccountId: itemAccountId,
         purpose: "followup",
         followupKey: item.followupKey,
         templateName,
         skipFailureRecord: true,
       });
-      await store.markFollowupSent(item.customerId, item.followupKey, now, item.businessAccountId || config.accountId);
+      await store.markFollowupSent(item.customerId, item.followupKey, now, itemAccountId);
       await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
       result.sent.push(sentItem);
     } catch (error) {
@@ -1956,6 +2180,10 @@ async function dispatchFollowupQueue(now = new Date()) {
   return result;
 }
 
+function customerKey(businessAccountId, customerId) {
+  return `${businessAccountId || ""}::${customerId || ""}`;
+}
+
 async function buildFollowupSkippedSummary(now = new Date()) {
   const customers = await store.listCustomers(now);
   const rows = customers.map((customer) => followupGuardrailStatus(customer, now));
@@ -1967,7 +2195,8 @@ async function buildFollowupSkippedSummary(now = new Date()) {
 }
 
 async function handleStockArrival(productId, businessAccountId = config.accountId) {
-  const product = catalog.products.find((item) => item.id === productId);
+  const content = await getTeamContent(businessAccountId);
+  const product = content.catalog.products.find((item) => item.id === productId);
   if (!product) throw new Error(`Unknown product: ${productId}`);
   const orders = await store.updateOrdersForStockArrival(productId, businessAccountId, `admin:${businessAccountId}`);
   const customerIds = [...new Set(orders.map((order) => order.customerId))];
@@ -2460,6 +2689,8 @@ async function appendSimMessage(message) {
 }
 
 async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId) {
+  const content = await getTeamContent(businessAccountId);
+  const teamCatalog = content.catalog;
   const [
     allCustomers,
     allDeletedCustomers,
@@ -2472,13 +2703,13 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allComplaintCases,
     complaintSettings,
   ] = await Promise.all([
-    store.listCustomers(now),
-    store.listDeletedCustomers(),
-    store.listOrders(),
-    store.listOutbox(),
-    operations.listNoReplyReviews(),
+    store.listCustomers(now, businessAccountId),
+    store.listDeletedCustomers(businessAccountId),
+    store.listOrders(businessAccountId),
+    store.listOutbox(businessAccountId),
+    operations.listNoReplyReviews(businessAccountId),
     operations.getState(),
-    operations.listFollowupQueue(),
+    operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
     store.getComplaintSettings(businessAccountId),
@@ -2503,8 +2734,14 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       ? message.businessAccountId === businessAccountId && message.businessAccountId !== DEMO_ACCOUNT_ID
       : customerIds.has(message.to) || customerIds.has(message.from))
   );
-  const productById = new Map(catalog.products.map((product) => [product.id, product]));
+  const productById = new Map(teamCatalog.products.map((product) => [product.id, product]));
   const ordersByCustomer = groupBy(orders, (order) => order.customerId);
+  const customerById = new Map(customers.map((customer) => [customer.id, customer]));
+  const latestOrderForCustomer = (customerId) => (ordersByCustomer.get(customerId) || []).at(-1) || null;
+  const handoffPhone = (customerId, order = null) => {
+    const latestOrder = order || latestOrderForCustomer(customerId);
+    return latestOrder?.phone || customerById.get(customerId)?.phone || customerId;
+  };
   const guardrails = buildGuardrailSummary(customers, now);
   const noReplyAlerts = buildNoReplyRows(
     customers,
@@ -2546,6 +2783,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
         type: "complaint",
         caseId: complaint.id,
         customerId: complaint.customerId,
+        phone: handoffPhone(complaint.customerId),
         product: productById.get(complaint.productId)?.name || complaint.productId || "",
         category: complaintCategoryDisplay(complaint.category),
         customerMessage: complaint.customerMessage,
@@ -2554,22 +2792,20 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
         createdAt: complaint.createdAt,
       })),
     ...customers
-      .filter((customer) => customer.handoffStatus === "human_required" && customer.complaintStatus !== "open")
+      .filter((customer) =>
+        customer.handoffStatus === "human_required" &&
+        customer.complaintStatus !== "open" &&
+        customer.handoffReason !== "Customer submitted complete order details." &&
+        !(customer.orderIds || []).length
+      )
       .map((customer) => ({
         type: "conversation",
         customerId: customer.id,
+        phone: handoffPhone(customer.id),
         product: productById.get(customer.productId)?.name || customer.productId || "",
         reason: customer.handoffReason || "Human review needed",
         createdAt: customer.lastMessageAt || customer.firstSeenAt || "",
       })),
-    ...orders.filter((order) => order.status === "pending_admin_order").map((order) => ({
-      type: "order",
-      customerId: order.customerId,
-      product: order.productName || productById.get(order.productId)?.name || order.productId || "",
-      reason: "Awaiting order processing",
-      createdAt: order.createdAt || "",
-      orderId: order.id,
-    })),
   ].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 
   return {
@@ -2587,7 +2823,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       blockedFollowups: guardrails.blockedFollowups,
       noReplyAlerts: noReplyAlerts.length,
     },
-    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate }),
+    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
     profile: normalizeDashboardProfile(systemState.dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
@@ -2737,7 +2973,7 @@ async function buildComplianceData() {
       { item: "Follow-up cap", status: guardrails.followupCap },
       { item: "24-hour window", status: guardrails.windowRule },
       { item: "Template-required follow-ups", status: `${guardrails.outside24HourWindow} customer(s) currently outside 24h window` },
-      { item: "Follow-up dispatch throttling", status: `queued and sent at up to ${Math.max(config.followupSendsPerMinute, 1)} message(s) per minute` },
+      { item: "Follow-up dispatch throttling", status: `queued, rotated by stage, delayed ${Math.round(config.followupSendDelayMinMs / 1000)}-${Math.round(config.followupSendDelayMaxMs / 1000)}s each, up to ${Math.max(config.followupSendsPerMinute, 1)} message(s) per minute for ${Math.max(config.followupActiveWindowMinutes, 1)} minutes, then ${Math.max(config.followupPauseWindowMinutes, 0)} minutes pause` },
       { item: "Human handoff", status: `${guardrails.humanRequired} customer(s) require human review; complaint cases pause follow-ups until resolved` },
       { item: "Order status lookup", status: "answers only from the current business account and customer WhatsApp ID" },
       { item: "Block/report risk monitor", status: "production step: connect Meta quality rating, blocks, and reports once WhatsApp API is live" },
@@ -2794,10 +3030,13 @@ function formatDashboardMessage(message) {
 function conversationStatus(customer, customerOrders) {
   if (customer.optedOut) return "opted out";
   if (customer.complaintStatus === "open") return "complaint - human required";
+  if (customerOrders.length > 0 && customer.handoffReason === "Customer submitted complete order details.") {
+    return orderStatusDisplay(customerOrders.at(-1).status);
+  }
   if (customer.handoffStatus === "human_required") return "human required";
   if (customerOrders.length > 0) return orderStatusDisplay(customerOrders.at(-1).status);
-  if (Number(customer.inboundCount || 0) <= 1) return "waiting reply";
-  return "active";
+  if (Number(customer.inboundCount || 0) <= 1) return "new lead";
+  return "engaged";
 }
 
 function buildGuardrailSummary(customers, now = new Date()) {
@@ -2895,7 +3134,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
   });
 }
 
-function buildAnalytics({ customers, orders, productById, now }) {
+function buildAnalytics({ customers, orders, productById, now, catalog: activeCatalog = catalog }) {
   const selectedDateCustomers = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, now));
   const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
   const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
@@ -2913,7 +3152,7 @@ function buildAnalytics({ customers, orders, productById, now }) {
     orderProductCounts.set(productName, (orderProductCounts.get(productName) || 0) + 1);
   }
   const totalSales = selectedDateOrders.reduce((sum, order) => sum + orderSalesAmount(order), 0);
-  const followupPerformance = buildFollowupPerformance(customers, now);
+  const followupPerformance = buildFollowupPerformance(customers, now, activeCatalog);
   const hourlyCustomerCounts = Array.from({ length: 24 }, (_, hour) => ({
     hour,
     label: `${String(hour).padStart(2, "0")}:00`,
@@ -2957,8 +3196,8 @@ function buildAnalytics({ customers, orders, productById, now }) {
   };
 }
 
-function buildFollowupPerformance(customers, now) {
-  const product = catalog.products.find((item) => item.id === catalog.default_product_id) || catalog.products[0];
+function buildFollowupPerformance(customers, now, activeCatalog = catalog) {
+  const product = activeCatalog.products.find((item) => item.id === activeCatalog.default_product_id) || activeCatalog.products[0];
   return productFollowupSequence(product).map((stage) => {
     const sentCustomers = customers.filter((customer) => {
       const sentAt = customer.followupsSent?.[stage.key];
@@ -3276,7 +3515,7 @@ async function sendOutboundSequence(to, messages, meta = {}) {
         console.log(`Demo outbound to ${to}: ${message.type} ${message.body || message.caption || message.url || message.name}`);
         continue;
       }
-      const messageId = await sendWhatsAppMessage(to, message);
+      const messageId = await sendWhatsAppMessage(to, message, meta);
       if (messageId) {
         await store.appendOutbox({
           direction: "outbound",
@@ -3310,10 +3549,11 @@ async function sendOutboundSequence(to, messages, meta = {}) {
   }
 }
 
-async function sendWhatsAppMessage(to, message) {
+async function sendWhatsAppMessage(to, message, meta = {}) {
   if (config.transportMode === "web") {
-    if (!webTransport) throw new Error("WhatsApp Web transport is not initialized.");
-    const messageId = await webTransport.send(to, messageForWebTransport(message));
+    if (!webTransportManager) throw new Error("WhatsApp Web transport is not initialized.");
+    const accountId = meta.businessAccountId || config.accountId;
+    const messageId = await webTransportManager.send(accountId, to, messageForWebTransport(message));
     console.log(`Sent WhatsApp Web ${message.type} to ${to}`);
     return messageId || `web_${Date.now()}`;
   }
@@ -3348,12 +3588,21 @@ async function sendWhatsAppMessage(to, message) {
           text: { preview_url: false, body: message.body },
         };
 
+  const teamSettings = meta.businessAccountId
+    ? await adminAccounts.getTeamSettings(meta.businessAccountId)
+    : {};
+  const phoneNumberId = teamSettings.whatsappPhoneNumberId || config.phoneNumberId;
+  const accessToken = teamSettings.whatsappAccessToken || config.accessToken;
+  if (!phoneNumberId || !accessToken) {
+    throw new Error(`Missing WhatsApp Cloud API credentials for account ${meta.businessAccountId || config.accountId}.`);
+  }
+
   const response = await fetch(
-    `https://graph.facebook.com/${config.graphVersion}/${config.phoneNumberId}/messages`,
+    `https://graph.facebook.com/${config.graphVersion}/${phoneNumberId}/messages`,
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${config.accessToken}`,
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
@@ -3451,7 +3700,11 @@ function extractInboundMessages(payload) {
     for (const change of entry.changes || []) {
       const value = change.value || {};
       for (const message of value.messages || []) {
-        messages.push(message);
+        messages.push({
+          ...message,
+          phoneNumberId: value.metadata?.phone_number_id || "",
+          displayPhoneNumber: value.metadata?.display_phone_number || "",
+        });
       }
     }
   }
@@ -3537,7 +3790,7 @@ function cleanupProcessedMessages() {
 }
 
 function clampMessages(messages = []) {
-  return messages.map((message) => {
+  return messages.filter((message) => message.type !== "image" || String(message.url || "").trim()).map((message) => {
     if (message.type !== "text") return message;
     return { ...message, body: String(message.body || "").slice(0, config.maxReplyChars) };
   });
@@ -3591,8 +3844,8 @@ function sendHtml(res, statusCode, body) {
   res.end(body);
 }
 
-async function sendQrSvg(res) {
-  const qr = webTransport?.getStatus().qr || "";
+async function sendQrSvg(res, accountId) {
+  const qr = webTransportManager?.getStatus(accountId).qr || "";
   if (!qr) return sendText(res, 404, "QR not available");
   try {
     const QRCode = await import("qrcode");
@@ -3612,7 +3865,7 @@ async function sendQrSvg(res) {
   }
 }
 
-function whatsappWebQrOnlyHtml() {
+function whatsappWebQrOnlyHtml(accountId = "") {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -3631,6 +3884,7 @@ function whatsappWebQrOnlyHtml() {
 <body>
   <main>
     <h1>Scan This QR</h1>
+    <p><strong>Account:</strong> ${escapeHtml(accountId)}</p>
     <p>Use the main WhatsApp Business phone: Settings &gt; Linked Devices &gt; Link a Device.</p>
     <img id="qr" src="/admin/whatsapp-web/qr.svg?t=${Date.now()}" alt="WhatsApp Web QR code">
     <div>
@@ -3648,6 +3902,7 @@ function whatsappWebQrOnlyHtml() {
 </html>`;
 }
 
+export { config, requestFollowupRun };
 function publicPrivacyHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -3782,6 +4037,7 @@ function whatsappWebStatusHtml() {
   <main>
     <section class="card">
       <h2>Connection Status</h2>
+      <p id="account" class="muted"></p>
       <p>Status: <span id="status" class="status">Loading...</span></p>
       <p id="details" class="muted"></p>
       <img id="qr" alt="WhatsApp Web QR code">
@@ -3812,6 +4068,7 @@ function whatsappWebStatusHtml() {
       const data = await response.json();
       const status = document.querySelector("#status");
       const qr = document.querySelector("#qr");
+      document.querySelector("#account").textContent = data.accountId ? "Business account: " + data.accountId : "";
       status.textContent = data.status || "unknown";
       status.className = "status " + (data.status || "");
       document.querySelector("#details").textContent =
@@ -4037,8 +4294,8 @@ function usableSecretEnv(name) {
   return value;
 }
 
-async function liveAutomationBlock() {
-  const account = await adminAccounts.getAccount(config.accountId);
+async function liveAutomationBlock(businessAccountId = config.accountId) {
+  const account = await adminAccounts.getAccount(businessAccountId);
   if (account?.automationPaused) {
     return { code: "automation_paused", message: "AI automation paused by super admin." };
   }
@@ -4046,6 +4303,42 @@ async function liveAutomationBlock() {
     return { code: "test_mode", message: "Account is in test mode; live AI reply suppressed." };
   }
   return null;
+}
+
+async function businessAccountIdForPhoneNumber(phoneNumberId) {
+  const account = await adminAccounts.findBusinessAccountByPhoneNumberId(phoneNumberId);
+  return account?.id || config.accountId;
+}
+
+async function businessAdminAccounts() {
+  return (await adminAccounts.listAccounts()).filter((account) => (account.role || "business_admin") === "business_admin");
+}
+
+async function webTransportStatusForAccount(accountId) {
+  if (!webTransportManager) {
+    return {
+      transport: config.transportMode,
+      accountId,
+      status: config.transportMode === "web" ? "not_initialized" : "disabled",
+      qr: "",
+    };
+  }
+  await webTransportManager.startAccount(accountId);
+  return webTransportManager.getStatus(accountId);
+}
+
+async function webTransportHealthData() {
+  if (!webTransportManager) return null;
+  const accounts = await businessAdminAccounts();
+  return {
+    transport: "web",
+    accounts: webTransportManager.listStatuses(accounts.map((account) => account.id)),
+  };
+}
+
+async function vectorStoreIdForAccount(businessAccountId = config.accountId) {
+  const settings = await adminAccounts.getTeamSettings(businessAccountId);
+  return settings.openaiVectorStoreId || config.vectorStoreId;
 }
 
 async function recordSystemError(scope, error, details = "", accountId = config.accountId) {
@@ -4122,10 +4415,20 @@ async function buildSystemBackup() {
   };
 }
 
-function faqLibraryData() {
+async function getTeamContent(accountId) {
+  return teamContentStore.getContent(accountId || config.accountId, defaultTeamContent);
+}
+
+async function saveTeamContent(accountId, content) {
+  return teamContentStore.saveContent(accountId || config.accountId, content);
+}
+
+function faqLibraryData(content = defaultTeamContent) {
+  const teamCatalog = content.catalog || catalog;
+  const teamFaqLibrary = content.faqLibrary || faqLibrary;
   return {
-    general: (faqLibrary.approved_faqs || []).map((faq) => ({ ...faq, scope: "general", productId: "" })),
-    products: catalog.products.map((product) => ({
+    general: (teamFaqLibrary.approved_faqs || []).map((faq) => ({ ...faq, scope: "general", productId: "" })),
+    products: teamCatalog.products.map((product) => ({
       id: product.id,
       name: product.name,
       faqs: (product.approved_faqs || []).map((faq) => ({ ...faq, scope: "product", productId: product.id })),
@@ -4139,19 +4442,19 @@ async function maybeLearnFromManualReply(customer, replyText, businessAccountId)
   const question = String(latestInbound?.body || "").trim();
   if (!question || !replyText) return null;
   if (shouldSkipLearningQuestion(question)) return null;
+  const content = await getTeamContent(businessAccountId);
 
   const scope = isGeneralBusinessQuestion(question) ? "general" : "product";
   const productId = scope === "product" ? String(customer.productId || "").trim() : "";
-  if (scope === "product" && !findCatalogProduct(productId)) return null;
+  if (scope === "product" && !findCatalogProduct(productId, content.catalog)) return null;
 
   const learnedFaq = upsertLearnedFaq({
     scope,
     productId,
     question,
     replyText,
-  });
-  if (learnedFaq.scope === "general") await persistFaqLibrary();
-  else await persistCatalog();
+  }, content);
+  await saveTeamContent(businessAccountId, content);
   await store.appendAuditLog({
     actor: `system:${businessAccountId}`,
     action: "manual_reply_learned_faq",
@@ -4173,9 +4476,9 @@ async function latestInboundMessageForCustomer(customerId, businessAccountId) {
     .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")))[0] || null;
 }
 
-function upsertLearnedFaq({ scope, productId, question, replyText }) {
-  const product = scope === "product" ? findCatalogProduct(productId) : null;
-  const records = scope === "general" ? (faqLibrary.approved_faqs ||= []) : (product.approved_faqs ||= []);
+function upsertLearnedFaq({ scope, productId, question, replyText }, content = defaultTeamContent) {
+  const product = scope === "product" ? findCatalogProduct(productId, content.catalog || catalog) : null;
+  const records = scope === "general" ? ((content.faqLibrary || faqLibrary).approved_faqs ||= []) : (product.approved_faqs ||= []);
   const normalizedQuestion = normalizeLearnedText(question);
   const existing = records.find((faq) =>
     (faq.example_questions || []).some((example) => normalizeLearnedText(example) === normalizedQuestion)
@@ -4196,7 +4499,7 @@ function upsertLearnedFaq({ scope, productId, question, replyText }) {
     exampleQuestions: [question],
     approvedReply: replyText,
     active: true,
-  });
+  }, content);
 }
 
 function shouldSkipLearningQuestion(question) {
@@ -4211,10 +4514,12 @@ function normalizeLearnedText(value) {
     .trim();
 }
 
-function saveApprovedFaq(body) {
+function saveApprovedFaq(body, content = defaultTeamContent) {
+  const teamCatalog = content.catalog || catalog;
+  const teamFaqLibrary = content.faqLibrary || faqLibrary;
   const scope = body.scope === "product" ? "product" : "general";
   const productId = scope === "product" ? String(body.productId || "").trim() : "";
-  const product = scope === "product" ? findCatalogProduct(productId) : null;
+  const product = scope === "product" ? findCatalogProduct(productId, teamCatalog) : null;
   if (scope === "product" && !product) throw new Error("Select a product for product FAQ.");
   const topic = String(body.topic || "").trim();
   const approvedReply = String(body.approvedReply || "").trim();
@@ -4225,7 +4530,7 @@ function saveApprovedFaq(body) {
   if (!approvedReply) throw new Error("Approved reply is required.");
   if (!exampleQuestions.length) throw new Error("Add at least one example customer question.");
   const records = scope === "general"
-    ? (faqLibrary.approved_faqs ||= [])
+    ? (teamFaqLibrary.approved_faqs ||= [])
     : (product.approved_faqs ||= []);
   const existingId = String(body.id || "").trim();
   const prefix = scope === "general" ? "general" : safeAssetSegment(product.id);
@@ -4234,8 +4539,8 @@ function saveApprovedFaq(body) {
   if (!existingId) {
     let suffix = 2;
     const allIds = new Set([
-      ...(faqLibrary.approved_faqs || []).map((faq) => faq.id),
-      ...catalog.products.flatMap((entry) => (entry.approved_faqs || []).map((faq) => faq.id)),
+      ...(teamFaqLibrary.approved_faqs || []).map((faq) => faq.id),
+      ...teamCatalog.products.flatMap((entry) => (entry.approved_faqs || []).map((faq) => faq.id)),
     ]);
     while (allIds.has(id)) {
       id = `${proposedId}_${suffix}`;
@@ -4255,15 +4560,17 @@ function saveApprovedFaq(body) {
   return { ...saved, scope, productId };
 }
 
-function deleteApprovedFaq(body) {
+function deleteApprovedFaq(body, content = defaultTeamContent) {
+  const teamFaqLibrary = content.faqLibrary || faqLibrary;
+  const teamCatalog = content.catalog || catalog;
   const scope = body.scope === "product" ? "product" : "general";
   const productId = scope === "product" ? String(body.productId || "").trim() : "";
-  const product = scope === "product" ? findCatalogProduct(productId) : null;
+  const product = scope === "product" ? findCatalogProduct(productId, teamCatalog) : null;
   if (scope === "product" && !product) throw new Error("Select a product for product FAQ.");
   const id = String(body.id || "").trim();
   if (!id) throw new Error("FAQ id is required.");
   const records = scope === "general"
-    ? (faqLibrary.approved_faqs ||= [])
+    ? (teamFaqLibrary.approved_faqs ||= [])
     : (product.approved_faqs ||= []);
   const index = records.findIndex((faq) => faq.id === id);
   if (index < 0) throw new Error("FAQ not found.");
@@ -4271,16 +4578,18 @@ function deleteApprovedFaq(body) {
   return { ...deleted, scope, productId };
 }
 
-function salesRepliesData() {
+function salesRepliesData(content = defaultTeamContent) {
+  const teamSalesReplyLibrary = content.salesReplyLibrary || salesReplyLibrary;
   return {
-    general: (salesReplyLibrary.sales_replies || [])
+    general: (teamSalesReplyLibrary.sales_replies || [])
       .filter((reply) => (reply.scope || "business") !== "product")
       .map((reply) => ({ ...reply, scope: "general", productId: "" })),
     products: [],
   };
 }
 
-function saveSalesReply(body) {
+function saveSalesReply(body, content = defaultTeamContent) {
+  const teamSalesReplyLibrary = content.salesReplyLibrary || salesReplyLibrary;
   if (body.scope === "product") throw new Error("Sales replies are general only. Product-specific answers belong in Product FAQ.");
   const scope = "general";
   const productId = "";
@@ -4295,7 +4604,7 @@ function saveSalesReply(body) {
   if (!intent) throw new Error("Intent description is required.");
   if (!approvedReply) throw new Error("Approved reply is required.");
   if (!exampleMessages.length) throw new Error("Add at least one example customer message.");
-  const records = (salesReplyLibrary.sales_replies ||= []);
+  const records = (teamSalesReplyLibrary.sales_replies ||= []);
   const existingId = String(body.id || "").trim();
   const storageScope = "business";
   const prefix = "sales";
@@ -4303,8 +4612,8 @@ function saveSalesReply(body) {
   let id = existingId || proposedId;
   if (!existingId) {
     let suffix = 2;
-    const allIds = new Set([
-      ...(salesReplyLibrary.sales_replies || []).map((reply) => reply.id),
+      const allIds = new Set([
+      ...(teamSalesReplyLibrary.sales_replies || []).map((reply) => reply.id),
     ]);
     while (allIds.has(id)) {
       id = `${proposedId}_${suffix}`;
@@ -4328,13 +4637,14 @@ function saveSalesReply(body) {
   return { ...saved, scope, productId };
 }
 
-function deleteSalesReply(body) {
+function deleteSalesReply(body, content = defaultTeamContent) {
+  const teamSalesReplyLibrary = content.salesReplyLibrary || salesReplyLibrary;
   if (body.scope === "product") throw new Error("Sales replies are general only. Product-specific answers belong in Product FAQ.");
   const scope = "general";
   const productId = "";
   const id = String(body.id || "").trim();
   if (!id) throw new Error("Sales reply id is required.");
-  const records = (salesReplyLibrary.sales_replies ||= []);
+  const records = (teamSalesReplyLibrary.sales_replies ||= []);
   const index = records.findIndex((reply) => reply.id === id);
   if (index < 0) throw new Error("Sales reply not found.");
   const [deleted] = records.splice(index, 1);
@@ -4390,8 +4700,8 @@ const REQUIRED_PRODUCT_FLOW_IMAGE_KEYS = new Set(PRODUCT_FLOW_IMAGE_SLOTS
   .filter((slot) => slot.key !== "salesPhoto")
   .map((slot) => slot.key));
 
-function findCatalogProduct(productId) {
-  return catalog.products.find((product) => product.id === String(productId || ""));
+function findCatalogProduct(productId, activeCatalog = catalog) {
+  return activeCatalog.products.find((product) => product.id === String(productId || ""));
 }
 
 function productFlowEditorData(product, options = {}) {
@@ -5381,6 +5691,12 @@ function superAdminSystemHtml() {
     section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
     h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding: 14px; }
+    .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; padding: 14px; max-width: 980px; }
+    .settings-grid label { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
+    .settings-grid input, .settings-grid select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; min-width: 0; }
+    .settings-help { grid-column: 1 / -1; color: var(--muted); font-size: 13px; line-height: 1.38; }
+    .settings-secret { display: block; color: var(--muted); font-size: 12px; font-weight: 600; }
+    #team-settings-state { color: var(--muted); font-size: 13px; }
     label { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
     input, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
     textarea { min-width: min(420px, 86vw); min-height: 42px; resize: vertical; }
@@ -5428,6 +5744,42 @@ function superAdminSystemHtml() {
       <div class="table-wrap" id="controls"></div>
     </section>
     <section>
+      <h2>Team Settings</h2>
+      <form id="team-settings-form" class="settings-grid">
+        <div class="settings-help">Super Admin setup for each business team. Leave credential fields blank to keep the existing saved value.</div>
+        <label for="team-account-id">Business Account
+          <select id="team-account-id" name="id"></select>
+        </label>
+        <label for="team-public-base-url">Public Base URL
+          <input id="team-public-base-url" name="publicBaseUrl" placeholder="https://agent.example.com" />
+        </label>
+        <label for="team-assets-base-url">Assets Base URL
+          <input id="team-assets-base-url" name="assetsBaseUrl" placeholder="https://cdn.example.com" />
+        </label>
+        <label for="team-phone-number-id">WhatsApp Phone Number ID
+          <input id="team-phone-number-id" name="whatsappPhoneNumberId" autocomplete="off" placeholder="Leave blank to keep current" />
+          <span class="settings-secret" id="team-phone-number-id-current"></span>
+        </label>
+        <label for="team-access-token">WhatsApp Access Token
+          <input id="team-access-token" name="whatsappAccessToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep current" />
+          <span class="settings-secret" id="team-access-token-current"></span>
+        </label>
+        <label for="team-vector-store-id">OpenAI Vector Store ID
+          <input id="team-vector-store-id" name="openaiVectorStoreId" placeholder="vs_..." />
+        </label>
+        <label for="team-followup-sends">Follow-Up Sends Per Minute
+          <input id="team-followup-sends" name="followupSendsPerMinute" type="number" min="1" max="100" />
+        </label>
+        <label for="team-followup-interval">Follow-Up Worker Interval Minutes
+          <input id="team-followup-interval" name="followupIntervalMinutes" type="number" min="1" max="1440" />
+        </label>
+        <div class="actions">
+          <button class="primary" type="submit">Save Team Settings</button>
+          <span id="team-settings-state"></span>
+        </div>
+      </form>
+    </section>
+    <section>
       <h2>Failed Message Queue</h2>
       <div class="table-wrap" id="failed"></div>
     </section>
@@ -5449,6 +5801,7 @@ function superAdminSystemHtml() {
   </main>
   <script>
     let data = null;
+    let selectedTeamSettingsAccount = "";
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
         return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
@@ -5477,6 +5830,62 @@ function superAdminSystemHtml() {
       if (message.status === "retried") return ["Retried", ""];
       if (message.status === "retry_failed") return ["Retry Failed", "fail"];
       return ["Pending Retry", "pending"];
+    }
+    function currentTeamSettingsAccount() {
+      const accounts = data ? data.accounts || [] : [];
+      return accounts.find(account => account.id === selectedTeamSettingsAccount) || accounts[0] || null;
+    }
+    function renderTeamSettings(force = false) {
+      const form = document.querySelector("#team-settings-form");
+      if (!force && form.contains(document.activeElement)) return;
+      const accounts = data ? data.accounts || [] : [];
+      const select = document.querySelector("#team-account-id");
+      if (!selectedTeamSettingsAccount && accounts[0]) selectedTeamSettingsAccount = accounts[0].id;
+      select.innerHTML = accounts.map(account =>
+        '<option value="' + esc(account.id) + '">' + esc(account.name || account.id) + ' (' + esc(account.id) + ')</option>'
+      ).join("");
+      select.value = selectedTeamSettingsAccount;
+      const account = currentTeamSettingsAccount();
+      const settings = account ? account.settings || {} : {};
+      document.querySelector("#team-public-base-url").value = settings.publicBaseUrl || "";
+      document.querySelector("#team-assets-base-url").value = settings.assetsBaseUrl || "";
+      document.querySelector("#team-phone-number-id").value = "";
+      document.querySelector("#team-access-token").value = "";
+      document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
+      document.querySelector("#team-followup-sends").value = settings.followupSendsPerMinute || "";
+      document.querySelector("#team-followup-interval").value = settings.followupIntervalMinutes || "";
+      document.querySelector("#team-phone-number-id-current").textContent =
+        settings.whatsappPhoneNumberId ? "Current: " + settings.whatsappPhoneNumberId : "No team-specific phone number ID saved.";
+      document.querySelector("#team-access-token-current").textContent =
+        settings.whatsappAccessToken ? "Current: " + settings.whatsappAccessToken : "No team-specific access token saved.";
+    }
+    async function saveTeamSettings(event) {
+      event.preventDefault();
+      const state = document.querySelector("#team-settings-state");
+      const settings = {
+        publicBaseUrl: document.querySelector("#team-public-base-url").value,
+        assetsBaseUrl: document.querySelector("#team-assets-base-url").value,
+        openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
+        followupSendsPerMinute: document.querySelector("#team-followup-sends").value,
+        followupIntervalMinutes: document.querySelector("#team-followup-interval").value
+      };
+      const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
+      const accessToken = document.querySelector("#team-access-token").value.trim();
+      if (phoneNumberId) settings.whatsappPhoneNumberId = phoneNumberId;
+      if (accessToken) settings.whatsappAccessToken = accessToken;
+      state.textContent = "Saving...";
+      try {
+        const result = await request("/superadmin/system/team-settings", {
+          id: document.querySelector("#team-account-id").value,
+          settings
+        });
+        data.accounts = (data.accounts || []).map(account => account.id === result.account.id ? result.account : account);
+        selectedTeamSettingsAccount = result.account.id;
+        renderTeamSettings(true);
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      }
     }
     function render() {
       const pending = data.failedMessages.filter(item => item.status !== "retried").length;
@@ -5516,6 +5925,7 @@ function superAdminSystemHtml() {
       document.querySelector("#history").innerHTML = audits.length ? '<table><thead><tr><th>Time</th><th>Actor</th><th>Change</th><th>Result</th></tr></thead><tbody>' +
         audits.slice(0, 50).map(item => '<tr><td>' + esc(fmt(item.createdAt)) + '</td><td>' + esc(item.actor) + '</td><td>' + esc(item.action) + '</td><td>' + esc(item.result || "") + '</td></tr>').join("") +
         '</tbody></table>' : '<div class="empty">No change history recorded.</div>';
+      renderTeamSettings();
 
       document.querySelectorAll("button[data-id][data-pause]").forEach(button => button.addEventListener("click", async () => {
         await request("/superadmin/system/account-control", {
@@ -5554,6 +5964,11 @@ function superAdminSystemHtml() {
         document.querySelector("#release-message").textContent = error.message;
       }
     });
+    document.querySelector("#team-account-id").addEventListener("change", event => {
+      selectedTeamSettingsAccount = event.target.value;
+      renderTeamSettings(true);
+    });
+    document.querySelector("#team-settings-form").addEventListener("submit", saveTeamSettings);
     document.querySelector("#refresh").addEventListener("click", load);
     load();
     setInterval(load, 15000);
@@ -6012,7 +6427,7 @@ function adminDashboardHtml() {
     </section>
     <section id="followups" class="panel">
       <h2>Follow-Up Monitor</h2>
-      <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are placed in a dispatch queue and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute. In live WhatsApp mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
+      <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are queued, rotated by stage, delayed ${escapeHtml(Math.round(config.followupSendDelayMinMs / 1000))}-${escapeHtml(Math.round(config.followupSendDelayMaxMs / 1000))} second(s) before each send, and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute for ${escapeHtml(Math.max(config.followupActiveWindowMinutes, 1))} minutes, then paused for ${escapeHtml(Math.max(config.followupPauseWindowMinutes, 0))} minutes. In live WhatsApp mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
       <div class="subtabs" id="followup-label-tabs"></div>
       <div class="table-wrap"></div>
     </section>
@@ -6132,7 +6547,7 @@ function adminDashboardHtml() {
       let cls = "pill";
       if (/human|required|delete|expired|due/i.test(text)) cls += " danger";
       else if (/waiting|scheduled|pending/i.test(text)) cls += " warn";
-      else if (/active|submitted|completed|sent/i.test(text)) cls += " ok";
+      else if (/active|engaged|submitted|completed|sent/i.test(text)) cls += " ok";
       return '<span class="' + cls + '">' + esc(text) + '</span>';
     }
 
@@ -6206,15 +6621,16 @@ function adminDashboardHtml() {
       sections.handoff.innerHTML = table(filtered, [
         { label: 'Type', key: 'type', render: r => pill(r.type) },
         { label: 'Customer', key: 'customerId' },
+        { label: 'Phone', key: 'phone' },
         { label: 'Product', key: 'product' },
         { label: 'Category', key: 'category' },
         { label: 'Customer Message', key: 'customerMessage' },
         { label: 'Reason', key: 'reason' },
         { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
-        { label: 'Action', key: 'caseId', render: r => r.type === 'complaint' ? '<div class="actions"><button type="button" data-complaint-reply="' + esc(r.customerId) + '">Reply</button><button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button></div>' : '' }
+        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-handoff-chat="' + esc(r.customerId) + '">Chat</button>' + (r.type === 'complaint' ? '<button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button>' : '') + '</div>' }
       ]);
-      document.querySelectorAll("button[data-complaint-reply]").forEach(button => button.addEventListener("click", () => {
-        window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.complaintReply);
+      document.querySelectorAll("button[data-handoff-chat]").forEach(button => button.addEventListener("click", () => {
+        window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.handoffChat);
       }));
       document.querySelectorAll("button[data-complaint-resolve]").forEach(button => button.addEventListener("click", async () => {
         await request("/admin/handoff/complaint/resolve", { caseId: button.dataset.complaintResolve });
@@ -6534,7 +6950,8 @@ function adminDashboardHtml() {
       button.addEventListener('click', () => openDashboardTab(button.dataset.tab));
     });
     setupDashboardDate();
-    if (new URLSearchParams(window.location.search).get("tab") === "profile") openDashboardTab("profile");
+    const requestedTab = new URLSearchParams(window.location.search).get("tab");
+    if (requestedTab && document.getElementById(requestedTab)) openDashboardTab(requestedTab);
     loadDashboard();
     setInterval(loadDashboard, 15000);
   </script>
@@ -9232,7 +9649,13 @@ function demoChatHtml() {
     const send = document.querySelector("#send");
     const productSelect = document.querySelector("#demo-product");
     const productButtons = document.querySelector("#demo-product-buttons");
-    let customerId = localStorage.getItem("demoCustomerId") || "customer_" + Date.now();
+    function newDemoCustomerId() {
+      return "6016" + String(Date.now()).slice(-8);
+    }
+    let customerId = localStorage.getItem("demoCustomerId") || newDemoCustomerId();
+    if (!/^\\d{8,15}$/.test(customerId)) {
+      customerId = newDemoCustomerId();
+    }
     let selectedProductId = localStorage.getItem("demoProductId") || ${JSON.stringify(catalog.default_product_id)};
     localStorage.setItem("demoCustomerId", customerId);
     document.querySelector("#customer-id-label").textContent = customerId;
@@ -9276,7 +9699,7 @@ function demoChatHtml() {
       localStorage.setItem("demoProductId", selectedProductId);
       productSelect.value = selectedProductId;
       renderProductOptions();
-      customerId = "customer_" + Date.now();
+      customerId = newDemoCustomerId();
       localStorage.setItem("demoCustomerId", customerId);
       document.querySelector("#customer-id-label").textContent = customerId;
       messages.innerHTML = "";
@@ -9336,6 +9759,10 @@ function demoChatHtml() {
             const img = document.createElement("img");
             img.src = message.url;
             img.alt = message.caption || "Product image";
+            img.onerror = () => {
+              console.warn("Demo image could not load", message.url);
+              wrap.remove();
+            };
             wrap.append(img);
             if (message.caption) {
               const caption = document.createElement("div");
@@ -9372,7 +9799,7 @@ function demoChatHtml() {
     });
 
     document.querySelector("#new-customer").addEventListener("click", () => {
-      customerId = "customer_" + Date.now();
+      customerId = newDemoCustomerId();
       localStorage.setItem("demoCustomerId", customerId);
       document.querySelector("#customer-id-label").textContent = customerId;
       messages.innerHTML = "";

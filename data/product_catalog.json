@@ -173,10 +173,6 @@
         {
           "url": "/assets/blackhead-remover/price.jpeg",
           "caption": "Price photo"
-        },
-        {
-          "url": "/assets/blackhead-remover/sales.png",
-          "caption": "Optional sales photo"
         }
       ],
       "opening_flow": [
@@ -230,11 +226,6 @@
         {
           "type": "image",
           "url": "/assets/blackhead-remover/price.jpeg",
-          "caption": ""
-        },
-        {
-          "type": "image",
-          "url": "/assets/blackhead-remover/sales.png",
           "caption": ""
         },
         {
@@ -301,6 +292,15 @@
             "Ada mode untuk sensitive skin?"
           ],
           "approved_reply": "Ada 3 suction modes: Normal, Intermediate dan Strong. Pilih ikut kesesuaian kulit. Untuk kulit sensitif, mula dari Normal dulu.",
+          "active": true
+        },
+        {
+          "id": "blackhead-remover_learned-can-i-pay-using-bank-transfer",
+          "topic": "Learned: Can I pay using bank transfer?",
+          "example_questions": [
+            "Can I pay using bank transfer?"
+          ],
+          "approved_reply": "cannot ya",
           "active": true
         }
       ],
@@ -383,7 +383,7 @@
       "shopping_link": "https://my.shp.ee/8X9Xk7Xd",
       "openingFlowEnabled": true,
       "sales_replies": [],
-      "sales_photo_url": "/assets/blackhead-remover/sales.png",
+      "sales_photo_url": "",
       "extracted_knowledge": {
         "pending": [],
         "approved": [],
