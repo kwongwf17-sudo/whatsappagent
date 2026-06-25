@@ -470,23 +470,13 @@
             "embedding_text": "Blackhead Remover product info photo 1 before after benefit_claim see the difference cleaner pores smoother look before after stubborn blackheads oily t-zone clogged pores rough texture cleaner pores less oil shine smoother look fresh skin nose comparison device shown",
             "customer_safe": true,
             "approval_note": "Visible in image",
-            "question_examples": [
-              "what does the image show?",
-              "what benefits are written?",
-              "what are the before and after labels?"
-            ],
             "sourceSlot": "infoPhoto1",
             "sourceLabel": "Product info photo 1",
             "sourceImageUrl": "/assets/blackhead-remover/product-1.png",
             "sourceFilename": "product-1.png",
             "extractedAt": "2026-06-11T14:34:36.807Z",
-            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih.",
-            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Blackhead remover ani untuk apa?",
-              "Macam mana alat ani bantu blackhead?"
-            ],
+            "brunei_malay_summary": "Gambar ani tunjuk perbezaan sebelum dan selepas: sebelum ada stubborn blackheads, oily T-zone, pori tersumbat dan tekstur kasar. Selepas nampak pori lebih bersih, kurang minyak berkilat, kulit nampak lebih smooth dan fresh.",
+            "brunei_malay_search_text": "sebelum selepas blackhead oily t-zone pori tersumbat tekstur kasar pori lebih bersih kurang minyak kulit nampak smooth fresh",
             "approvedAt": "2026-06-13T06:35:46.049Z"
           },
           {
@@ -499,28 +489,13 @@
             "embedding_text": "Blackhead Remover product info photo 2 product-2.png feature 4 Key Functions cleaner pores smoother skin more confidence blackhead removal deep pore clean targeted suction oil build-up care 60KPA strong suction USB rechargeable 3 suction probe heads safe for all skin types cheeks nose forehead chin",
             "customer_safe": true,
             "approval_note": "Visible text and product illustrations in image",
-            "question_examples": [
-              "what are the main functions?",
-              "does it have rechargeable USB?",
-              "how many probe heads are included?"
-            ],
             "sourceSlot": "infoPhoto2",
             "sourceLabel": "Product info photo 2",
             "sourceImageUrl": "/assets/blackhead-remover/product-2.png",
             "sourceFilename": "product-2.png",
             "extractedAt": "2026-06-11T14:34:44.199Z",
-            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Dalam info gambar ada disebut gentle formula atau sesuai untuk kulit sensitif. Info gambar menunjukkan fungsi device seperti suction head/mode, cas USB dan butang kawalan jika berkaitan.",
-            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | kulit sensitif kah sensitive skin gentle formula sesuai kulit sensitive | macam mana cara guna cara pakai mode kepala alat suction cas usb rechargeable button",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Blackhead remover ani untuk apa?",
-              "Macam mana alat ani bantu blackhead?",
-              "Sesuai untuk kulit sensitif kah?",
-              "Kulit sensitive boleh pakai kah?",
-              "Macam mana cara guna?",
-              "Cara pakai macam mana?",
-              "Ada berapa mode?"
-            ],
+            "brunei_malay_summary": "Gambar ani tunjuk 4 fungsi utama blackhead remover: buang blackhead, deep pore clean, targeted suction untuk kawasan pipi, hidung, dahi dan dagu, serta bantu kurangkan oil build-up. Gambar juga menyebut 60KPA strong suction, USB rechargeable, 3 suction probe heads dan safe for all skin types.",
+            "brunei_malay_search_text": "4 fungsi utama blackhead removal deep pore clean targeted suction pipi hidung dahi dagu oil build-up 60KPA strong suction USB rechargeable 3 suction probe heads safe for all skin types",
             "approvedAt": "2026-06-13T06:35:46.669Z"
           },
           {
@@ -533,25 +508,13 @@
             "embedding_text": "Blackhead Remover product info photo 3 feature built with smart features advanced technology for clearer smoother skin microcrystal extractor deep pore suction 3 suction heads for different areas large round head small round head oval-shaped head 3 suction modes normal intermediate strong USB-C rechargeable fast and convenient physical button adjust suction intensity power on/off long press mode select short press suction intensity",
             "customer_safe": true,
             "approval_note": "Visible in image",
-            "question_examples": [
-              "what features does it have?",
-              "what suction modes are shown?"
-            ],
             "sourceSlot": "infoPhoto3",
             "sourceLabel": "Product info photo 3",
             "sourceImageUrl": "/assets/blackhead-remover/product-3.png",
             "sourceFilename": "product-3.png",
             "extractedAt": "2026-06-11T14:34:52.603Z",
-            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Info gambar menunjukkan fungsi device seperti suction head/mode, cas USB dan butang kawalan jika berkaitan.",
-            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | macam mana cara guna cara pakai mode kepala alat suction cas usb rechargeable button",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Blackhead remover ani untuk apa?",
-              "Macam mana alat ani bantu blackhead?",
-              "Macam mana cara guna?",
-              "Cara pakai macam mana?",
-              "Ada berapa mode?"
-            ],
+            "brunei_malay_summary": "Gambar ani tunjuk smart features blackhead remover: microcrystal extractor dengan deep pore suction, 3 suction heads untuk kawasan berbeza, 3 suction modes iaitu Normal, Intermediate dan Strong, USB-C rechargeable, dan physical button untuk adjust suction intensity. Power on/off long press dan mode select short press.",
+            "brunei_malay_search_text": "smart features microcrystal extractor deep pore suction 3 suction heads large round small round oval head 3 suction modes normal intermediate strong USB-C rechargeable physical button adjust suction intensity long press short press",
             "approvedAt": "2026-06-13T06:35:47.019Z"
           },
           {
@@ -564,33 +527,13 @@
             "embedding_text": "price photo, Blackhead Remover, price, package deals, product poster, BLACKHEAD REMOVER, BERSIH PORI, KURANG KOMEDO, KULIT LEBIH LICIN, HARGA ASAL B$78, PACKAGE A 2 UNIT = B$39, PACKAGE B 4 UNIT = B$70, PACKAGE C 6 UNIT = B$105, BARANG SAMPAI BARU BAYAR, 7 HARI ROSAK - 100% FULLY REFUND, COD TO ALL BRUNEI",
             "customer_safe": true,
             "approval_note": "Visible text from the image",
-            "question_examples": [
-              "berapa harga?",
-              "ada package apa saja?",
-              "boleh COD?"
-            ],
             "sourceSlot": "pricePhoto",
             "sourceLabel": "Price photo",
             "sourceImageUrl": "/assets/blackhead-remover/price.jpeg",
             "sourceFilename": "price.jpeg",
             "extractedAt": "2026-06-11T14:34:58.201Z",
-            "brunei_malay_summary": "Bantu sedut dan bersihkan blackhead/minyak di pori supaya hidung atau kawasan muka nampak lebih bersih. Info gambar ada menunjukkan harga atau promo produk. COD ada, barang sampai baru bayar, tertakluk kepada info delivery yang tersedia. Info gambar menyebut 7 hari rosak boleh 100% refund jika syarat berkenaan dipenuhi.",
-            "brunei_malay_search_text": "apa fungsi produk ani blackhead remover untuk apa sedut blackhead bersihkan pori minyak hidung suction | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1 | cod ada bayar masa barang sampai barang sampai baru bayar delivery hantar runner brunei | refund warranty rosak 7 hari rosak return tukar barang",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Blackhead remover ani untuk apa?",
-              "Macam mana alat ani bantu blackhead?",
-              "Berapa harga?",
-              "Ada promo kah?",
-              "Combo berapa?",
-              "Ada add-on apa?",
-              "COD ada?",
-              "Boleh bayar masa barang sampai?",
-              "Ada delivery kah?",
-              "Ada warranty kah?",
-              "Kalau rosak macam mana?",
-              "Ada refund kah?"
-            ],
+            "brunei_malay_summary": "Gambar harga Blackhead Remover menunjukkan kesan yang ditulis: bersih pori, kurang komedo dan kulit lebih licin. Harga asal B$78. Package A 2 unit = B$39, Package B 4 unit = B$70, Package C 6 unit = B$105. Gambar juga menyebut barang sampai baru bayar, 7 hari rosak 100% fully refund dan COD to all Brunei.",
+            "brunei_malay_search_text": "blackhead remover bersih pori kurang komedo kulit lebih licin harga asal B$78 Package A 2 unit B$39 Package B 4 unit B$70 Package C 6 unit B$105 barang sampai baru bayar 7 hari rosak 100% fully refund COD Brunei",
             "approvedAt": "2026-06-13T06:35:47.920Z"
           }
         ]
@@ -822,25 +765,14 @@
             "embedding_text": "Product info photo 1 | product-1.jpg | P08 ilso super melting sebum softener | category: benefit_claim | Blackheads out in 5 minutes comparison. Promotional before-and-after style image showing without ilso vs with ilso on a nose area. Visible text includes: BLACKHEADS OUT IN 5 MINUTES, Hard Blackheads, Difficult to Remove, Clogged Pores, Rough Skin, Softened Sebum, Easier Removal, Cleaner Pores, Smoother Skin, ilso.",
             "customer_safe": true,
             "approval_note": "Visible comparison and text in image; claims kept as written without strengthening.",
-            "question_examples": [
-              "what benefits are shown?",
-              "what does the image claim?",
-              "apa klaim yang terlihat?"
-            ],
             "sourceSlot": "infoPhoto1",
             "sourceLabel": "Product info photo 1",
             "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-1.jpg",
             "sourceFilename": "product-1.jpg",
             "extractedAt": "2026-06-11T14:58:26.679Z",
             "approvedAt": "2026-06-11T15:00:55.555Z",
-            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth.",
-            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Produk ani untuk apa?",
-              "Apa benefit produk ani?",
-              "Buleh bantu blackhead kah?"
-            ]
+            "brunei_malay_summary": "Gambar perbandingan WITHOUT ILSO dan WITH ILSO. Sebelah tanpa ILSO menunjukkan hard blackheads, susah dibuang, pori tersumbat dan kulit kasar. Sebelah dengan ILSO menunjukkan sebum lebih lembut, lebih mudah dibuang, pori lebih bersih dan kulit lebih smooth.",
+            "brunei_malay_search_text": "without ilso with ilso hard blackheads susah dibuang pori tersumbat kulit kasar softened sebum easier removal pori lebih bersih kulit lebih smooth blackheads out in 5 minutes"
           },
           {
             "id": "image_1781189909194",
@@ -852,20 +784,14 @@
             "embedding_text": "Product image info photo 2 product-2.jpg. Category: benefit_claim. After using ilso. Cleaner nose area. Less visible blackheads. Better makeup application. Fresher looking skin. Close-up nose image with sparkles and check marks.",
             "customer_safe": true,
             "approval_note": "Visible promotional text and nose close-up are shown in the image.",
-            "question_examples": [
-              "what results are shown after using it?",
-              "apa manfaat yang ditampilkan?",
-              "does it claim less visible blackheads?"
-            ],
             "sourceSlot": "infoPhoto2",
             "sourceLabel": "Product info photo 2",
             "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-2.jpg",
             "sourceFilename": "product-2.jpg",
             "extractedAt": "2026-06-11T14:58:29.194Z",
             "approvedAt": "2026-06-11T15:00:56.435Z",
-            "brunei_malay_summary": "Info gambar berkaitan P08 ilso super melting sebum softener.",
-            "brunei_malay_search_text": "produk ani P08 ilso super melting sebum softener info gambar soalan customer",
-            "brunei_malay_question_examples": []
+            "brunei_malay_summary": "Gambar ani menunjukkan hasil selepas menggunakan ILSO: kawasan hidung nampak lebih bersih, blackhead kurang nampak, makeup lebih senang nampak cantik, dan kulit nampak lebih fresh.",
+            "brunei_malay_search_text": "after using ilso kawasan hidung lebih bersih less visible blackheads better makeup application fresher looking skin"
           },
           {
             "id": "image_1781189912007",
@@ -877,27 +803,14 @@
             "embedding_text": "Product info photo 3 | product-3.jpg | category: benefit_claim | Why choose ilso? product benefits. ilso super melting sebum softener promo image with visible text: WHY CHOOSE ILSO? NO PAINFUL SQUEEZING, No more hurting your skin, VISIBLE RESULTS, See blackheads come out, 5-MINUTE CARE, Quick and easy at home, GENTLE FORMULA, Suitable for sensitive skin, SUPER MELTING SEBUM SOFTENER, ilso.",
             "customer_safe": true,
             "approval_note": "Visible promotional text and product bottle in image.",
-            "question_examples": [
-              "what benefits are shown?",
-              "is it gentle for sensitive skin?",
-              "what does the image say about results?"
-            ],
             "sourceSlot": "infoPhoto3",
             "sourceLabel": "Product info photo 3",
             "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/product-3.jpg",
             "sourceFilename": "product-3.jpg",
             "extractedAt": "2026-06-11T14:58:32.007Z",
             "approvedAt": "2026-06-11T15:00:56.929Z",
-            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Dalam info gambar ada disebut gentle formula atau sesuai untuk kulit sensitif.",
-            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | kulit sensitif kah sensitive skin gentle formula sesuai kulit sensitive",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Produk ani untuk apa?",
-              "Apa benefit produk ani?",
-              "Buleh bantu blackhead kah?",
-              "Sesuai untuk kulit sensitif kah?",
-              "Kulit sensitive boleh pakai kah?"
-            ]
+            "brunei_malay_summary": "Gambar ani menerangkan kenapa pilih ILSO: no painful squeezing, visible results, 5-minute care, dan gentle formula. Gambar juga menyebut suitable for sensitive skin.",
+            "brunei_malay_search_text": "why choose ilso no painful squeezing visible results 5-minute care gentle formula suitable for sensitive skin"
           },
           {
             "id": "image_1781189915497",
@@ -909,35 +822,14 @@
             "embedding_text": "Price photo | price.jpg | category: price | ilso Super Melting Sebum Softener pricing promo image. Visible text includes SUPER MELTING SEBUM SOFTENER, soften sebum, clear pores, blackhead extraction, 1 unit = $39, best seller combo $55, sebum softener + scrub tool for stubborn blackheads, other add-ons available: Bio Collagen Mask x5, Green Mask Stick x2, Pore-Reducing Toner, Cerave Cleanser, barang sampai baru bayar, 7 hari rosak - 100% fully refund, COD to all Brunei.",
             "customer_safe": true,
             "approval_note": "Visible price and promo text in image",
-            "question_examples": [
-              "what is the price?",
-              "what combo is available?",
-              "ada add-on apa?"
-            ],
             "sourceSlot": "pricePhoto",
             "sourceLabel": "Price photo",
             "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/price.jpg",
             "sourceFilename": "price.jpg",
             "extractedAt": "2026-06-11T14:58:35.497Z",
             "approvedAt": "2026-06-11T15:00:57.810Z",
-            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Harga/promo yang ditunjukkan: 1 unit = $39, and best seller combo is $55 with sebum softener + scrub tool for stubborn blackheads. 1 UNIT = $39. BEST SELLER COMBO: $55. 1 unit = $39, best seller combo $55, sebum softener + scrub tool for stubborn blackheads, other add-ons available: Bio Collagen Mask x5, Green Mask Stick x2, Pore-Reducing Toner, Cerave Cleanser, barang sampai baru bayar, 7 hari rosak - 100% fully refund, COD to all Brunei. COD ada, barang sampai baru bayar, tertakluk kepada info delivery yang tersedia. Info gambar menyebut 7 hari rosak boleh 100% refund jika syarat berkenaan dipenuhi.",
-            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | berapa harga harga promo promosi pakej package combo add on discount diskaun buy 1 free 1 | cod ada bayar masa barang sampai barang sampai baru bayar delivery hantar runner brunei | refund warranty rosak 7 hari rosak return tukar barang",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Produk ani untuk apa?",
-              "Apa benefit produk ani?",
-              "Buleh bantu blackhead kah?",
-              "Berapa harga?",
-              "Ada promo kah?",
-              "Combo berapa?",
-              "Ada add-on apa?",
-              "COD ada?",
-              "Boleh bayar masa barang sampai?",
-              "Ada delivery kah?",
-              "Ada warranty kah?",
-              "Kalau rosak macam mana?",
-              "Ada refund kah?"
-            ]
+            "brunei_malay_summary": "Gambar harga ILSO Super Melting Sebum Softener menunjukkan softening sebum, clear pores dan blackhead extraction. Harga 1 unit = , best seller combo  dengan sebum softener + scrub tool for stubborn blackheads. Gambar juga menyebut add-ons Bio Collagen Mask x5, Green Mask Stick x2, Pore-Reducing Toner, Cerave Cleanser, barang sampai baru bayar, 7 hari rosak 100% fully refund dan COD to all Brunei.",
+            "brunei_malay_search_text": "ilso super melting sebum softener soften sebum clear pores blackhead extraction 1 unit  best seller combo  sebum softener scrub tool stubborn blackheads add-ons Bio Collagen Mask Green Mask Stick Pore-Reducing Toner Cerave Cleanser barang sampai baru bayar 7 hari rosak 100% fully refund COD Brunei"
           },
           {
             "id": "image_1781189918937",
@@ -949,29 +841,14 @@
             "embedding_text": "feature, product: P08 ilso super melting sebum softener, sales photo, Complete Pore Care Routine, Main Product + Recommended Add-Ons, ilso SUPER MELTING SEBUM SOFTENER, main product, Sebum Care, Gentle Formula, Fresh Water Type, 150ml, add-ons: Bio Collagen Mask, Sebum Care Tool, Green Mask Stick, Hydrating Cleanser, Pore-Reducing Toner, use together for a clearer, smoother skincare routine",
             "customer_safe": true,
             "approval_note": "Visible in image",
-            "question_examples": [
-              "what features are shown?",
-              "what add-ons are recommended?",
-              "berapa ml?"
-            ],
             "sourceSlot": "salesPhoto",
             "sourceLabel": "Optional sales photo",
             "sourceImageUrl": "/assets/p08-ilso-super-melting-sebum-softener/sales.jpg",
             "sourceFilename": "sales.jpg",
             "extractedAt": "2026-06-11T14:58:38.937Z",
             "approvedAt": "2026-06-11T15:00:58.589Z",
-            "brunei_malay_summary": "Bantu lembutkan sebum, bantu bersihkan pori dan mudahkan blackhead dibersihkan. Boleh bantu kulit nampak lebih bersih dan smooth. Dalam info gambar ada disebut gentle formula atau sesuai untuk kulit sensitif. Isi produk yang ditunjukkan ialah 150ml.",
-            "brunei_malay_search_text": "apa fungsi produk ani untuk apa kegunaan benefit manfaat buleh bantu apa lembutkan sebum bersihkan pori blackhead kulit smooth | kulit sensitif kah sensitive skin gentle formula sesuai kulit sensitive | berapa ml isi botol volume 150ml",
-            "brunei_malay_question_examples": [
-              "Apa fungsi produk ani?",
-              "Produk ani untuk apa?",
-              "Apa benefit produk ani?",
-              "Buleh bantu blackhead kah?",
-              "Sesuai untuk kulit sensitif kah?",
-              "Kulit sensitive boleh pakai kah?",
-              "Berapa ml?",
-              "Satu botol berapa ml?"
-            ]
+            "brunei_malay_summary": "Gambar Complete Pore Care Routine menunjukkan ILSO Super Melting Sebum Softener sebagai main product. Callout yang tertulis: sebum care, gentle formula, fresh water type dan 150ml. Add-ons yang ditunjukkan ialah Bio Collagen Mask, Sebum Care Tool, Green Mask Stick, Hydrating Cleanser dan Pore-Reducing Toner. Gambar menyebut gunakan bersama untuk skincare routine yang lebih clear dan smooth.",
+            "brunei_malay_search_text": "complete pore care routine main product ilso super melting sebum softener sebum care gentle formula fresh water type 150ml add-on Bio Collagen Mask Sebum Care Tool Green Mask Stick Hydrating Cleanser Pore-Reducing Toner clearer smoother skincare routine"
           }
         ],
         "lastExtraction": {

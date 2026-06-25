@@ -239,6 +239,9 @@ function renderProductImageKnowledge(catalog = {}) {
 }
 
 function renderFaqRecord(faq, { scope, product = {} } = {}) {
+  const approvedAnswer = faq.approved_reply || faq.answer || "";
+  const bruneiMalayAnswer = faq.brunei_malay_approved_reply || approvedAnswer;
+  const bruneiMalaySearchText = renderBruneiMalayFaqSearchText(faq, bruneiMalayAnswer);
   return [
     `### FAQ: ${faq.id || faq.topic || "unnamed"}`,
     `Scope: ${scope}`,
@@ -247,9 +250,24 @@ function renderFaqRecord(faq, { scope, product = {} } = {}) {
     faq.topic ? `Topic: ${faq.topic}` : "",
     ...(faq.example_questions || []).map((question) => `Customer question example: ${question}`),
     ...(faq.customer_messages || []).map((question) => `Customer question example: ${question}`),
-    `Approved answer: ${faq.approved_reply || faq.answer || ""}`,
+    `Approved answer: ${approvedAnswer}`,
+    bruneiMalayAnswer ? `Brunei Malay approved answer: ${bruneiMalayAnswer}` : "",
+    bruneiMalaySearchText ? `Brunei Malay FAQ search text: ${bruneiMalaySearchText}` : "",
     "",
   ].filter(Boolean).join("\n");
+}
+
+function renderBruneiMalayFaqSearchText(faq, approvedAnswer) {
+  return [
+    ...(faq.brunei_malay_example_questions || []),
+    ...(faq.example_questions || []),
+    ...(faq.customer_messages || []),
+    faq.brunei_malay_topic || "",
+    approvedAnswer || "",
+  ]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .join(" | ");
 }
 
 function renderImageChunk(chunk, product) {
@@ -266,8 +284,6 @@ function renderImageChunk(chunk, product) {
     safeChunk.embedding_text ? `Embedding text: ${safeChunk.embedding_text}` : "",
     safeChunk.brunei_malay_summary ? `Brunei Malay summary: ${safeChunk.brunei_malay_summary}` : "",
     safeChunk.brunei_malay_search_text ? `Brunei Malay search text: ${safeChunk.brunei_malay_search_text}` : "",
-    ...(safeChunk.question_examples || []).map((question) => `Customer question example: ${question}`),
-    ...(safeChunk.brunei_malay_question_examples || []).map((question) => `Brunei Malay question example: ${question}`),
     "",
   ].filter(Boolean).join("\n");
 }
