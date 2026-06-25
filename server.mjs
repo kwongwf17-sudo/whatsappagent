@@ -6,7 +6,6 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   buildConversationPlan,
-  approvedFaqRecordsForProduct,
   approvedProductFactRecordsForProduct,
   classifyFaqSalesPromptResponse,
   findApprovedFaqLocalMatch,
@@ -15,27 +14,21 @@ import {
   isProductNameMessage,
   findSalesReplyExactMatch,
   formatStockArrivalMessage,
-  salesReplyRecordsForProduct,
   textMessage,
   usesFixedOpeningFlow,
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
   createEmbeddings,
-  createCustomerServiceResponse,
   createProductFactReply,
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
   rerankProductFacts,
-  selectApprovedFaq,
   selectProductFact,
-  selectSalesReply,
 } from "./lib/openai.mjs";
 import {
-  retrieveFaqRecords,
   retrieveProductFactRecords,
-  retrieveSalesReplyRecords,
 } from "./lib/retrieval.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
@@ -1233,8 +1226,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         model: config.openaiModel,
         extractionModel: config.extractionModel,
         embeddingModel: config.embeddingModel,
-        ragProvider: "openai_vector_store",
-        ragEnabled: Boolean(config.openaiApiKey && config.vectorStoreId),
+        productKnowledgeRagEnabled: Boolean(config.openaiApiKey),
         webhookDiagnostics,
         products: catalog.products.map((product) => ({ id: product.id, name: product.name })),
       });
@@ -1645,23 +1637,12 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   const exactSalesReply = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq
     ? null
     : findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary });
-  const approvedFaqMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
-    ? null
-    : await maybeSelectApprovedFaq({ customerMessage: text, product, catalog: teamCatalog, faqLibrary: teamFaqLibrary, businessAccountId });
-  const productFactMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || approvedFaqMatch
+  const approvedFaqMatch = null;
+  const productFactMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
     ? null
     : await maybeSelectProductFact({ customerMessage: text, product, businessAccountId });
-  const salesReplyMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch || approvedFaqMatch
-    ? null
-    : await maybeSelectSalesReply({ customerMessage: text, product, catalog: teamCatalog, salesReplyLibrary: teamSalesReplyLibrary, businessAccountId });
-  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch || approvedFaqMatch || salesReplyMatch
-    ? null
-    : await maybeCreateRagAnswer({
-        customerMessage: text,
-        customerId: from,
-        product,
-        businessAccountId,
-      });
+  const salesReplyMatch = null;
+  const ragAnswer = null;
   if (fixedOpeningFlow) {
     console.log(`Skipping OpenAI for fixed opening flow to ${from}`);
   }
@@ -1909,108 +1890,6 @@ function isUsageDurationQuestion(text) {
 function isProductOriginQuestion(text) {
   const normalized = String(text || "").toLowerCase();
   return /\b(from\s*where|where\s*(is|are|this|the)?.*(product|barang)|product\s*(from|made)|made\s*in|asal\s*(mana|dari)|dari\s*mana|barang\s*mana|produk\s*(dari|asal))\b/i.test(normalized);
-}
-
-async function maybeSelectApprovedFaq({ customerMessage, product, catalog: activeCatalog = catalog, faqLibrary: activeFaqLibrary = faqLibrary, businessAccountId = config.accountId }) {
-  if (!config.openaiApiKey) return null;
-  const faqRecords = approvedFaqRecordsForProduct(activeCatalog, product, {
-    includeGeneral: isGeneralBusinessQuestion(customerMessage),
-    faqLibrary: activeFaqLibrary,
-  });
-  if (!faqRecords.length) return null;
-  try {
-    const retrievedRecords = await retrieveFaqRecords({
-      records: faqRecords,
-      customerMessage,
-      productName: product.name,
-      embedTexts: embedKnowledgeTexts,
-      topK: 8,
-    });
-    if (!retrievedRecords.length) return null;
-    const match = await selectApprovedFaq({
-      apiKey: config.openaiApiKey,
-      model: config.openaiModel,
-      customerMessage,
-      productName: product.name,
-      faqRecords: retrievedRecords,
-    });
-    if (!match) return null;
-    const faq = faqRecords.find((item) => item.id === match.faqId);
-    if (!faq) return null;
-    return {
-      faqId: faq.id,
-      approvedReply: faq.approved_reply,
-      scope: faq.scope,
-      reason: match.reason,
-      retrieval: retrievedRecords.find((item) => item.id === faq.id)?.retrieval || "",
-      retrievalScore: retrievedRecords.find((item) => item.id === faq.id)?.retrieval_score || 0,
-    };
-  } catch (error) {
-    await recordSystemError("approved_faq_match", error, `Product: ${product.id}`);
-    return null;
-  }
-}
-
-async function maybeSelectSalesReply({ customerMessage, product, catalog: activeCatalog = catalog, salesReplyLibrary: activeSalesReplyLibrary = salesReplyLibrary, businessAccountId = config.accountId }) {
-  if (!config.openaiApiKey) return null;
-  const records = salesReplyRecordsForProduct(activeCatalog, product, { salesReplyLibrary: activeSalesReplyLibrary });
-  if (!records.length) return null;
-  try {
-    const retrievedRecords = await retrieveSalesReplyRecords({
-      records,
-      customerMessage,
-      productName: product.name,
-      embedTexts: embedKnowledgeTexts,
-      topK: 8,
-    });
-    if (!retrievedRecords.length) return null;
-    const match = await selectSalesReply({
-      apiKey: config.openaiApiKey,
-      model: config.openaiModel,
-      customerMessage,
-      productName: product.name,
-      salesReplyRecords: retrievedRecords,
-    });
-    if (!match) return null;
-    const salesReply = records.find((item) => item.id === match.salesReplyId);
-    if (!salesReply) return null;
-    return {
-      salesReplyId: salesReply.id,
-      approvedReply: salesReply.approved_reply,
-      followupPrompt: salesReply.followup_prompt || "",
-      scope: salesReply.scope,
-      reason: match.reason,
-      retrieval: retrievedRecords.find((item) => item.id === salesReply.id)?.retrieval || "",
-      retrievalScore: retrievedRecords.find((item) => item.id === salesReply.id)?.retrieval_score || 0,
-    };
-  } catch (error) {
-    await recordSystemError("sales_reply_match", error, `Product: ${product.id}`);
-    return null;
-  }
-}
-
-async function maybeCreateRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
-  if (!config.openaiApiKey) return null;
-  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
-  if (!vectorStoreId) return null;
-  try {
-    const answer = await createCustomerServiceResponse({
-      apiKey: config.openaiApiKey,
-      model: config.openaiModel,
-      vectorStoreId,
-      businessName: config.businessName,
-      supportLanguage: config.supportLanguage,
-      customerId,
-      customerMessage,
-      productName: product?.name || "",
-      productId: product?.id || "",
-    });
-    if (!answer?.reply) return null;
-    return answer;
-  } catch (error) {
-    await recordSystemError("rag_answer", error, `Product: ${product?.id || ""}`, businessAccountId);
-    return null;
-  }
 }
 
 async function embedKnowledgeTexts(texts) {
@@ -3100,7 +2979,7 @@ async function buildComplianceData() {
       { item: "App secret signature check", status: config.appSecret ? "configured" : "missing WHATSAPP_APP_SECRET" },
       { item: "Public HTTPS base URL for images", status: config.publicBaseUrl ? "configured" : "missing PUBLIC_BASE_URL" },
       { item: "Admin WhatsApp alert number", status: config.adminWhatsAppNumber ? "configured" : "missing ADMIN_WHATSAPP_NUMBER" },
-      { item: "OpenAI RAG", status: config.openaiApiKey && config.vectorStoreId ? "configured" : "optional: missing OpenAI key/vector store" },
+      { item: "Product image knowledge AI", status: config.openaiApiKey ? "configured" : "optional: missing OpenAI key" },
     ],
     privacyNotice: [
       "We collect your WhatsApp number, messages, name, phone number, address, selected product/package, and order details to answer enquiries, process orders, arrange delivery, and provide customer support.",
@@ -5933,7 +5812,7 @@ function superAdminSystemHtml() {
           <input id="team-access-token" name="whatsappAccessToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep current" />
           <span class="settings-secret" id="team-access-token-current"></span>
         </label>
-        <label for="team-vector-store-id">OpenAI Vector Store ID
+        <label for="team-vector-store-id">Legacy OpenAI Vector Store ID (unused by current reply flow)
           <input id="team-vector-store-id" name="openaiVectorStoreId" placeholder="vs_..." />
         </label>
         <label for="team-followup-sends">Follow-Up Sends Per Minute
