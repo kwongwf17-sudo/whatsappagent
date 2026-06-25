@@ -895,6 +895,28 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/chat/delete-conversation") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "").trim();
+      if (!customerId) return sendJson(res, 400, { error: "Customer ID is required." });
+      const customer = (await store.listCustomers(new Date(), adminSession.accountId)).find((item) => item.id === customerId);
+      if (!customer) return sendJson(res, 404, { error: "Customer not found." });
+      try {
+        const result = await store.deleteConversationMessages(customerId, adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "chat_conversation_deleted",
+          customerId,
+          businessAccountId: adminSession.accountId,
+          result: `${result.deleted} message(s) deleted`,
+        });
+        return sendJson(res, 200, result);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/no-reply/handoff") {
       const body = await readJsonBody(req);
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
@@ -7050,9 +7072,11 @@ function adminChatPageHtml() {
     .customer-item strong { display: block; overflow-wrap: anywhere; }
     .customer-item span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .pane { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
-    .chat-header { padding: 14px 16px; border-bottom: 1px solid #e5e5ea; background: #fff; }
+    .chat-header { padding: 14px 16px; border-bottom: 1px solid #e5e5ea; background: #fff; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .chat-header strong { display: block; overflow-wrap: anywhere; }
     .chat-header span { color: var(--muted); font-size: 13px; }
+    .chat-header-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+    .chat-header-actions .danger { border-color: #fecaca; background: #fee2e2; color: #991b1b; }
     .thread { padding: 18px; overflow: auto; background: #f7f7f8; }
     .row { display: flex; margin: 0 0 10px; }
     .row.customer { justify-content: flex-start; }
@@ -7070,7 +7094,7 @@ function adminChatPageHtml() {
     textarea:focus, input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
     .composer button { min-width: 80px; background: var(--accent); border-color: var(--accent); color: #fff; }
     .empty { color: var(--muted); padding: 18px; }
-    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } }
+    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } .chat-header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>
@@ -7100,7 +7124,7 @@ function adminChatPageHtml() {
         <div class="customer-list" id="customer-list"></div>
       </aside>
       <section class="pane">
-        <div class="chat-header" id="chat-header"><strong>No customer selected</strong><span>Select a customer on the left.</span></div>
+        <div class="chat-header" id="chat-header"><div><strong>No customer selected</strong><span>Select a customer on the left.</span></div></div>
         <div class="thread" id="thread"><div class="empty">No conversation selected.</div></div>
         <form class="composer" id="composer">
           <div class="composer-state" id="composer-state"></div>
@@ -7196,13 +7220,14 @@ function adminChatPageHtml() {
       replyText.disabled = !customer;
       sendButton.disabled = !customer;
       if (!customer) {
-        header.innerHTML = '<strong>No customer selected</strong><span>Select a customer on the left.</span>';
+        header.innerHTML = '<div><strong>No customer selected</strong><span>Select a customer on the left.</span></div>';
         thread.innerHTML = '<div class="empty">No conversation selected.</div>';
         return;
       }
-      header.innerHTML = '<strong>' + esc(customer.id) + '</strong><span>' +
+      header.innerHTML = '<div><strong>' + esc(customer.id) + '</strong><span>' +
         esc(customer.product || '-') + ' | ' + esc(customer.status || '-') + ' | ' + esc(customer.guardrail || '') +
-        '</span>';
+        '</span></div><div class="chat-header-actions"><button id="delete-conversation" class="danger" type="button">Delete Chat</button></div>';
+      document.querySelector("#delete-conversation").addEventListener("click", deleteConversation);
       const messages = (data.conversationMessages || [])
         .filter(message => message.to === activeCustomerId || message.from === activeCustomerId)
         .slice()
@@ -7232,6 +7257,19 @@ function adminChatPageHtml() {
       applyProfile(data.profile);
       document.querySelector("#status").textContent = "Loaded " + (data.customers || []).length + " customer(s) for " + selectedDate + ".";
       render();
+    }
+    async function deleteConversation() {
+      if (!activeCustomerId) return;
+      const ok = confirm("Delete all chat messages for " + activeCustomerId + "? Customer profile and orders will stay.");
+      if (!ok) return;
+      state.textContent = "Deleting chat for " + activeCustomerId + "...";
+      try {
+        const result = await request("/admin/chat/delete-conversation", { customerId: activeCustomerId });
+        state.textContent = "Deleted " + result.deleted + " message(s).";
+        await load();
+      } catch (error) {
+        state.textContent = error.message;
+      }
     }
     document.querySelector("#composer").addEventListener("submit", async (event) => {
       event.preventDefault();
