@@ -20,6 +20,7 @@ import {
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
   createEmbeddings,
+  createCustomerServiceResponse,
   createProductImageVectorStoreReply,
   createProductFactReply,
   detectComplaintIntent,
@@ -1227,7 +1228,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         model: config.openaiModel,
         extractionModel: config.extractionModel,
         embeddingModel: config.embeddingModel,
-        productImageVectorStoreRagEnabled: Boolean(config.openaiApiKey && config.vectorStoreId),
+        approvedKnowledgeVectorStoreRagEnabled: Boolean(config.openaiApiKey && config.vectorStoreId),
         webhookDiagnostics,
         products: catalog.products.map((product) => ({ id: product.id, name: product.name })),
       });
@@ -1643,7 +1644,14 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     ? null
     : await maybeSelectProductFact({ customerMessage: text, product, businessAccountId });
   const salesReplyMatch = null;
-  const ragAnswer = null;
+  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch
+    ? null
+    : await maybeCreateApprovedKnowledgeRagAnswer({
+        customerMessage: text,
+        customerId: from,
+        product,
+        businessAccountId,
+      });
   if (fixedOpeningFlow) {
     console.log(`Skipping OpenAI for fixed opening flow to ${from}`);
   }
@@ -1908,6 +1916,51 @@ async function recordProductFactRagDiagnostic(stage, {
     JSON.stringify(details),
     businessAccountId
   );
+}
+
+async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
+  if (!config.openaiApiKey) return null;
+  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
+  if (!vectorStoreId) return null;
+  try {
+    const answer = await createCustomerServiceResponse({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      vectorStoreId,
+      businessName: config.businessName,
+      supportLanguage: config.supportLanguage,
+      customerId,
+      customerMessage,
+      productName: product?.name || "",
+      productId: product?.id || "",
+      maxResults: 8,
+    });
+    const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
+    if (!answer || answer.handoffRequired || !safeReply) {
+      await recordSystemError(
+        "approved_knowledge_rag",
+        new Error("Approved knowledge RAG no answer"),
+        JSON.stringify({
+          productId: product?.id || "",
+          productName: product?.name || "",
+          customerMessage: String(customerMessage || "").slice(0, 500),
+          handoffReason: answer?.handoffReason || "",
+          buyingIntent: answer?.buyingIntent || "",
+          replyType: answer?.replyType || "",
+        }),
+        businessAccountId
+      );
+      return null;
+    }
+    return {
+      ...answer,
+      reply: safeReply,
+      allowProductSpecific: true,
+    };
+  } catch (error) {
+    await recordSystemError("approved_knowledge_rag", error, `Product: ${product?.id || ""}`, businessAccountId);
+    return null;
+  }
 }
 
 function sanitizeProductKnowledgeReply(reply) {
@@ -3024,7 +3077,7 @@ async function buildComplianceData() {
       { item: "App secret signature check", status: config.appSecret ? "configured" : "missing WHATSAPP_APP_SECRET" },
       { item: "Public HTTPS base URL for images", status: config.publicBaseUrl ? "configured" : "missing PUBLIC_BASE_URL" },
       { item: "Admin WhatsApp alert number", status: config.adminWhatsAppNumber ? "configured" : "missing ADMIN_WHATSAPP_NUMBER" },
-      { item: "Product image vector-store RAG", status: config.openaiApiKey && config.vectorStoreId ? "configured" : "optional: missing OpenAI key/vector store" },
+      { item: "Approved knowledge vector-store RAG", status: config.openaiApiKey && config.vectorStoreId ? "configured" : "optional: missing OpenAI key/vector store" },
     ],
     privacyNotice: [
       "We collect your WhatsApp number, messages, name, phone number, address, selected product/package, and order details to answer enquiries, process orders, arrange delivery, and provide customer support.",
@@ -5857,7 +5910,7 @@ function superAdminSystemHtml() {
           <input id="team-access-token" name="whatsappAccessToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep current" />
           <span class="settings-secret" id="team-access-token-current"></span>
         </label>
-        <label for="team-vector-store-id">Product Image Vector Store ID
+        <label for="team-vector-store-id">Approved Knowledge Vector Store ID
           <input id="team-vector-store-id" name="openaiVectorStoreId" placeholder="vs_..." />
         </label>
         <label for="team-followup-sends">Follow-Up Sends Per Minute
