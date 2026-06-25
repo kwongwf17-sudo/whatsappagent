@@ -118,6 +118,7 @@ const config = {
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
+  webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   noReplyAlertMinutes: Number(getEnv("NO_REPLY_ALERT_MINUTES", "2")),
   adminPassword: getEnv("ADMIN_PASSWORD", "admin123"),
   adminSessionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "demo_session_secret")),
@@ -162,7 +163,11 @@ const adminAccounts = new AdminAccountStore(config.dataDir, {
 const operations = new OperationsStore(config.dataDir, { adapter: storageAdapter });
 const teamContentStore = new TeamContentStore(config.dataDir, { adapter: storageAdapter });
 const webTransportManager = config.transportMode === "web"
-  ? new WebWhatsAppManager({ sessionRootDir: config.webSessionDir, logger: console })
+  ? new WebWhatsAppManager({
+      sessionRootDir: config.webSessionDir,
+      logger: console,
+      processFromMeMessages: config.webProcessFromMeMessages,
+    })
   : null;
 await adminAccounts.ensureInitialAccount({
   id: config.accountId,
@@ -4010,6 +4015,11 @@ function whatsappWebStatusHtml() {
     .connected { color: #176f37; background: #dcfce7; }
     .qr_required, .starting { color: #8a5a00; background: #fef3c7; }
     .error, .disconnected { color: #9f1c1c; background: #fee2e2; }
+    .diagnostics { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+    .diagnostics table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    .diagnostics td { border-bottom: 1px solid #edf0f3; padding: 8px 4px; vertical-align: top; }
+    .diagnostics td:first-child { color: var(--muted); width: 190px; }
+    .warning { display: none; margin-top: 12px; border: 1px solid #facc15; background: #fef9c3; color: #713f12; border-radius: 8px; padding: 10px 12px; }
     #qr { display: none; margin-top: 16px; width: min(520px, calc(100vw - 96px)); height: auto; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 14px; }
     .pairing { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
     .pairing-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -4043,6 +4053,14 @@ function whatsappWebStatusHtml() {
       <img id="qr" alt="WhatsApp Web QR code">
       <p class="muted">If QR is shown: open WhatsApp Business on the main phone, go to Linked devices, then scan this QR.</p>
       <p><a href="/admin/whatsapp-web/qr-only" target="_blank" rel="noopener">Open large QR scan page</a></p>
+      <div id="from-me-warning" class="warning"></div>
+      <div class="diagnostics">
+        <h2>Message Diagnostics</h2>
+        <p class="muted">Use this after sending a test WhatsApp message. Customer messages should increase processed messages.</p>
+        <table>
+          <tbody id="diagnostics"></tbody>
+        </table>
+      </div>
       <div class="pairing">
         <h2>Alternative: Pairing Code</h2>
         <p class="muted">If QR keeps expiring, enter the WhatsApp Business number and use the code in WhatsApp Business &gt; Linked devices &gt; Link with phone number instead.</p>
@@ -4072,7 +4090,9 @@ function whatsappWebStatusHtml() {
       status.textContent = data.status || "unknown";
       status.className = "status " + (data.status || "");
       document.querySelector("#details").textContent =
-        "Transport: " + (data.transport || "") +
+        "Transport: " + (data.transportMode || data.transport || "") +
+        " | Demo mode: " + (data.demoMode ? "on" : "off") +
+        " | Process linked-phone messages: " + (data.processFromMeMessages ? "on" : "off") +
         (data.lastConnectedAt ? " | Connected: " + new Date(data.lastConnectedAt).toLocaleString() : "") +
         (data.lastDisconnectedAt ? " | Disconnected: " + new Date(data.lastDisconnectedAt).toLocaleString() : "") +
         (data.lastError ? " | Error: " + data.lastError : "");
@@ -4092,6 +4112,42 @@ function whatsappWebStatusHtml() {
         codeEl.style.display = "block";
         codeEl.textContent = data.pairingCode;
       }
+      renderDiagnostics(data.diagnostics || {});
+    }
+    function renderDiagnostics(diagnostics) {
+      const rows = [
+        ["Received events", diagnostics.receivedEvents || 0],
+        ["Received messages", diagnostics.receivedMessages || 0],
+        ["Processed messages", diagnostics.processedMessages || 0],
+        ["Ignored from linked phone", diagnostics.ignoredFromMe || 0],
+        ["Ignored non-customer chat", diagnostics.ignoredNonCustomer || 0],
+        ["Ignored empty text", diagnostics.ignoredEmptyText || 0],
+        ["Last ignore reason", diagnostics.lastIgnoreReason || "-"],
+        ["Last message kinds", diagnostics.lastMessageKinds || "-"],
+        ["Last customer id", diagnostics.lastCustomerId || "-"],
+        ["Last message preview", diagnostics.lastTextPreview || "-"],
+        ["Last event time", diagnostics.lastAt ? new Date(diagnostics.lastAt).toLocaleString() : "-"]
+      ];
+      document.querySelector("#diagnostics").innerHTML = rows.map(([label, value]) =>
+        "<tr><td>" + esc(label) + "</td><td>" + esc(String(value)) + "</td></tr>"
+      ).join("");
+      const warning = document.querySelector("#from-me-warning");
+      if (diagnostics.lastIgnoreReason === "from_me") {
+        warning.style.display = "block";
+        warning.textContent = "Last message was ignored because it was sent from the linked WhatsApp phone. Test from a different customer phone/WhatsApp account, or enable WHATSAPP_WEB_PROCESS_FROM_ME=true only for local self-testing.";
+      } else {
+        warning.style.display = "none";
+        warning.textContent = "";
+      }
+    }
+    function esc(value) {
+      return String(value || "").replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[char]));
     }
     async function requestPairingCode() {
       const state = document.querySelector("#pairing-state");
@@ -4319,12 +4375,18 @@ async function webTransportStatusForAccount(accountId) {
     return {
       transport: config.transportMode,
       accountId,
+      processFromMeMessages: config.webProcessFromMeMessages,
+      demoMode: config.demoMode,
       status: config.transportMode === "web" ? "not_initialized" : "disabled",
       qr: "",
     };
   }
   await webTransportManager.startAccount(accountId);
-  return webTransportManager.getStatus(accountId);
+  return {
+    ...webTransportManager.getStatus(accountId),
+    demoMode: config.demoMode,
+    transportMode: config.transportMode,
+  };
 }
 
 async function webTransportHealthData() {
