@@ -15,6 +15,7 @@ import { AdminAccountStore } from "./lib/admin_accounts.mjs";
 import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
 import { TeamContentStore } from "./lib/team_content.mjs";
+import { sanitizeImageKnowledgeChunk } from "./lib/knowledge_sanitizer.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const supportedExtensions = new Set([
@@ -252,20 +253,21 @@ function renderFaqRecord(faq, { scope, product = {} } = {}) {
 }
 
 function renderImageChunk(chunk, product) {
+  const safeChunk = sanitizeImageKnowledgeChunk(chunk);
   return [
-    `### Image Knowledge: ${chunk.id || chunk.title || "unnamed"}`,
+    `### Image Knowledge: ${safeChunk.id || safeChunk.title || "unnamed"}`,
     `Product ID: ${product.id || ""}`,
     `Product Name: ${product.name || ""}`,
-    chunk.category ? `Category: ${chunk.category}` : "",
-    chunk.title ? `Title: ${chunk.title}` : "",
-    chunk.sourceFilename ? `Source file: ${chunk.sourceFilename}` : "",
-    chunk.summary ? `Summary: ${chunk.summary}` : "",
-    chunk.extracted_text ? `Extracted text: ${chunk.extracted_text}` : "",
-    chunk.embedding_text ? `Embedding text: ${chunk.embedding_text}` : "",
-    chunk.brunei_malay_summary ? `Brunei Malay summary: ${chunk.brunei_malay_summary}` : "",
-    chunk.brunei_malay_search_text ? `Brunei Malay search text: ${chunk.brunei_malay_search_text}` : "",
-    ...(chunk.question_examples || []).map((question) => `Customer question example: ${question}`),
-    ...(chunk.brunei_malay_question_examples || []).map((question) => `Brunei Malay question example: ${question}`),
+    safeChunk.category ? `Category: ${safeChunk.category}` : "",
+    safeChunk.title ? `Title: ${safeChunk.title}` : "",
+    safeChunk.sourceFilename ? `Source file: ${safeChunk.sourceFilename}` : "",
+    safeChunk.summary ? `Summary: ${safeChunk.summary}` : "",
+    safeChunk.extracted_text ? `Extracted text: ${safeChunk.extracted_text}` : "",
+    safeChunk.embedding_text ? `Embedding text: ${safeChunk.embedding_text}` : "",
+    safeChunk.brunei_malay_summary ? `Brunei Malay summary: ${safeChunk.brunei_malay_summary}` : "",
+    safeChunk.brunei_malay_search_text ? `Brunei Malay search text: ${safeChunk.brunei_malay_search_text}` : "",
+    ...(safeChunk.question_examples || []).map((question) => `Customer question example: ${question}`),
+    ...(safeChunk.brunei_malay_question_examples || []).map((question) => `Brunei Malay question example: ${question}`),
     "",
   ].filter(Boolean).join("\n");
 }
