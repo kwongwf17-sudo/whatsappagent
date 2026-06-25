@@ -1737,12 +1737,18 @@ async function maybeDetectComplaintIntent(customerMessage) {
 }
 
 async function maybeSelectProductFact({ customerMessage, product, businessAccountId = config.accountId }) {
-  if (!config.openaiApiKey) return null;
+  if (!config.openaiApiKey) {
+    await recordProductFactRagDiagnostic("missing_openai_key", { product, customerMessage, businessAccountId });
+    return null;
+  }
   if (isBusinessOrLogisticsQuestion(customerMessage)) return null;
   if (isUsageDurationQuestion(customerMessage)) return null;
   if (isProductOriginQuestion(customerMessage)) return null;
   const records = approvedProductFactRecordsForProduct(product);
-  if (!records.length) return null;
+  if (!records.length) {
+    await recordProductFactRagDiagnostic("no_approved_product_facts", { product, customerMessage, businessAccountId });
+    return null;
+  }
   try {
     const retrievedRecords = await retrieveProductFactRecords({
       records,
@@ -1751,7 +1757,10 @@ async function maybeSelectProductFact({ customerMessage, product, businessAccoun
       embedTexts: embedKnowledgeTexts,
       topK: 20,
     });
-    if (!retrievedRecords.length) return null;
+    if (!retrievedRecords.length) {
+      await recordProductFactRagDiagnostic("retrieval_empty", { product, customerMessage, businessAccountId, records });
+      return null;
+    }
     const rerankedRecords = await rerankProductFacts({
       apiKey: config.openaiApiKey,
       model: config.openaiModel,
@@ -1760,7 +1769,15 @@ async function maybeSelectProductFact({ customerMessage, product, businessAccoun
       factRecords: retrievedRecords,
       topK: 5,
     });
-    if (!rerankedRecords.length) return null;
+    if (!rerankedRecords.length) {
+      await recordProductFactRagDiagnostic("rerank_empty", {
+        product,
+        customerMessage,
+        businessAccountId,
+        retrievedRecords,
+      });
+      return null;
+    }
     const match = await selectProductFact({
       apiKey: config.openaiApiKey,
       model: config.openaiModel,
@@ -1768,9 +1785,27 @@ async function maybeSelectProductFact({ customerMessage, product, businessAccoun
       productName: product.name,
       factRecords: rerankedRecords,
     });
-    if (!match) return null;
+    if (!match) {
+      await recordProductFactRagDiagnostic("select_no_match", {
+        product,
+        customerMessage,
+        businessAccountId,
+        retrievedRecords,
+        rerankedRecords,
+      });
+      return null;
+    }
     const fact = records.find((item) => item.id === match.factId);
-    if (!fact) return null;
+    if (!fact) {
+      await recordProductFactRagDiagnostic("selected_fact_missing", {
+        product,
+        customerMessage,
+        businessAccountId,
+        match,
+        rerankedRecords,
+      });
+      return null;
+    }
     const retrieved = rerankedRecords.find((item) => item.id === fact.id) ||
       retrievedRecords.find((item) => item.id === fact.id);
     const generatedReply = fact.kind === "image_chunk"
@@ -1783,7 +1818,17 @@ async function maybeSelectProductFact({ customerMessage, product, businessAccoun
         })
       : "";
     const safeGeneratedReply = sanitizeProductKnowledgeReply(generatedReply);
-    if (fact.kind === "image_chunk" && !safeGeneratedReply) return null;
+    if (fact.kind === "image_chunk" && !safeGeneratedReply) {
+      await recordProductFactRagDiagnostic("generated_reply_empty", {
+        product,
+        customerMessage,
+        businessAccountId,
+        match,
+        fact,
+        retrieved,
+      });
+      return null;
+    }
     return {
       factId: fact.id,
       reply: safeGeneratedReply || fact.approved_reply,
@@ -1797,6 +1842,46 @@ async function maybeSelectProductFact({ customerMessage, product, businessAccoun
     await recordSystemError("product_fact_match", error, `Product: ${product.id}`);
     return null;
   }
+}
+
+async function recordProductFactRagDiagnostic(stage, {
+  product,
+  customerMessage = "",
+  businessAccountId = config.accountId,
+  records = [],
+  retrievedRecords = [],
+  rerankedRecords = [],
+  match = null,
+  fact = null,
+  retrieved = null,
+} = {}) {
+  const summarizeRecord = (record) => ({
+    id: record?.id || "",
+    category: record?.category || "",
+    title: record?.title || record?.label || "",
+    retrieval: record?.retrieval || "",
+    retrievalScore: Number.isFinite(record?.retrieval_score) ? record.retrieval_score : undefined,
+    rerankScore: Number.isFinite(record?.rerank_score) ? record.rerank_score : undefined,
+    rerankReason: record?.rerank_reason || "",
+  });
+  const details = {
+    stage,
+    productId: product?.id || "",
+    productName: product?.name || "",
+    customerMessage: String(customerMessage || "").slice(0, 500),
+    approvedFactCount: records.length || undefined,
+    retrieved: retrievedRecords.slice(0, 5).map(summarizeRecord),
+    reranked: rerankedRecords.slice(0, 5).map(summarizeRecord),
+    selected: match ? { factId: match.factId, reason: match.reason || "" } : undefined,
+    fact: fact ? summarizeRecord(fact) : undefined,
+    retrieval: retrieved ? summarizeRecord(retrieved) : undefined,
+  };
+  await recordSystemError(
+    "product_fact_rag",
+    new Error(`Product fact RAG ${stage}`),
+    JSON.stringify(details),
+    businessAccountId
+  );
 }
 
 function sanitizeProductKnowledgeReply(reply) {
