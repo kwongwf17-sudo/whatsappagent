@@ -167,11 +167,16 @@ Open `http://localhost:3000/admin/faq-library` to maintain approved FAQ replies:
 - `Product FAQ` applies only to the selected product, for example suction heads or product usage.
 - Add several example customer questions for each FAQ. When OpenAI is configured, the agent matches similar customer meaning to one approved FAQ ID and sends the stored approved reply exactly.
 
-For broader product documents or SOP answers that are not in the approved FAQ library, use OpenAI file search:
+For approved knowledge fallback, use OpenAI file search. The vector store must contain only generated customer-safe knowledge:
 
-1. Put product info, FAQ, and SOP documents in `whatsapp_agent/knowledge/` for single-team use, or `whatsapp_agent/knowledge/TEAM_ID/` for multi-team use.
-2. Add `OPENAI_API_KEY` to `whatsapp_agent/.env`.
-3. Upload the knowledge base:
+- `general-faq.md` from `data/general_faqs.json`
+- `product-faq.md` from `products[].approved_faqs`
+- `product-image-knowledge.md` from `products[].extracted_knowledge.approvedImages`
+
+Do not upload SOP documents, sales reply scripts, reply flows, or old static `knowledge/` files as RAG sources.
+
+1. Add `OPENAI_API_KEY` to `whatsapp_agent/.env`.
+2. Upload the generated vector-store knowledge:
 
 ```powershell
 npm run whatsapp:ingest
@@ -180,10 +185,12 @@ npm run whatsapp:ingest
 For a specific team:
 
 ```powershell
-node ingest_knowledge.mjs --account-id TEAM_ID --knowledge-dir knowledge/TEAM_ID
+node ingest_knowledge.mjs --account-id TEAM_ID
 ```
 
-4. For single-team use, put the printed `OPENAI_VECTOR_STORE_ID` into `whatsapp_agent/.env`. For multi-team use, the script saves the vector store ID into Super Admin Team Settings for that team.
+By default, ingestion removes old vector-store file attachments first, then uploads the three generated files. Use `--dry-run` to inspect the generated files without calling OpenAI. Use `--append` only when you intentionally want to keep existing vector-store files.
+
+3. For single-team use, put the printed `OPENAI_VECTOR_STORE_ID` into `whatsapp_agent/.env`. For multi-team use, the script saves the vector store ID into Super Admin Team Settings for that team.
 
 ## WhatsApp Cloud API Setup
 

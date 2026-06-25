@@ -77,10 +77,10 @@ assets/<account-id>/<product-id>/<filename>
 For team-specific OpenAI knowledge ingestion:
 
 ```powershell
-node ingest_knowledge.mjs --account-id TEAM_ID --knowledge-dir knowledge/TEAM_ID
+node ingest_knowledge.mjs --account-id TEAM_ID
 ```
 
-The script creates or reuses that team's vector store and saves the `openaiVectorStoreId` back to Super Admin Team Settings.
+The script generates vector-store files from that team's approved live content only: general FAQ, approved product FAQ, and approved extracted product image knowledge. It creates or reuses that team's vector store, removes old vector-store file attachments by default, uploads the generated files, and saves the `openaiVectorStoreId` back to Super Admin Team Settings.
 
 ## Tenant Boundaries Added
 

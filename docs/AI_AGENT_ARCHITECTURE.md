@@ -124,6 +124,16 @@ Each approved image chunk can contain:
 
 Image knowledge is product-scoped. A P08 chat can only retrieve P08 approved image chunks. It cannot retrieve Blackhead Remover chunks.
 
+### OpenAI Vector Store Knowledge
+
+The OpenAI vector store is generated from approved live data only:
+
+- `general-faq.md` from `data/general_faqs.json`
+- `product-faq.md` from `data/product_catalog.json -> products[].approved_faqs`
+- `product-image-knowledge.md` from `data/product_catalog.json -> products[].extracted_knowledge.approvedImages`
+
+It must not contain sales replies, SOPs, reply flows, or old static markdown files from `knowledge/`.
+
 ### Sales Replies
 
 Stored independently in:
@@ -148,10 +158,10 @@ For product-specific questions:
 ```text
 Customer question
   -> Active product already resolved
-  -> Retrieve only active product approved image chunks
-  -> Search English extracted text + Brunei-Malay stored wording
-  -> OpenAI selects the best product chunk
-  -> OpenAI rewrites the retrieved chunk into a customer-facing WhatsApp reply
+  -> Try exact/local approved FAQ and sales reply matching first
+  -> If local knowledge cannot answer, use OpenAI file-search RAG
+  -> Retrieve only similar chunks from generated vector-store knowledge
+  -> OpenAI rewrites the retrieved approved chunk into a customer-facing WhatsApp reply
   -> If no direct chunk exists, handoff to human
 ```
 
