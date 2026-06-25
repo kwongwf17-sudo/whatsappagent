@@ -7,11 +7,11 @@ This document explains the current AI agent process flow, knowledge base structu
 - `server.mjs`
   - HTTP server, WhatsApp webhook, admin dashboard routes, demo routes, manual reply, handoff, product image ingestion, and orchestration.
 - `lib/conversation.mjs`
-  - Core conversation decision engine: active product resolution, FAQ matching, sales replies, product knowledge matching, order detection, and handoff.
+  - Core conversation decision engine: active product resolution, local FAQ matching, local sales replies, order detection, vector-store RAG result handling, and handoff.
 - `lib/retrieval.mjs`
-  - Retrieval engine for approved FAQs, sales replies, and product image knowledge. Uses embeddings when available, with token fallback.
+  - Legacy/local retrieval helpers. Not part of the active customer answer flow.
 - `lib/openai.mjs`
-  - OpenAI calls and prompts for image extraction, FAQ matching, sales reply matching, product knowledge selection, and customer-facing answer rewriting.
+  - OpenAI calls and prompts for vector-store RAG, image extraction, FAQ matching, sales reply matching, complaint detection, and order-status detection.
 - `data/product_catalog.json`
   - Product catalog and product-scoped knowledge: products, opening flow, product FAQs, product sales replies, order options, and extracted image knowledge.
 - `lib/store.mjs`
@@ -27,13 +27,13 @@ Customer WhatsApp message
   -> Handle fixed opening flow if first product/ad message
   -> Handle opt-out, complaint, or order-status guards
   -> Search approved local FAQ
-  -> Search approved product image knowledge
-  -> Search approved sales replies
+  -> Search approved local sales replies
   -> Detect order/order form details
-  -> If no approved answer, handoff to human
+  -> If no local answer, use one OpenAI vector-store RAG fallback
+  -> If no direct vector-store answer, handoff to human
 ```
 
-Global OpenAI/vector-store RAG is not used for chat answers anymore. General/business FAQs are local-only.
+The active answer flow is: local approved FAQ/sales first, then one OpenAI vector-store RAG fallback, then human handoff.
 
 ## Active Product Resolution
 
@@ -81,7 +81,7 @@ Used only for business-level questions such as:
 - stock arrival
 - pickup/self-collect, if a local FAQ exists
 
-General FAQ is local-only. If no local FAQ matches, the agent hands off.
+General FAQ is checked locally first. If no local FAQ matches, the single OpenAI vector-store RAG fallback can answer from embedded approved general FAQ.
 
 ### Product FAQ
 
@@ -102,7 +102,7 @@ Used only for the active product. Product FAQ is best for stable, approved answe
 - result timing
 - product-specific policies
 
-Product FAQ does not use global OpenAI RAG. The system may use OpenAI only to select the best approved FAQ record from the active product's local FAQ list. The customer receives the saved approved reply.
+Product FAQ is checked locally first. If no local product FAQ matches, the single OpenAI vector-store RAG fallback can answer from embedded approved product FAQ for the active product.
 
 ### Product Image Knowledge
 
@@ -151,25 +151,25 @@ Each sales reply has a scope:
 
 Sales replies are no longer stored under `product_catalog.json`. The product catalog should describe products and product assets, not become a mixed sales-reply database.
 
-## Product Knowledge Retrieval Flow
+## Customer Answer Flow
 
-For product-specific questions:
+For customer questions after opening/order/complaint guards:
 
 ```text
 Customer question
   -> Active product already resolved
-  -> Try exact/local approved FAQ and sales reply matching first
-  -> If local knowledge cannot answer, use OpenAI file-search RAG
-  -> Retrieve only similar chunks from generated vector-store knowledge
-  -> OpenAI rewrites the retrieved approved chunk into a customer-facing WhatsApp reply
-  -> If no direct chunk exists, handoff to human
+  -> Try local approved FAQ
+  -> Try local approved sales replies
+  -> If local approved content cannot answer, call one OpenAI file-search RAG fallback
+  -> RAG searches generated vector-store knowledge only
+  -> If no direct approved answer exists, handoff to human
 ```
 
-The agent must not send raw image summaries to customers.
+The agent must not send raw image summaries, SOP notes, sales scripts, or unapproved content to customers.
 
 OpenAI is instructed to:
 
-- use only the retrieved approved product knowledge
+- use only retrieved approved embedded knowledge
 - rephrase into a natural customer-facing reply
 - avoid internal words like `image`, `poster`, `chunk`, `visible text`, `extracted`
 - reply in Malay/Brunei style if the customer writes Malay
@@ -177,7 +177,7 @@ OpenAI is instructed to:
 
 ## Brunei-Malay Knowledge Support
 
-When product images are extracted, the system now stores Brunei-Malay customer wording together with the original English knowledge.
+When product images are extracted, the system stores Brunei-Malay wording together with the original English knowledge.
 
 Example English image content:
 
@@ -185,7 +185,7 @@ Example English image content:
 SOFTEN SEBUM | CLEAR PORES | BLACKHEAD EXTRACTION | GENTLE FORMULA
 ```
 
-Stored Brunei-Malay search wording:
+Stored Brunei-Malay wording must only translate or lightly paraphrase the visible/extracted image meaning:
 
 ```text
 apa fungsi produk ani
@@ -206,24 +206,11 @@ Sesuai untuk kulit sensitif kah?
 
 retrieve the correct English image chunk.
 
-## General FAQ Flow
-
-For business/general questions:
-
-```text
-Customer asks delivery/location/payment/COD/etc.
-  -> Search local General FAQ
-  -> Search local approved FAQ semantic match
-  -> If no local answer, handoff
-```
-
-There is no global OpenAI RAG fallback for business/general FAQ.
-
 ## Handoff Flow
 
 The agent hands off when:
 
-- no approved FAQ/product knowledge/sales reply matches
+- no local approved FAQ/sales reply or vector-store RAG answer matches
 - the question asks for missing facts
 - the customer complains
 - the message is risky or requires human judgment
@@ -315,9 +302,9 @@ For production WhatsApp Business API usage:
 ## Current Safety Rules
 
 - Product-specific questions cannot use other products' knowledge.
-- Global OpenAI RAG is not used for chat answers.
-- General FAQ is local-only.
-- Product image chunks are active-product-only.
+- OpenAI RAG is a single vector-store fallback after local approved FAQ/sales replies.
+- The vector store contains only generated general FAQ, approved product FAQ, and approved product image knowledge.
+- Product image chunks remain product-scoped inside the vector-store knowledge.
 - Raw image summaries should not be sent to customers.
 - Missing knowledge leads to handoff, not guessing.
 - Manual human answers can become approved local FAQ for future use.

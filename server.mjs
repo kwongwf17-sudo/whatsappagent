@@ -6,7 +6,6 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   buildConversationPlan,
-  approvedProductFactRecordsForProduct,
   classifyFaqSalesPromptResponse,
   findApprovedFaqLocalMatch,
   findProduct,
@@ -19,19 +18,11 @@ import {
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
-  createEmbeddings,
   createCustomerServiceResponse,
-  createProductImageVectorStoreReply,
-  createProductFactReply,
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
-  rerankProductFacts,
-  selectProductFact,
 } from "./lib/openai.mjs";
-import {
-  retrieveProductFactRecords,
-} from "./lib/retrieval.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
 import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
@@ -1451,7 +1442,6 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
       source: messageSource,
       faqLibrary: teamFaqLibrary,
       salesReplyLibrary: teamSalesReplyLibrary,
-      productFactMatch: null,
       approvedFaqMatch: null,
       salesReplyMatch: null,
       ragAnswer: null,
@@ -1640,11 +1630,8 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     ? null
     : findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary });
   const approvedFaqMatch = null;
-  const productFactMatch = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
-    ? null
-    : await maybeSelectProductFact({ customerMessage: text, product, businessAccountId });
   const salesReplyMatch = null;
-  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply || productFactMatch
+  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
     ? null
     : await maybeCreateApprovedKnowledgeRagAnswer({
         customerMessage: text,
@@ -1665,7 +1652,6 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     source: messageSource,
     faqLibrary: teamFaqLibrary,
     salesReplyLibrary: teamSalesReplyLibrary,
-    productFactMatch,
     approvedFaqMatch,
     salesReplyMatch,
     ragAnswer,
@@ -1726,198 +1712,6 @@ async function maybeDetectComplaintIntent(customerMessage) {
   }
 }
 
-async function maybeSelectProductFact({ customerMessage, product, businessAccountId = config.accountId }) {
-  if (!config.openaiApiKey) {
-    await recordProductFactRagDiagnostic("missing_openai_key", { product, customerMessage, businessAccountId });
-    return null;
-  }
-  if (isBusinessOrLogisticsQuestion(customerMessage)) return null;
-  if (isUsageDurationQuestion(customerMessage)) return null;
-  if (isProductOriginQuestion(customerMessage)) return null;
-  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
-  if (vectorStoreId) {
-    try {
-      const answer = await createProductImageVectorStoreReply({
-        apiKey: config.openaiApiKey,
-        model: config.openaiModel,
-        vectorStoreId,
-        customerMessage,
-        productName: product.name,
-        productId: product.id,
-        supportLanguage: config.supportLanguage,
-      });
-      const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
-      if (answer && !answer.handoffRequired && safeReply) {
-        return {
-          factId: `vector_store:${product.id}`,
-          reply: safeReply,
-          reason: "Answered from product image vector store.",
-          retrieval: "openai_file_search",
-          retrievalScore: 0,
-          rerankScore: 0,
-          rerankReason: answer.matchedProduct || "",
-        };
-      }
-      await recordProductFactRagDiagnostic("vector_store_no_answer", {
-        product,
-        customerMessage,
-        businessAccountId,
-        vectorStoreId,
-        handoffReason: answer?.handoffReason || "",
-        matchedProduct: answer?.matchedProduct || "",
-      });
-      return null;
-    } catch (error) {
-      await recordSystemError("product_fact_vector_store", error, `Product: ${product.id}`, businessAccountId);
-      return null;
-    }
-  }
-  const records = approvedProductFactRecordsForProduct(product);
-  if (!records.length) {
-    await recordProductFactRagDiagnostic("no_approved_product_facts", { product, customerMessage, businessAccountId });
-    return null;
-  }
-  try {
-    const retrievedRecords = await retrieveProductFactRecords({
-      records,
-      customerMessage,
-      productName: product.name,
-      embedTexts: embedKnowledgeTexts,
-      topK: 20,
-    });
-    if (!retrievedRecords.length) {
-      await recordProductFactRagDiagnostic("retrieval_empty", { product, customerMessage, businessAccountId, records });
-      return null;
-    }
-    const rerankedRecords = await rerankProductFacts({
-      apiKey: config.openaiApiKey,
-      model: config.openaiModel,
-      customerMessage,
-      productName: product.name,
-      factRecords: retrievedRecords,
-      topK: 5,
-    });
-    if (!rerankedRecords.length) {
-      await recordProductFactRagDiagnostic("rerank_empty", {
-        product,
-        customerMessage,
-        businessAccountId,
-        retrievedRecords,
-      });
-      return null;
-    }
-    const match = await selectProductFact({
-      apiKey: config.openaiApiKey,
-      model: config.openaiModel,
-      customerMessage,
-      productName: product.name,
-      factRecords: rerankedRecords,
-    });
-    if (!match) {
-      await recordProductFactRagDiagnostic("select_no_match", {
-        product,
-        customerMessage,
-        businessAccountId,
-        retrievedRecords,
-        rerankedRecords,
-      });
-      return null;
-    }
-    const fact = records.find((item) => item.id === match.factId);
-    if (!fact) {
-      await recordProductFactRagDiagnostic("selected_fact_missing", {
-        product,
-        customerMessage,
-        businessAccountId,
-        match,
-        rerankedRecords,
-      });
-      return null;
-    }
-    const retrieved = rerankedRecords.find((item) => item.id === fact.id) ||
-      retrievedRecords.find((item) => item.id === fact.id);
-    const generatedReply = fact.kind === "image_chunk"
-      ? await createProductFactReply({
-          apiKey: config.openaiApiKey,
-          model: config.openaiModel,
-          customerMessage,
-          productName: product.name,
-          factRecord: fact,
-        })
-      : "";
-    const safeGeneratedReply = sanitizeProductKnowledgeReply(generatedReply);
-    if (fact.kind === "image_chunk" && !safeGeneratedReply) {
-      await recordProductFactRagDiagnostic("generated_reply_empty", {
-        product,
-        customerMessage,
-        businessAccountId,
-        match,
-        fact,
-        retrieved,
-      });
-      return null;
-    }
-    return {
-      factId: fact.id,
-      reply: safeGeneratedReply || fact.approved_reply,
-      reason: match.reason,
-      retrieval: retrieved?.retrieval || "",
-      retrievalScore: retrieved?.retrieval_score || 0,
-      rerankScore: retrieved?.rerank_score || 0,
-      rerankReason: retrieved?.rerank_reason || "",
-    };
-  } catch (error) {
-    await recordSystemError("product_fact_match", error, `Product: ${product.id}`);
-    return null;
-  }
-}
-
-async function recordProductFactRagDiagnostic(stage, {
-  product,
-  customerMessage = "",
-  businessAccountId = config.accountId,
-  records = [],
-  retrievedRecords = [],
-  rerankedRecords = [],
-  match = null,
-  fact = null,
-  retrieved = null,
-  vectorStoreId = "",
-  handoffReason = "",
-  matchedProduct = "",
-} = {}) {
-  const summarizeRecord = (record) => ({
-    id: record?.id || "",
-    category: record?.category || "",
-    title: record?.title || record?.label || "",
-    retrieval: record?.retrieval || "",
-    retrievalScore: Number.isFinite(record?.retrieval_score) ? record.retrieval_score : undefined,
-    rerankScore: Number.isFinite(record?.rerank_score) ? record.rerank_score : undefined,
-    rerankReason: record?.rerank_reason || "",
-  });
-  const details = {
-    stage,
-    productId: product?.id || "",
-    productName: product?.name || "",
-    customerMessage: String(customerMessage || "").slice(0, 500),
-    vectorStoreId: vectorStoreId || undefined,
-    handoffReason: handoffReason || undefined,
-    matchedProduct: matchedProduct || undefined,
-    approvedFactCount: records.length || undefined,
-    retrieved: retrievedRecords.slice(0, 5).map(summarizeRecord),
-    reranked: rerankedRecords.slice(0, 5).map(summarizeRecord),
-    selected: match ? { factId: match.factId, reason: match.reason || "" } : undefined,
-    fact: fact ? summarizeRecord(fact) : undefined,
-    retrieval: retrieved ? summarizeRecord(retrieved) : undefined,
-  };
-  await recordSystemError(
-    "product_fact_rag",
-    new Error(`Product fact RAG ${stage}`),
-    JSON.stringify(details),
-    businessAccountId
-  );
-}
-
 async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
   if (!config.openaiApiKey) return null;
   const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
@@ -1972,30 +1766,6 @@ function sanitizeProductKnowledgeReply(reply) {
     .filter((sentence) => !/\bblackheads?\s*out\s*in\s*5\s*minutes?\b/i.test(sentence))
     .join(" ")
     .trim();
-}
-
-function isBusinessOrLogisticsQuestion(text) {
-  const normalized = String(text || "").toLowerCase();
-  return /\b(area|location|lokasi|alamat|warehouse|kedai|store|shop|delivery|deliver|hantar|perhantaran|penghantaran|shipping|cod|bayar|payment|caj|charge|fee)\b/i.test(normalized);
-}
-
-function isUsageDurationQuestion(text) {
-  const normalized = String(text || "").toLowerCase();
-  return /\b(berapa\s*lama|how\s*long|guna\s*berapa\s*lama|tahan\s*berapa\s*lama|last\s*how\s*long|one\s*bottle|satu\s*botol)\b/i.test(normalized) &&
-    /\b(guna|pakai|use|last|lama|tahan|bottle|botol)\b/i.test(normalized);
-}
-
-function isProductOriginQuestion(text) {
-  const normalized = String(text || "").toLowerCase();
-  return /\b(from\s*where|where\s*(is|are|this|the)?.*(product|barang)|product\s*(from|made)|made\s*in|asal\s*(mana|dari)|dari\s*mana|barang\s*mana|produk\s*(dari|asal))\b/i.test(normalized);
-}
-
-async function embedKnowledgeTexts(texts) {
-  return createEmbeddings({
-    apiKey: config.openaiApiKey,
-    model: config.embeddingModel,
-    input: texts,
-  });
 }
 
 function orderSubmittedCustomerMessages() {
