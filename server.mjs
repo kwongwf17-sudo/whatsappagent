@@ -7057,9 +7057,11 @@ function adminDashboardHtml() {
         { label: 'Status', key: 'statusDisplay', render: r => pill(r.statusDisplay) },
         { label: 'Action', key: 'id', render: r => r.status === 'pending_admin_order'
           ? '<button type="button" data-reached-warehouse="' + esc(r.id) + '">Reached Warehouse</button>'
-          : '<span class="muted">-</span>' }
+          : '<span class="muted">-</span>' },
+        { label: 'Delete', key: 'customerId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.customerId) + '">Delete</button>' }
       ]);
       bindReachedWarehouseButtons();
+      bindDashboardCustomerDeleteButtons();
     }
 
     function renderOrders() {
@@ -7566,12 +7568,17 @@ function adminChatPageHtml() {
     }
     async function deleteConversation() {
       if (!activeCustomerId) return;
-      const ok = confirm("Delete all chat messages for " + activeCustomerId + "? Customer profile and orders will stay.");
+      const deletedCustomerId = activeCustomerId;
+      const ok = confirm("Delete chat with " + deletedCustomerId + "? This moves the customer to Deleted and removes them from active lists.");
       if (!ok) return;
-      state.textContent = "Deleting chat for " + activeCustomerId + "...";
+      state.textContent = "Deleting chat for " + deletedCustomerId + "...";
       try {
-        const result = await request("/admin/chat/delete-conversation", { customerId: activeCustomerId });
-        state.textContent = "Deleted " + result.deleted + " message(s).";
+        await request("/admin/customer/delete", {
+          customerId: deletedCustomerId,
+          reason: "Manual deletion from chat inbox"
+        });
+        activeCustomerId = "";
+        state.textContent = "Deleted chat for " + deletedCustomerId + ".";
         await load();
       } catch (error) {
         state.textContent = error.message;
