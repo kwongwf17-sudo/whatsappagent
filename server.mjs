@@ -4707,6 +4707,7 @@ function productFlowEditorData(product, options = {}) {
     name: product.name,
     shoppingLink: String(product.shopping_link || ""),
     orderOptions: orderOptionsForEditor(product),
+    approvedFaqs: approvedProductFaqsForEditor(product),
     extractedKnowledge: productKnowledgeForEditor(product),
     ready: options.skipReady ? false : product.openingFlowEnabled !== false && isProductFlowComplete(product),
     ...Object.fromEntries(
@@ -4718,6 +4719,25 @@ function productFlowEditorData(product, options = {}) {
       url: imageUrlForSlot(slot),
     })),
   };
+}
+
+function approvedProductFaqsForEditor(product) {
+  return (product.approved_faqs || [])
+    .filter((faq) => faq && faq.active !== false)
+    .map((faq) => ({
+      id: String(faq.id || ""),
+      topic: String(faq.topic || faq.brunei_malay_topic || ""),
+      exampleQuestions: [
+        ...(Array.isArray(faq.example_questions) ? faq.example_questions : []),
+        ...(Array.isArray(faq.customer_messages) ? faq.customer_messages : []),
+      ].map((item) => String(item || "").trim()).filter(Boolean),
+      bruneiMalayExampleQuestions: (Array.isArray(faq.brunei_malay_example_questions) ? faq.brunei_malay_example_questions : [])
+        .map((item) => String(item || "").trim())
+        .filter(Boolean),
+      approvedReply: String(faq.approved_reply || faq.answer || ""),
+      bruneiMalayApprovedReply: String(faq.brunei_malay_approved_reply || ""),
+      bruneiMalaySearchText: String(faq.brunei_malay_search_text || ""),
+    }));
 }
 
 function productKnowledgeForEditor(product) {
@@ -8305,6 +8325,7 @@ function productFlowPageHtml() {
     .knowledge-list { display: grid; gap: 8px; }
     .knowledge-item { padding: 10px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
     .knowledge-item strong { display: block; margin-bottom: 4px; }
+    .knowledge-item p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
     .knowledge-meta { margin-top: 5px; color: var(--muted); font-size: 12px; }
     .knowledge-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     .knowledge-actions button { padding: 6px 9px; font-size: 12px; }
@@ -8388,6 +8409,15 @@ function productFlowPageHtml() {
             <button id="add-order-option" type="button">Add Option</button>
           </div>
           <div class="option-list" id="order-options"></div>
+        </div>
+        <div class="knowledge-panel">
+          <div class="knowledge-head">
+            <div>
+              <h3>Approved Product FAQ</h3>
+              <div class="knowledge-note">These product FAQs are embedded into the team vector store when you sync knowledge.</div>
+            </div>
+          </div>
+          <div class="knowledge-list" id="approved-product-faqs"></div>
         </div>
         <div class="knowledge-panel">
           <div class="knowledge-head">
@@ -8539,6 +8569,25 @@ function productFlowPageHtml() {
       });
     }
 
+    function faqItemHtml(faq) {
+      const questions = [
+        ...(faq.exampleQuestions || []),
+        ...(faq.bruneiMalayExampleQuestions || [])
+      ].filter(Boolean).join("\\n");
+      return '<div class="knowledge-item">' +
+        '<strong>' + esc(faq.topic || faq.id || "Approved product FAQ") + '</strong>' +
+        (questions ? '<p><b>Questions:</b>\\n' + esc(questions) + '</p>' : '') +
+        (faq.approvedReply ? '<p><b>Approved answer:</b>\\n' + esc(faq.approvedReply) + '</p>' : '') +
+        (faq.bruneiMalayApprovedReply ? '<p><b>Brunei-Malay answer:</b>\\n' + esc(faq.bruneiMalayApprovedReply) + '</p>' : '') +
+        (faq.bruneiMalaySearchText ? '<div class="knowledge-meta">Search text: ' + esc(faq.bruneiMalaySearchText) + '</div>' : '') +
+      '</div>';
+    }
+
+    function renderApprovedFaqs() {
+      const faqs = selectedProduct.approvedFaqs || [];
+      document.querySelector("#approved-product-faqs").innerHTML = faqs.map(faqItemHtml).join("") || '<div class="knowledge-empty">No approved product FAQ for this product yet. Add product-scoped FAQ in Reply Library.</div>';
+    }
+
     function knowledgeItemHtml(fact, status) {
       const category = fact.category ? String(fact.category).replace(/_/g, " ") : "";
       const safeText = fact.customer_safe === false ? "needs review" : "";
@@ -8684,6 +8733,7 @@ function productFlowPageHtml() {
         document.querySelector("#" + field).value = selectedProduct[field] || "";
       });
       renderOrderOptions();
+      renderApprovedFaqs();
       renderKnowledge();
       renderImages();
       renderReadiness();
