@@ -13,6 +13,7 @@ import {
   isGeneralBusinessQuestion,
   isProductNameMessage,
   findSalesReplyExactMatch,
+  salesReplyRecordsForProduct,
   formatStockArrivalMessage,
   textMessage,
   usesFixedOpeningFlow,
@@ -23,6 +24,7 @@ import {
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
+  selectSalesReplyFromVectorStore,
 } from "./lib/openai.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
@@ -1783,12 +1785,28 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   const exactSalesReply = fixedOpeningFlow || faqSalesResponse
     ? null
     : findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary });
-  const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || exactSalesReply
+  const vectorSalesReply = fixedOpeningFlow || faqSalesResponse || exactSalesReply
+    ? null
+    : await maybeSelectApprovedSalesReply({
+        customerMessage: text,
+        product,
+        catalog: teamCatalog,
+        salesReplyLibrary: teamSalesReplyLibrary,
+        businessAccountId,
+      });
+  const selectedSalesReply = exactSalesReply || vectorSalesReply;
+  const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || selectedSalesReply
     ? null
     : findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext });
   const approvedFaqMatch = null;
-  const salesReplyMatch = null;
-  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
+  const salesReplyMatch = selectedSalesReply
+    ? {
+        salesReplyId: selectedSalesReply.id,
+        approvedReply: selectedSalesReply.approved_reply,
+        followupPrompt: selectedSalesReply.followup_prompt || "",
+      }
+    : null;
+  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || selectedSalesReply
     ? null
     : await maybeCreateApprovedKnowledgeRagAnswer({
         customerMessage: text,
@@ -1876,6 +1894,37 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
     result: id || "",
     businessAccountId,
   });
+}
+
+async function maybeSelectApprovedSalesReply({
+  customerMessage,
+  product,
+  catalog: activeCatalog,
+  salesReplyLibrary: activeSalesReplyLibrary,
+  businessAccountId = config.accountId,
+}) {
+  if (!config.openaiApiKey) return null;
+  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
+  if (!vectorStoreId) return null;
+  try {
+    const selected = await selectSalesReplyFromVectorStore({
+      apiKey: config.openaiApiKey,
+      model: config.openaiModel,
+      vectorStoreId,
+      customerMessage,
+      productName: product.name,
+    });
+    if (!selected?.salesReplyId) return null;
+    const records = salesReplyRecordsForProduct(activeCatalog, product, {
+      salesReplyLibrary: activeSalesReplyLibrary,
+    });
+    const record = records.find((reply) => reply.id === selected.salesReplyId && reply.active !== false);
+    if (!record) return null;
+    return record;
+  } catch (error) {
+    await recordSystemError("sales_reply_vector_selection", error, `Customer message: ${customerMessage}`, businessAccountId);
+    return null;
+  }
 }
 
 async function maybeDetectOrderStatusIntent(customerMessage) {
@@ -9245,12 +9294,12 @@ function productFlowPageHtml() {
 
     async function syncVectorStore() {
       const button = document.querySelector("#sync-vector-store");
-      if (!confirm("Sync all approved FAQ and product image knowledge for this team to OpenAI vector store? This replaces the old files attached to this team vector store.")) {
+      if (!confirm("Sync all approved FAQ, product image knowledge, and sales replies for this team to OpenAI vector store? This replaces the old files attached to this team vector store.")) {
         return;
       }
       button.disabled = true;
       document.querySelector("#vector-sync-status").textContent = "Syncing team knowledge...";
-      status("Syncing approved knowledge to OpenAI vector store...");
+      status("Syncing approved FAQ, product knowledge, and sales replies to OpenAI vector store...");
       try {
         const response = await fetch("/admin/product-flow/knowledge/sync-vector-store", {
           method: "POST",
