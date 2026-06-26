@@ -9294,11 +9294,11 @@ function productFlowPageHtml() {
 
     async function syncVectorStore() {
       const button = document.querySelector("#sync-vector-store");
-      if (!confirm("Sync all approved FAQ, product image knowledge, and sales replies for this team to OpenAI vector store? This replaces the old files attached to this team vector store.")) {
+      if (!confirm("Sync all approved FAQ, product image knowledge, and sales replies for this team to OpenAI vector store? This creates a clean replacement vector store for the team.")) {
         return;
       }
       button.disabled = true;
-      document.querySelector("#vector-sync-status").textContent = "Syncing team knowledge...";
+      document.querySelector("#vector-sync-status").textContent = "Creating clean team vector store...";
       status("Syncing approved FAQ, product knowledge, and sales replies to OpenAI vector store...");
       try {
         const response = await fetch("/admin/product-flow/knowledge/sync-vector-store", {

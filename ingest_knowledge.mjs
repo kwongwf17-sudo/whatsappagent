@@ -6,6 +6,7 @@ import {
   attachFileToVectorStore,
   createVectorStore,
   deleteUploadedFile,
+  deleteVectorStore,
   deleteVectorStoreFile,
   getVectorStoreFile,
   listVectorStoreFiles,
@@ -58,9 +59,19 @@ const vectorStoreName = getEnv(
 const adminAccounts = teamAccountId && !dryRun ? await createAdminAccountStore() : null;
 const teamSettings = adminAccounts ? await adminAccounts.getTeamSettings(teamAccountId) : {};
 let vectorStoreId = dryRun ? "" : teamSettings.openaiVectorStoreId || process.env.OPENAI_VECTOR_STORE_ID;
+let previousVectorStoreId = "";
+const replaceTeamVectorStore = Boolean(teamAccountId && !manualKnowledgeDir && !appendMode);
 
 if (dryRun) {
   console.log("Dry run: skipping OpenAI vector store creation and upload.");
+} else if (replaceTeamVectorStore) {
+  previousVectorStoreId = vectorStoreId || "";
+  const vectorStore = await createVectorStore(apiKey, vectorStoreName);
+  vectorStoreId = vectorStore.id;
+  console.log(`Created vector store: ${vectorStoreId}`);
+  if (previousVectorStoreId) {
+    console.log(`Previous vector store: ${previousVectorStoreId}`);
+  }
 } else if (!vectorStoreId) {
   const vectorStore = await createVectorStore(apiKey, vectorStoreName);
   vectorStoreId = vectorStore.id;
@@ -102,7 +113,7 @@ try {
     process.exit(0);
   }
 
-  if (!manualKnowledgeDir && !appendMode) {
+  if (!manualKnowledgeDir && !appendMode && !replaceTeamVectorStore) {
     await clearVectorStore(apiKey, vectorStoreId);
   }
 
@@ -112,6 +123,16 @@ try {
     const attached = await attachFileToVectorStore(apiKey, vectorStoreId, file.id);
     await waitForVectorStoreFile(apiKey, vectorStoreId, file.id, attached.status);
     console.log(`Ready: ${path.basename(filePath)} (${file.id})`);
+  }
+
+  if (replaceTeamVectorStore) {
+    await adminAccounts.updateTeamSettings(teamAccountId, { openaiVectorStoreId: vectorStoreId });
+    console.log(`Saved vector store ID to team settings for ${teamAccountId}.`);
+    if (previousVectorStoreId && previousVectorStoreId !== vectorStoreId) {
+      await deleteVectorStore(apiKey, previousVectorStoreId)
+        .then(() => console.log(`Deleted previous vector store: ${previousVectorStoreId}`))
+        .catch((error) => console.log(`Previous vector store delete skipped: ${error.message}`));
+    }
   }
 
   console.log("Knowledge ingestion complete.");
