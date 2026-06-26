@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
 import { existsSync } from "node:fs";
@@ -170,6 +171,7 @@ const outboundQueues = new Map();
 let testCustomerGenerationActive = false;
 let simulatedOutboxBuffer = null;
 let followupRunPromise = null;
+const knowledgeSyncRuns = new Map();
 const followupPacingStartedAt = new Date();
 const webhookDiagnostics = {
   received: 0,
@@ -955,7 +957,39 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/admin/product-flow-data") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const content = await getTeamContent(adminSession.accountId);
-      return sendJson(res, 200, { products: content.catalog.products.map(productFlowEditorData) });
+      const settings = await adminAccounts.getTeamSettings(adminSession.accountId);
+      return sendJson(res, 200, {
+        products: content.catalog.products.map(productFlowEditorData),
+        vectorStoreId: settings.openaiVectorStoreId || config.vectorStoreId || "",
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/sync-vector-store") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      if (!config.openaiApiKey) return sendJson(res, 400, { error: "OPENAI_API_KEY is not configured." });
+      if (knowledgeSyncRuns.has(adminSession.accountId)) {
+        return sendJson(res, 409, { error: "Knowledge sync is already running for this team." });
+      }
+      const run = runTeamKnowledgeIngest(adminSession.accountId);
+      knowledgeSyncRuns.set(adminSession.accountId, run);
+      try {
+        const result = await run;
+        const settings = await adminAccounts.getTeamSettings(adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "vector_store_knowledge_synced",
+          result: settings.openaiVectorStoreId || config.vectorStoreId || result.vectorStoreId || "",
+        });
+        return sendJson(res, 200, {
+          ...result,
+          vectorStoreId: settings.openaiVectorStoreId || config.vectorStoreId || result.vectorStoreId || "",
+        });
+      } catch (error) {
+        await recordSystemError("vector_store_knowledge_sync", error, "", adminSession.accountId);
+        return sendJson(res, 500, { error: error.message || "Knowledge sync failed." });
+      } finally {
+        knowledgeSyncRuns.delete(adminSession.accountId);
+      }
     }
 
     if (req.method === "GET" && (url.pathname === "/admin/reply-library" || url.pathname === "/admin/faq-library")) {
@@ -4255,6 +4289,40 @@ async function webTransportHealthData() {
 async function vectorStoreIdForAccount(businessAccountId = config.accountId) {
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return settings.openaiVectorStoreId || config.vectorStoreId;
+}
+
+function runTeamKnowledgeIngest(accountId) {
+  const scriptPath = path.join(__dirname, "ingest_knowledge.mjs");
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [scriptPath, "--account-id", accountId],
+      {
+        cwd: __dirname,
+        env: process.env,
+        maxBuffer: 4 * 1024 * 1024,
+        timeout: 10 * 60 * 1000,
+      },
+      (error, stdout = "", stderr = "") => {
+        const output = `${stdout}\n${stderr}`.trim();
+        if (error) {
+          const message = output || error.message || "Knowledge ingestion failed.";
+          reject(new Error(message.slice(0, 2000)));
+          return;
+        }
+        const vectorStoreMatch = output.match(/(?:Using|Created) vector store:\s*(\S+)/);
+        const readyFiles = [...output.matchAll(/Ready:\s*([^(]+?)\s*\(/g)]
+          .map((match) => match[1].trim())
+          .filter(Boolean);
+        resolve({
+          status: "completed",
+          syncedAt: new Date().toISOString(),
+          vectorStoreId: vectorStoreMatch?.[1] || "",
+          files: readyFiles,
+        });
+      }
+    );
+  });
 }
 
 async function recordSystemError(scope, error, details = "", accountId = config.accountId) {
@@ -8278,6 +8346,8 @@ function productFlowPageHtml() {
       <div class="toolbar-tools">
         <span class="status-badge" id="flow-readiness">Setup</span>
         <button id="show-create-product" type="button">New Product</button>
+        <button id="sync-vector-store" type="button">Sync Knowledge to Vector Store</button>
+        <span id="vector-sync-status" class="knowledge-note"></span>
       </div>
     </div>
     <section id="create-product-panel" hidden>
@@ -8390,6 +8460,7 @@ function productFlowPageHtml() {
   <script>
     let products = [];
     let selectedProduct = null;
+    let vectorStoreId = "";
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
@@ -8623,6 +8694,10 @@ function productFlowPageHtml() {
       const response = await fetch("/admin/product-flow-data");
       const data = await response.json();
       products = data.products || [];
+      vectorStoreId = data.vectorStoreId || "";
+      document.querySelector("#vector-sync-status").textContent = vectorStoreId
+        ? "Vector store: " + vectorStoreId
+        : "No vector store synced yet";
       const select = document.querySelector("#product-select");
       select.innerHTML = products.map(product =>
         '<option value="' + esc(product.id) + '">' + esc(product.name + (product.ready ? "" : " (Setup)")) + '</option>'
@@ -8635,6 +8710,34 @@ function productFlowPageHtml() {
       } else {
         renderReadiness();
         status("No configured products");
+      }
+    }
+
+    async function syncVectorStore() {
+      const button = document.querySelector("#sync-vector-store");
+      if (!confirm("Sync all approved FAQ and product image knowledge for this team to OpenAI vector store? This replaces the old files attached to this team vector store.")) {
+        return;
+      }
+      button.disabled = true;
+      document.querySelector("#vector-sync-status").textContent = "Syncing team knowledge...";
+      status("Syncing approved knowledge to OpenAI vector store...");
+      try {
+        const response = await fetch("/admin/product-flow/knowledge/sync-vector-store", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          document.querySelector("#vector-sync-status").textContent = data.error || "Sync failed";
+          status(data.error || "Sync failed");
+          return;
+        }
+        vectorStoreId = data.vectorStoreId || vectorStoreId;
+        const files = data.files && data.files.length ? data.files.join(", ") : "knowledge files";
+        document.querySelector("#vector-sync-status").textContent = "Synced " + files + (vectorStoreId ? " to " + vectorStoreId : "");
+        status("Vector store knowledge synced");
+      } finally {
+        button.disabled = false;
       }
     }
 
@@ -8785,6 +8888,7 @@ function productFlowPageHtml() {
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
     document.querySelector("#extract-existing-images").addEventListener("click", extractExistingKnowledge);
     document.querySelector("#clean-pending-facts").addEventListener("click", cleanPendingFacts);
+    document.querySelector("#sync-vector-store").addEventListener("click", syncVectorStore);
     document.querySelector("#add-order-option").addEventListener("click", () => {
       if (!selectedProduct) return;
       selectedProduct.orderOptions = [
