@@ -1369,6 +1369,10 @@ if (!config.skipHttpServer && webTransportManager) {
     .then((accounts) => webTransportManager.start({
       accounts,
       onMessage: async (message) => {
+        if (message.source?.fromMe) {
+          await handleManualBusinessMessage(message);
+          return;
+        }
         await processInboundMessage(message);
       },
     }))
@@ -1831,6 +1835,40 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     handoffRequired: Boolean(plan.handoffRequired),
     handoffReason: plan.handoffReason || "",
   };
+}
+
+async function handleManualBusinessMessage({ id, from, text, source = {}, businessAccountId = config.accountId }) {
+  const body = String(text || "").trim();
+  if (!from || !body) return;
+  console.log(`Manual WhatsApp business message to ${from}: ${body}`);
+  const now = new Date().toISOString();
+  await store.getOrCreateCustomer(from, {
+    lastMessageAt: now,
+    businessAccountId,
+    source: {
+      transport: "web",
+      ...(source || {}),
+      manualBusinessMessage: true,
+    },
+  });
+  await store.appendOutbox({
+    id,
+    direction: "outbound",
+    from: `business_admin:${businessAccountId}`,
+    to: from,
+    businessAccountId,
+    channel: "business_admin",
+    type: "text",
+    body,
+    purpose: "manual_whatsapp_message",
+  });
+  await store.appendAuditLog({
+    actor: `business_admin:${businessAccountId}`,
+    action: "manual_whatsapp_message_recorded",
+    customerId: from,
+    result: id || "",
+    businessAccountId,
+  });
 }
 
 async function maybeDetectOrderStatusIntent(customerMessage) {
