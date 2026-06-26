@@ -105,6 +105,7 @@ const config = {
   followupActiveWindowMinutes: Number(getEnv("FOLLOWUP_ACTIVE_WINDOW_MINUTES", "10")),
   followupPauseWindowMinutes: Number(getEnv("FOLLOWUP_PAUSE_WINDOW_MINUTES", "5")),
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
+  openingFlowInitialDelayMs: Number(getEnv("OPENING_FLOW_INITIAL_DELAY_MS", "5000")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
@@ -1512,6 +1513,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
       handoffReason: "",
     }), businessAccountId);
     const outbound = clampMessages(plan.messages);
+    await delayBeforeNewCustomerOpeningFlow(customer, "product-name opening flow");
     await sendOutbound(from, outbound, { businessAccountId });
     return {
       customer: updatedCustomer,
@@ -1757,6 +1759,9 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   }
 
   const outbound = clampMessages(order ? orderSubmittedCustomerMessages() : plan.messages);
+  if (!order && fixedOpeningFlow) {
+    await delayBeforeNewCustomerOpeningFlow(customer, "fixed opening flow");
+  }
   await sendOutbound(from, outbound, { businessAccountId });
 
   return {
@@ -1871,6 +1876,14 @@ function templateMessage(name, languageCode = FOLLOWUP_TEMPLATE_LANGUAGE, compon
     languageCode,
     components,
   };
+}
+
+async function delayBeforeNewCustomerOpeningFlow(customer, reason = "opening flow") {
+  if (Number(customer?.inboundCount || 0) !== 1) return;
+  const delayMs = Math.max(0, Number(config.openingFlowInitialDelayMs) || 0);
+  if (!delayMs) return;
+  console.log(`Delaying ${reason} for new customer ${customer.id} by ${delayMs}ms`);
+  await wait(delayMs);
 }
 
 function randomFollowupDelayMs() {
