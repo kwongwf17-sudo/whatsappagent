@@ -2656,6 +2656,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       name: latestOrder.name || "",
       whatsappId: customer.id,
       product: productById.get(customer.productId)?.name || customer.productId || "",
+      skuCode: productById.get(customer.productId)?.sku_code || "",
       label: customer.label,
       labelDisplay: customer.labelDisplay,
       lastMessageAt: customer.lastMessageAt || "",
@@ -2737,6 +2738,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       phone: order.phone || "",
       address: order.address || "",
       product: order.productName || productById.get(order.productId)?.name || order.productId || "",
+      skuCode: productById.get(order.productId)?.sku_code || "",
       status: order.status || "",
       statusDisplay: orderStatusDisplay(order.status),
       statusUpdatedAt: order.statusUpdatedAt || order.updatedAt || "",
@@ -2753,6 +2755,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       customerId: order.customerId,
       businessAccountId: order.businessAccountId || "",
       product: order.productName || productById.get(order.productId)?.name || order.productId || "",
+      skuCode: productById.get(order.productId)?.sku_code || "",
       package: order.orderOptionName || order.packageName || order.orderOptionId || order.packageId || "",
       packagePrice: order.orderOptionPrice || order.packagePrice || "",
       addOnChoice: order.addOnChoice || "",
@@ -2772,6 +2775,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     deletedCustomers: deletedCustomers.map((customer) => ({
       id: customer.id,
       product: productById.get(customer.productId)?.name || customer.productId || "",
+      skuCode: productById.get(customer.productId)?.sku_code || "",
       label: customer.label,
       labelDisplay: customer.labelDisplay || "DELETE",
       firstSeenAt: customer.firstSeenAt || "",
@@ -4724,6 +4728,7 @@ function productFlowEditorData(product, options = {}) {
   return {
     id: product.id,
     name: product.name,
+    skuCode: String(product.sku_code || ""),
     shoppingLink: String(product.shopping_link || ""),
     orderOptions: orderOptionsForEditor(product),
     approvedFaqs: approvedProductFaqsForEditor(product),
@@ -4786,6 +4791,9 @@ function updateProductFlowText(product, body) {
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderOptions")) {
     product.order_options = normalizeOrderOptions(body.orderOptions);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "skuCode")) {
+    product.sku_code = normalizeSkuCode(body.skuCode);
   }
   product.shopping_link = normalizeShoppingLink(body.shoppingLink ?? product.shopping_link ?? "");
   updateProductFlowReadiness(product);
@@ -5140,6 +5148,7 @@ function createCatalogProduct(name) {
     id,
     name,
     aliases: [name.toLowerCase()],
+    sku_code: "",
     price: "",
     stock_status: "preorder",
     shopping_link: "",
@@ -5174,6 +5183,10 @@ function normalizeShoppingLink(value) {
   } catch {
     throw new Error("Shopping link must be a valid http or https URL.");
   }
+}
+
+function normalizeSkuCode(value) {
+  return String(value || "").trim().slice(0, 80);
 }
 
 function isProductFlowComplete(product) {
@@ -6312,7 +6325,7 @@ function adminDashboardHtml() {
       font-size: 13px;
       font-weight: 700;
     }
-    .filterbar input {
+    .filterbar input, .filterbar select {
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 7px 9px;
@@ -6416,6 +6429,9 @@ function adminDashboardHtml() {
     </div>
     <section id="customers" class="panel active">
       <h2>Customer List</h2>
+      <div class="filterbar">
+        <label for="customer-sku-filter">SKU <select id="customer-sku-filter"></select></label>
+      </div>
       <div class="subtabs" id="customer-label-tabs"></div>
       <div class="table-wrap"></div>
     </section>
@@ -6492,6 +6508,7 @@ function adminDashboardHtml() {
     };
     let dashboardData = null;
     let activeCustomerLabel = "ALL";
+    let activeCustomerSku = "ALL";
     let activeFollowupLabel = "ALL";
     let activeDashboardDate = localDateInput(new Date());
     let activeOrderCustomersDate = localDateInput(new Date());
@@ -6536,6 +6553,13 @@ function adminDashboardHtml() {
 
     function dashboardCustomers() {
       return rowsForDate(dashboardData ? dashboardData.customers : [], "firstSeenAt");
+    }
+
+    function skuFilteredCustomers() {
+      const customers = dashboardCustomers();
+      return activeCustomerSku === "ALL"
+        ? customers
+        : customers.filter(customer => (customer.skuCode || "") === activeCustomerSku);
     }
 
     function dashboardFollowups() {
@@ -6619,7 +6643,8 @@ function adminDashboardHtml() {
       ).join('');
       updateDashboardTabs(stats);
 
-      renderCustomerLabelTabs(dashboardCustomers());
+      renderCustomerSkuFilter();
+      renderCustomerLabelTabs(skuFilteredCustomers());
       renderCustomers();
       renderHandoff();
       renderComplaintSettings();
@@ -6633,6 +6658,7 @@ function adminDashboardHtml() {
       sections.deleted.innerHTML = table(dashboardDeletedCustomers(), [
         { label: 'Customer', key: 'id' },
         { label: 'Product', key: 'product' },
+        { label: 'SKU', key: 'skuCode' },
         { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
         { label: 'First Seen', key: 'firstSeenAt', render: r => fmtTime(r.firstSeenAt) },
         { label: 'Deleted At', key: 'deletedAt', render: r => fmtTime(r.deletedAt) },
@@ -6728,6 +6754,7 @@ function adminDashboardHtml() {
         { label: 'Order Time', key: 'orderTimestamp', render: r => fmtTime(r.orderTimestamp) },
         { label: 'Customer', key: 'customerId' },
         { label: 'Product', key: 'product' },
+        { label: 'SKU', key: 'skuCode' },
         { label: 'Order Option', key: 'package' },
         { label: 'Price', key: 'packagePrice' },
         { label: 'Qty', key: 'quantity' },
@@ -6868,20 +6895,31 @@ function adminDashboardHtml() {
       document.querySelectorAll("#customer-label-tabs .subtab").forEach(button => {
         button.addEventListener("click", () => {
           activeCustomerLabel = button.dataset.label;
-          renderCustomerLabelTabs(dashboardCustomers());
+          renderCustomerLabelTabs(skuFilteredCustomers());
           renderCustomers();
         });
       });
     }
 
-    function renderCustomers() {
+    function renderCustomerSkuFilter() {
       const customers = dashboardCustomers();
+      const skus = [...new Set(customers.map(customer => customer.skuCode || "").filter(Boolean))].sort();
+      if (activeCustomerSku !== "ALL" && !skus.includes(activeCustomerSku)) activeCustomerSku = "ALL";
+      document.querySelector("#customer-sku-filter").innerHTML =
+        '<option value="ALL">All SKU</option>' +
+        skus.map(sku => '<option value="' + esc(sku) + '">' + esc(sku) + '</option>').join("");
+      document.querySelector("#customer-sku-filter").value = activeCustomerSku;
+    }
+
+    function renderCustomers() {
+      const customers = skuFilteredCustomers();
       const filtered = activeCustomerLabel === "ALL"
         ? customers
         : customers.filter(customer => customer.labelDisplay === activeCustomerLabel);
       sections.customers.innerHTML = table(filtered, [
         { label: 'WhatsApp ID', key: 'whatsappId' },
         { label: 'Product', key: 'product' },
+        { label: 'SKU', key: 'skuCode' },
         { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
         { label: 'Status', key: 'status', render: r => pill(r.status) },
         { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
@@ -6960,6 +6998,12 @@ function adminDashboardHtml() {
     setupDateFilter("#handoff-date", "#handoff-all", () => activeHandoffDate, value => activeHandoffDate = value, renderHandoff);
     setupDateFilter("#order-customers-date", "#order-customers-all", () => activeOrderCustomersDate, value => activeOrderCustomersDate = value, renderOrderCustomers);
     setupDateFilter("#orders-date", "#orders-all", () => activeOrdersDate, value => activeOrdersDate = value, renderOrders);
+    document.querySelector("#customer-sku-filter").addEventListener("change", event => {
+      activeCustomerSku = event.target.value || "ALL";
+      activeCustomerLabel = "ALL";
+      renderCustomerLabelTabs(skuFilteredCustomers());
+      renderCustomers();
+    });
     function openDashboardTab(tabId) {
       document.querySelector("main").classList.toggle("profile-only", tabId === "profile");
       document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab.dataset.tab === tabId));
@@ -8412,6 +8456,13 @@ function productFlowPageHtml() {
       <form id="supply-form">
         <div class="steps">
           <div class="step">
+            <div class="number">SKU</div>
+            <div class="field">
+              <label for="skuCode">Product SKU Code</label>
+              <input id="skuCode" name="skuCode" placeholder="BR-BHR-001" />
+            </div>
+          </div>
+          <div class="step">
             <div class="number">URL</div>
             <div class="field">
               <label for="shoppingLink">Shopping Link for Order Admin</label>
@@ -8421,7 +8472,7 @@ function productFlowPageHtml() {
         </div>
         <div class="actions">
           <span id="supply-save-state"></span>
-          <button class="primary" id="save-supply" type="submit">Save Shopping Link</button>
+          <button class="primary" id="save-supply" type="submit">Save Supply Details</button>
         </div>
       </form>
     </section>
@@ -8902,6 +8953,7 @@ function productFlowPageHtml() {
       document.querySelector("#product-faq-form").hidden = true;
       document.querySelector("#product-faq-status").textContent = "";
       resetProductFaqForm();
+      document.querySelector("#skuCode").value = selectedProduct.skuCode || "";
       document.querySelector("#shoppingLink").value = selectedProduct.shoppingLink || "";
       ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
         document.querySelector("#" + field).value = selectedProduct[field] || "";
@@ -9011,7 +9063,11 @@ function productFlowPageHtml() {
       const button = document.querySelector("#save-flow");
       button.disabled = true;
       status("Saving...");
-      const body = { productId: selectedProduct.id, shoppingLink: selectedProduct.shoppingLink || "" };
+      const body = {
+        productId: selectedProduct.id,
+        skuCode: document.querySelector("#skuCode").value,
+        shoppingLink: selectedProduct.shoppingLink || ""
+      };
       ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
         body[field] = document.querySelector("#" + field).value;
       });
@@ -9050,6 +9106,7 @@ function productFlowPageHtml() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             productId: selectedProduct.id,
+            skuCode: document.querySelector("#skuCode").value,
             shoppingLink: document.querySelector("#shoppingLink").value
           })
         });
@@ -9062,7 +9119,7 @@ function productFlowPageHtml() {
         products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
         renderProduct();
         updateSelectedOptionLabel();
-        message.textContent = "Shopping link saved";
+        message.textContent = "Supply details saved";
       } finally {
         button.disabled = false;
       }
