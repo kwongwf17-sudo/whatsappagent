@@ -7138,8 +7138,30 @@ function adminDashboardHtml() {
         { label: 'Status', key: 'status', render: r => pill(r.status) },
         { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
         { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
-        { label: 'Inbound', key: 'inboundCount' }
+        { label: 'Delete', key: 'whatsappId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.whatsappId) + '">Delete</button>' }
       ]);
+      bindDashboardCustomerDeleteButtons();
+    }
+
+    function bindDashboardCustomerDeleteButtons() {
+      document.querySelectorAll("button[data-delete-dashboard-customer]").forEach(button => {
+        button.addEventListener("click", async () => {
+          const customerId = button.dataset.deleteDashboardCustomer;
+          if (!confirm("Delete customer " + customerId + "? This moves the customer to Deleted and removes them from active lists.")) return;
+          button.disabled = true;
+          button.textContent = "Deleting...";
+          try {
+            await request("/admin/customer/delete", {
+              customerId,
+              reason: "Manual deletion from dashboard customer list"
+            });
+            await loadDashboard();
+          } catch (error) {
+            button.disabled = false;
+            button.textContent = error.message;
+          }
+        });
+      });
     }
 
     function renderFollowupLabelTabs(followups) {
