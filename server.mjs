@@ -941,7 +941,14 @@ const server = http.createServer(async (req, res) => {
         });
         return sendJson(res, 200, { ok: true, customerId, learnedFaq });
       } catch (error) {
-        return sendJson(res, 502, { error: "Message was not sent. Check the failed-message queue." });
+        const detail = String(error.message || "Unknown send error").trim();
+        const failedId = error.failedMessageId || "";
+        return sendJson(res, 502, {
+          error: failedId
+            ? `Message was not sent: ${detail} (failed queue: ${failedId})`
+            : `Message was not sent: ${detail}`,
+          failedMessageId: failedId,
+        });
       }
     }
 
@@ -3564,13 +3571,15 @@ async function sendOutbound(to, messages, meta = {}) {
     await pending;
   } catch (error) {
     if (!skipFailureRecord) {
-      await operations.recordFailedMessage({
+      const failedMessage = await operations.recordFailedMessage({
         businessAccountId: safeMeta.businessAccountId || config.accountId,
         to,
         messages: error.unsentMessages || messages,
         meta: safeMeta,
         error: error.message,
       });
+      error.failedMessageId = failedMessage.id;
+      error.failedMessage = failedMessage;
     }
     await recordSystemError("outbound_message", error, `Recipient: ${to}`, safeMeta.businessAccountId || config.accountId);
     throw error;
