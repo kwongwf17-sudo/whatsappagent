@@ -8781,7 +8781,7 @@ function productFlowPageHtml() {
     </section>
     <section>
       <h2>WhatsApp Opening Flow</h2>
-      <form id="flow-form">
+      <form id="flow-form" novalidate>
         <div class="order-options-panel">
           <div class="order-options-head">
             <div>
@@ -9391,6 +9391,8 @@ function productFlowPageHtml() {
         renderReadiness();
         updateSelectedOptionLabel();
         status("Saved");
+      } catch (error) {
+        status(error.message || "Save failed");
       } finally {
         button.disabled = false;
       }
