@@ -4531,6 +4531,13 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
       suffix += 1;
     }
   }
+  const index = records.findIndex((faq) => faq.id === id);
+  const existing = index >= 0 ? records[index] : {};
+  const bruneiMalayExampleQuestions = "bruneiMalayExampleQuestions" in body
+    ? (Array.isArray(body.bruneiMalayExampleQuestions)
+        ? body.bruneiMalayExampleQuestions.map((question) => String(question).trim()).filter(Boolean)
+        : String(body.bruneiMalayExampleQuestions || "").split(/\r?\n/).map((question) => question.trim()).filter(Boolean))
+    : (existing.brunei_malay_example_questions || []);
   const saved = {
     id,
     topic,
@@ -4538,7 +4545,19 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
     approved_reply: approvedReply,
     active: body.active !== false,
   };
-  const index = records.findIndex((faq) => faq.id === id);
+  const bruneiMalayTopic = "bruneiMalayTopic" in body
+    ? String(body.bruneiMalayTopic || "").trim()
+    : String(existing.brunei_malay_topic || "");
+  const bruneiMalayApprovedReply = "bruneiMalayApprovedReply" in body
+    ? String(body.bruneiMalayApprovedReply || "").trim()
+    : String(existing.brunei_malay_approved_reply || "");
+  const bruneiMalaySearchText = "bruneiMalaySearchText" in body
+    ? String(body.bruneiMalaySearchText || "").trim()
+    : String(existing.brunei_malay_search_text || "");
+  if (bruneiMalayTopic) saved.brunei_malay_topic = bruneiMalayTopic;
+  if (bruneiMalayExampleQuestions.length) saved.brunei_malay_example_questions = bruneiMalayExampleQuestions;
+  if (bruneiMalayApprovedReply) saved.brunei_malay_approved_reply = bruneiMalayApprovedReply;
+  if (bruneiMalaySearchText) saved.brunei_malay_search_text = bruneiMalaySearchText;
   if (index >= 0) records[index] = saved;
   else records.push(saved);
   return { ...saved, scope, productId };
@@ -4727,6 +4746,7 @@ function approvedProductFaqsForEditor(product) {
     .map((faq) => ({
       id: String(faq.id || ""),
       topic: String(faq.topic || faq.brunei_malay_topic || ""),
+      bruneiMalayTopic: String(faq.brunei_malay_topic || ""),
       exampleQuestions: [
         ...(Array.isArray(faq.example_questions) ? faq.example_questions : []),
         ...(Array.isArray(faq.customer_messages) ? faq.customer_messages : []),
@@ -4737,6 +4757,7 @@ function approvedProductFaqsForEditor(product) {
       approvedReply: String(faq.approved_reply || faq.answer || ""),
       bruneiMalayApprovedReply: String(faq.brunei_malay_approved_reply || ""),
       bruneiMalaySearchText: String(faq.brunei_malay_search_text || ""),
+      active: faq.active !== false,
     }));
 }
 
@@ -8331,13 +8352,20 @@ function productFlowPageHtml() {
     .knowledge-actions button { padding: 6px 9px; font-size: 12px; }
     .knowledge-actions .danger { color: #9b1c12; border-color: #ffd1d1; background: #fff7f7; }
     .knowledge-empty { color: var(--muted); padding: 10px; border: 1px dashed #d2d2d7; border-radius: 8px; background: #fff; }
+    .editor { margin-top: 12px; padding: 12px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
+    .field.wide { grid-column: 1 / -1; }
+    .field input { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 12px; }
+    .editor-actions label { display: inline-flex; align-items: center; gap: 7px; margin-right: auto; font-size: 13px; font-weight: 700; }
+    .editor-actions input { width: auto; }
     .actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 14px; border-top: 1px solid #e5e5ea; background: var(--surface-soft); }
     #save-state { color: var(--muted); font-size: 13px; margin-right: auto; }
     @media (max-width: 680px) {
       main { padding: 14px; }
       .step { grid-template-columns: 1fr; }
       .order-options-head { align-items: stretch; flex-direction: column; }
-      .option-grid, .option-extra { grid-template-columns: 1fr; }
+      .option-grid, .option-extra, .fields { grid-template-columns: 1fr; }
       .knowledge-grid { grid-template-columns: 1fr; }
       .number { margin-bottom: -4px; }
       select { min-width: 0; max-width: 100%; }
@@ -8414,10 +8442,45 @@ function productFlowPageHtml() {
           <div class="knowledge-head">
             <div>
               <h3>Approved Product FAQ</h3>
-              <div class="knowledge-note">These product FAQs are embedded into the team vector store when you sync knowledge.</div>
+              <div class="knowledge-note">Create product-specific FAQ here, then sync knowledge to embed it into the team vector store.</div>
+            </div>
+            <div class="toolbar-tools">
+              <button id="new-product-faq" type="button">New Product FAQ</button>
+              <span id="product-faq-status" class="knowledge-note"></span>
             </div>
           </div>
           <div class="knowledge-list" id="approved-product-faqs"></div>
+          <div id="product-faq-form" class="editor" hidden>
+            <input id="product-faq-id" type="hidden" />
+            <div class="fields">
+              <label class="field wide" for="product-faq-topic">Topic
+                <input id="product-faq-topic" required />
+              </label>
+              <label class="field wide" for="product-faq-examples">Example Customer Questions
+                <textarea id="product-faq-examples" required></textarea>
+              </label>
+              <label class="field wide" for="product-faq-reply">Approved Reply
+                <textarea class="reply" id="product-faq-reply" required></textarea>
+              </label>
+              <label class="field wide" for="product-faq-bm-topic">Brunei-Malay Topic
+                <input id="product-faq-bm-topic" />
+              </label>
+              <label class="field wide" for="product-faq-bm-examples">Brunei-Malay Example Questions
+                <textarea id="product-faq-bm-examples"></textarea>
+              </label>
+              <label class="field wide" for="product-faq-bm-reply">Brunei-Malay Approved Reply
+                <textarea class="reply" id="product-faq-bm-reply"></textarea>
+              </label>
+              <label class="field wide" for="product-faq-bm-search">Brunei-Malay Search Text
+                <textarea id="product-faq-bm-search"></textarea>
+              </label>
+            </div>
+            <div class="editor-actions">
+              <label for="product-faq-active"><input id="product-faq-active" type="checkbox" checked /> Active</label>
+              <button id="cancel-product-faq" type="button">Cancel</button>
+              <button class="primary" id="save-product-faq" type="button">Save Product FAQ</button>
+            </div>
+          </div>
         </div>
         <div class="knowledge-panel">
           <div class="knowledge-head">
@@ -8580,12 +8643,120 @@ function productFlowPageHtml() {
         (faq.approvedReply ? '<p><b>Approved answer:</b>\\n' + esc(faq.approvedReply) + '</p>' : '') +
         (faq.bruneiMalayApprovedReply ? '<p><b>Brunei-Malay answer:</b>\\n' + esc(faq.bruneiMalayApprovedReply) + '</p>' : '') +
         (faq.bruneiMalaySearchText ? '<div class="knowledge-meta">Search text: ' + esc(faq.bruneiMalaySearchText) + '</div>' : '') +
+        '<div class="knowledge-actions">' +
+          '<button type="button" data-edit-product-faq="' + esc(faq.id) + '">Edit</button>' +
+          '<button class="danger" type="button" data-delete-product-faq="' + esc(faq.id) + '" data-faq-topic="' + esc(faq.topic || faq.id) + '">Delete</button>' +
+        '</div>' +
       '</div>';
     }
 
     function renderApprovedFaqs() {
       const faqs = selectedProduct.approvedFaqs || [];
-      document.querySelector("#approved-product-faqs").innerHTML = faqs.map(faqItemHtml).join("") || '<div class="knowledge-empty">No approved product FAQ for this product yet. Add product-scoped FAQ in Reply Library.</div>';
+      document.querySelector("#approved-product-faqs").innerHTML = faqs.map(faqItemHtml).join("") || '<div class="knowledge-empty">No approved product FAQ for this product yet. Click New Product FAQ to add one.</div>';
+      document.querySelectorAll("button[data-edit-product-faq]").forEach(button => {
+        button.addEventListener("click", () => editProductFaq(button.dataset.editProductFaq));
+      });
+      document.querySelectorAll("button[data-delete-product-faq]").forEach(button => {
+        button.addEventListener("click", () => deleteProductFaq(button.dataset.deleteProductFaq, button.dataset.faqTopic));
+      });
+    }
+
+    function resetProductFaqForm() {
+      document.querySelector("#product-faq-id").value = "";
+      document.querySelector("#product-faq-topic").value = "";
+      document.querySelector("#product-faq-examples").value = "";
+      document.querySelector("#product-faq-reply").value = "";
+      document.querySelector("#product-faq-bm-topic").value = "";
+      document.querySelector("#product-faq-bm-examples").value = "";
+      document.querySelector("#product-faq-bm-reply").value = "";
+      document.querySelector("#product-faq-bm-search").value = "";
+      document.querySelector("#product-faq-active").checked = true;
+    }
+
+    function showProductFaqForm() {
+      document.querySelector("#product-faq-form").hidden = false;
+      document.querySelector("#product-faq-topic").focus();
+    }
+
+    function newProductFaq() {
+      resetProductFaqForm();
+      document.querySelector("#product-faq-status").textContent = "New product FAQ";
+      showProductFaqForm();
+    }
+
+    function editProductFaq(faqId) {
+      const faq = (selectedProduct.approvedFaqs || []).find(item => item.id === faqId);
+      if (!faq) return;
+      document.querySelector("#product-faq-id").value = faq.id || "";
+      document.querySelector("#product-faq-topic").value = faq.topic || "";
+      document.querySelector("#product-faq-examples").value = (faq.exampleQuestions || []).join("\\n");
+      document.querySelector("#product-faq-reply").value = faq.approvedReply || "";
+      document.querySelector("#product-faq-bm-topic").value = faq.bruneiMalayTopic || "";
+      document.querySelector("#product-faq-bm-examples").value = (faq.bruneiMalayExampleQuestions || []).join("\\n");
+      document.querySelector("#product-faq-bm-reply").value = faq.bruneiMalayApprovedReply || "";
+      document.querySelector("#product-faq-bm-search").value = faq.bruneiMalaySearchText || "";
+      document.querySelector("#product-faq-active").checked = faq.active !== false;
+      document.querySelector("#product-faq-status").textContent = "Editing product FAQ";
+      showProductFaqForm();
+    }
+
+    async function saveProductFaq() {
+      if (!selectedProduct) return;
+      const button = document.querySelector("#save-product-faq");
+      if (!document.querySelector("#product-faq-topic").value.trim() || !document.querySelector("#product-faq-reply").value.trim() || !document.querySelector("#product-faq-examples").value.trim()) {
+        document.querySelector("#product-faq-status").textContent = "Topic, questions, and approved reply are required";
+        return;
+      }
+      button.disabled = true;
+      document.querySelector("#product-faq-status").textContent = "Saving...";
+      try {
+        const response = await fetch("/admin/faq-library/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: document.querySelector("#product-faq-id").value,
+            scope: "product",
+            productId: selectedProduct.id,
+            topic: document.querySelector("#product-faq-topic").value,
+            exampleQuestions: document.querySelector("#product-faq-examples").value.split(/\\r?\\n/),
+            approvedReply: document.querySelector("#product-faq-reply").value,
+            bruneiMalayTopic: document.querySelector("#product-faq-bm-topic").value,
+            bruneiMalayExampleQuestions: document.querySelector("#product-faq-bm-examples").value.split(/\\r?\\n/),
+            bruneiMalayApprovedReply: document.querySelector("#product-faq-bm-reply").value,
+            bruneiMalaySearchText: document.querySelector("#product-faq-bm-search").value,
+            active: document.querySelector("#product-faq-active").checked
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          document.querySelector("#product-faq-status").textContent = data.error || "Save failed";
+          return;
+        }
+        await loadProducts(selectedProduct.id);
+        document.querySelector("#product-faq-form").hidden = true;
+        document.querySelector("#product-faq-status").textContent = "Product FAQ saved";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function deleteProductFaq(faqId, topic) {
+      if (!selectedProduct || !confirm('Delete product FAQ "' + (topic || faqId) + '"?')) return;
+      document.querySelector("#product-faq-status").textContent = "Deleting...";
+      const response = await fetch("/admin/faq-library/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "product", productId: selectedProduct.id, id: faqId })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        document.querySelector("#product-faq-status").textContent = data.error || "Delete failed";
+        return;
+      }
+      await loadProducts(selectedProduct.id);
+      resetProductFaqForm();
+      document.querySelector("#product-faq-form").hidden = true;
+      document.querySelector("#product-faq-status").textContent = "Product FAQ deleted";
     }
 
     function knowledgeItemHtml(fact, status) {
@@ -8728,6 +8899,9 @@ function productFlowPageHtml() {
 
     function renderProduct() {
       if (!selectedProduct) return;
+      document.querySelector("#product-faq-form").hidden = true;
+      document.querySelector("#product-faq-status").textContent = "";
+      resetProductFaqForm();
       document.querySelector("#shoppingLink").value = selectedProduct.shoppingLink || "";
       ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
         document.querySelector("#" + field).value = selectedProduct[field] || "";
@@ -8936,6 +9110,13 @@ function productFlowPageHtml() {
     document.querySelector("#create-product-form").addEventListener("submit", createProduct);
     document.querySelector("#supply-form").addEventListener("submit", saveSupply);
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
+    document.querySelector("#new-product-faq").addEventListener("click", newProductFaq);
+    document.querySelector("#cancel-product-faq").addEventListener("click", () => {
+      document.querySelector("#product-faq-form").hidden = true;
+      document.querySelector("#product-faq-status").textContent = "";
+      resetProductFaqForm();
+    });
+    document.querySelector("#save-product-faq").addEventListener("click", saveProductFaq);
     document.querySelector("#extract-existing-images").addEventListener("click", extractExistingKnowledge);
     document.querySelector("#clean-pending-facts").addEventListener("click", cleanPendingFacts);
     document.querySelector("#sync-vector-store").addEventListener("click", syncVectorStore);
