@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import {
   attachFileToVectorStore,
   createVectorStore,
-  deleteUploadedFile,
   deleteVectorStoreFile,
   getVectorStoreFile,
   listVectorStoreFiles,
@@ -370,8 +369,7 @@ async function listKnowledgeFiles(dir) {
 
 async function clearVectorStore(apiKey, vectorStoreId) {
   let totalRemoved = 0;
-  const attempted = new Set();
-  for (let pass = 1; pass <= 5; pass += 1) {
+  for (let pass = 1; pass <= 10; pass += 1) {
     const files = await listVectorStoreFiles(apiKey, vectorStoreId);
     if (!files.length) {
       if (totalRemoved) console.log(`Vector store cleanup complete. Removed ${totalRemoved} file(s).`);
@@ -380,29 +378,32 @@ async function clearVectorStore(apiKey, vectorStoreId) {
 
     console.log(`Removing ${files.length} existing vector store file(s). Pass ${pass}.`);
     for (const file of files) {
-      attempted.add(file.id);
-      await deleteVectorStoreFile(apiKey, vectorStoreId, file.id).catch((error) => {
-        console.log(`Vector-store detach skipped for ${file.id}: ${error.message}`);
-      });
-      await deleteUploadedFile(apiKey, file.id).catch((error) => {
-        console.log(`File ${file.id} detached but uploaded-file delete skipped: ${error.message}`);
-      });
+      await detachVectorStoreFile(apiKey, vectorStoreId, file);
       totalRemoved += 1;
       console.log(`Removed: ${file.id}`);
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 
   const remaining = await listVectorStoreFiles(apiKey, vectorStoreId);
   if (remaining.length) {
-    const staleIds = remaining.filter((file) => attempted.has(file.id));
-    if (staleIds.length === remaining.length) {
-      console.log(`Vector store still lists ${remaining.length} stale file row(s) after cleanup; continuing upload to the same vector store.`);
-      return;
-    }
-    throw new Error(`Vector store cleanup did not finish. ${remaining.length} file(s) still attached.`);
+    throw new Error(`Vector store cleanup did not finish. ${remaining.length} old file row(s) still attached. Please delete the old rows in OpenAI Storage, then sync again.`);
   }
+}
+
+async function detachVectorStoreFile(apiKey, vectorStoreId, file) {
+  const ids = [...new Set([file.id, file.file_id].filter(Boolean))];
+  let lastError = null;
+  for (const id of ids) {
+    try {
+      await deleteVectorStoreFile(apiKey, vectorStoreId, id);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error(`Unable to detach vector store file ${file.id}`);
 }
 
 async function waitForVectorStoreFile(apiKey, vectorStoreId, fileId, initialStatus) {
