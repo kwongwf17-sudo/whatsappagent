@@ -33,6 +33,8 @@ import { TeamContentStore } from "./lib/team_content.mjs";
 import { WebWhatsAppManager } from "./lib/web_whatsapp_manager.mjs";
 import {
   customerOrderStatusReply,
+  deliveryRescheduleReply,
+  isDeliveryRescheduleRequest,
   isLikelyOrderStatusQuestion,
   ORDER_STATUS_OPTIONS,
   orderStatusDisplay,
@@ -1617,6 +1619,38 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     return {
       customer: updatedCustomer,
       order: null,
+      messages: outbound,
+      handoffRequired: true,
+      handoffReason: updatedCustomer.handoffReason,
+    };
+  }
+
+  if (!faqSalesResponse && !initialAdOpening && isDeliveryRescheduleRequest(text)) {
+    const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
+    const outbound = [textMessage(deliveryRescheduleReply())];
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      awaitingPackageBInterest: false,
+      handoffStatus: "human_required",
+      handoffReason: "Customer requested delivery reschedule.",
+      lastDeliveryRescheduleRequestAt: new Date().toISOString(),
+    }), businessAccountId);
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "delivery_reschedule_handoff",
+      customerId: from,
+      result: latestOrder ? latestOrder.id : "no_linked_order",
+      businessAccountId,
+    });
+    if (businessAccountId !== DEMO_ACCOUNT_ID) {
+      await notifyAdmin(`Delivery reschedule requested for ${from}: ${text}`);
+    }
+    await sendOutbound(from, outbound, {
+      businessAccountId,
+      purpose: "delivery_reschedule_handoff",
+    });
+    return {
+      customer: updatedCustomer,
+      order: latestOrder,
       messages: outbound,
       handoffRequired: true,
       handoffReason: updatedCustomer.handoffReason,
