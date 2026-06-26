@@ -840,6 +840,63 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/handoff/acknowledge") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      const customerId = String(body.customerId || "").trim();
+      const caseId = String(body.caseId || "").trim();
+      const type = String(body.type || "conversation").trim();
+      try {
+        if (type === "complaint" || caseId) {
+          const complaint = await store.resolveComplaintCase(
+            caseId,
+            adminSession.accountId,
+            `admin:${adminSession.accountId}`
+          );
+          const hasOpenComplaint = (await store.listComplaintCases(adminSession.accountId)).some(
+            (item) => item.customerId === complaint.customerId && item.status !== "resolved"
+          );
+          if (!hasOpenComplaint) {
+            await store.updateCustomer(complaint.customerId, (customer) => ({
+              complaintStatus: "resolved",
+              complaintResolvedAt: complaint.resolvedAt,
+              handoffStatus: customer.handoffReason?.startsWith("Complaint") ? "" : customer.handoffStatus,
+              handoffReason: customer.handoffReason?.startsWith("Complaint") ? "" : customer.handoffReason,
+              handoffAcknowledgedAt: new Date().toISOString(),
+              handoffAcknowledgedBy: `admin:${adminSession.accountId}`,
+              followupBlocked: Boolean(customer.optedOut),
+              followupBlockedReason: customer.optedOut ? customer.followupBlockedReason : "",
+            }), adminSession.accountId);
+          }
+          await store.appendAuditLog({
+            actor: `admin:${adminSession.accountId}`,
+            action: "handoff_acknowledged",
+            customerId: complaint.customerId,
+            result: complaint.id,
+          });
+          return sendJson(res, 200, { acknowledged: true, customerId: complaint.customerId, caseId: complaint.id });
+        }
+
+        if (!customerId) return sendJson(res, 400, { error: "Customer ID is required." });
+        const customer = await store.updateCustomer(customerId, () => ({
+          handoffStatus: "",
+          handoffReason: "",
+          handoffAcknowledgedAt: new Date().toISOString(),
+          handoffAcknowledgedBy: `admin:${adminSession.accountId}`,
+        }), adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "handoff_acknowledged",
+          customerId,
+          result: customer.handoffAcknowledgedAt || "",
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, { acknowledged: true, customerId });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/manual-reply") {
       const body = await readJsonBody(req);
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
@@ -2704,6 +2761,12 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
   const ordersByCustomer = groupBy(orders, (order) => order.customerId);
   const customerById = new Map(customers.map((customer) => [customer.id, customer]));
   const latestOrderForCustomer = (customerId) => (ordersByCustomer.get(customerId) || []).at(-1) || null;
+  const latestInboundForCustomer = (customerId) =>
+    outbox
+      .filter((message) => message.direction === "inbound" && message.from === customerId)
+      .slice()
+      .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))
+      .at(-1);
   const handoffPhone = (customerId, order = null) => {
     const latestOrder = order || latestOrderForCustomer(customerId);
     return latestOrder?.phone || customerById.get(customerId)?.phone || customerId;
@@ -2762,14 +2825,15 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       .filter((customer) =>
         customer.handoffStatus === "human_required" &&
         customer.complaintStatus !== "open" &&
-        customer.handoffReason !== "Customer submitted complete order details." &&
-        !(customer.orderIds || []).length
+        customer.handoffReason !== "Customer submitted complete order details."
       )
       .map((customer) => ({
         type: "conversation",
         customerId: customer.id,
         phone: handoffPhone(customer.id),
         product: productById.get(customer.productId)?.name || customer.productId || "",
+        category: "",
+        customerMessage: latestInboundForCustomer(customer.id)?.body || "",
         reason: customer.handoffReason || "Human review needed",
         createdAt: customer.lastMessageAt || customer.firstSeenAt || "",
       })),
@@ -6765,10 +6829,19 @@ function adminDashboardHtml() {
         { label: 'Customer Message', key: 'customerMessage' },
         { label: 'Reason', key: 'reason' },
         { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
-        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-handoff-chat="' + esc(r.customerId) + '">Chat</button>' + (r.type === 'complaint' ? '<button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button>' : '') + '</div>' }
+        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-handoff-chat="' + esc(r.customerId) + '">Chat</button><button type="button" data-handoff-ack="' + esc(r.customerId) + '" data-handoff-type="' + esc(r.type) + '" data-handoff-case="' + esc(r.caseId || '') + '">Acknowledge</button>' + (r.type === 'complaint' ? '<button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button>' : '') + '</div>' }
       ]);
       document.querySelectorAll("button[data-handoff-chat]").forEach(button => button.addEventListener("click", () => {
         window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.handoffChat);
+      }));
+      document.querySelectorAll("button[data-handoff-ack]").forEach(button => button.addEventListener("click", async () => {
+        if (!confirm("Acknowledge this handoff and remove it from the Handoff tab?")) return;
+        await request("/admin/handoff/acknowledge", {
+          customerId: button.dataset.handoffAck,
+          type: button.dataset.handoffType,
+          caseId: button.dataset.handoffCase
+        });
+        loadDashboard();
       }));
       document.querySelectorAll("button[data-complaint-resolve]").forEach(button => button.addEventListener("click", async () => {
         await request("/admin/handoff/complaint/resolve", { caseId: button.dataset.complaintResolve });
