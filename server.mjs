@@ -4543,8 +4543,11 @@ function runTeamKnowledgeIngest(accountId) {
       (error, stdout = "", stderr = "") => {
         const output = `${stdout}\n${stderr}`.trim();
         if (error) {
-          const message = output || error.message || "Knowledge ingestion failed.";
-          reject(new Error(message.slice(0, 2000)));
+          const cleanupMessage = output.match(/Vector store cleanup did not finish[^\r\n]*/)?.[0];
+          const conciseMessage = cleanupMessage
+            ? `${cleanupMessage} This usually means OpenAI still has old blank/stale rows. Delete those old rows with the trash icon in OpenAI Storage, then sync again.`
+            : error.message || "Knowledge ingestion failed.";
+          reject(new Error(conciseMessage.slice(0, 500)));
           return;
         }
         const vectorStoreMatch = output.match(/(?:Using|Created) vector store:\s*(\S+)/);
