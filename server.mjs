@@ -1078,6 +1078,22 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       return sendJson(res, 201, { product: productFlowEditorData(product) });
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/product-flow/delete") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      const content = await getTeamContent(adminSession.accountId);
+      try {
+        const deleted = deleteCatalogProduct(String(body.productId || ""), content.catalog);
+        await saveTeamContent(adminSession.accountId, content);
+        return sendJson(res, 200, {
+          deleted,
+          products: content.catalog.products.map(productFlowEditorData),
+        });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/product-flow/save") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
@@ -4743,6 +4759,20 @@ const REQUIRED_PRODUCT_FLOW_IMAGE_KEYS = new Set(PRODUCT_FLOW_IMAGE_SLOTS
 
 function findCatalogProduct(productId, activeCatalog = catalog) {
   return activeCatalog.products.find((product) => product.id === String(productId || ""));
+}
+
+function deleteCatalogProduct(productId, activeCatalog = catalog) {
+  const id = String(productId || "").trim();
+  if (!id) throw new Error("Product is required.");
+  const products = activeCatalog.products || [];
+  if (products.length <= 1) throw new Error("Cannot delete the last product.");
+  const index = products.findIndex((product) => product.id === id);
+  if (index < 0) throw new Error("Product not found.");
+  const [deleted] = products.splice(index, 1);
+  if (activeCatalog.default_product_id === deleted.id) {
+    activeCatalog.default_product_id = products[0]?.id || "";
+  }
+  return { id: deleted.id, name: deleted.name || deleted.id };
 }
 
 function productFlowEditorData(product, options = {}) {
@@ -8429,6 +8459,7 @@ function productFlowPageHtml() {
     .knowledge-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     .knowledge-actions button { padding: 6px 9px; font-size: 12px; }
     .knowledge-actions .danger { color: #9b1c12; border-color: #ffd1d1; background: #fff7f7; }
+    button.danger { color: #9b1c12; border-color: #ffd1d1; background: #fff7f7; }
     .knowledge-empty { color: var(--muted); padding: 10px; border: 1px dashed #d2d2d7; border-radius: 8px; background: #fff; }
     .editor { margin-top: 12px; padding: 12px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
     .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
@@ -8473,6 +8504,7 @@ function productFlowPageHtml() {
       <div class="toolbar-tools">
         <span class="status-badge" id="flow-readiness">Setup</span>
         <button id="show-create-product" type="button">New Product</button>
+        <button class="danger" id="delete-product" type="button">Delete Product</button>
         <button id="sync-vector-store" type="button">Sync Knowledge to Vector Store</button>
         <span id="vector-sync-status" class="knowledge-note"></span>
       </div>
@@ -9186,6 +9218,38 @@ function productFlowPageHtml() {
       }
     }
 
+    async function deleteSelectedProduct() {
+      if (!selectedProduct) return;
+      if (products.length <= 1) {
+        status("Cannot delete the last product");
+        return;
+      }
+      const label = selectedProduct.name || selectedProduct.id;
+      if (!confirm('Delete entire product flow for "' + label + '"? This removes this product setup, approved product FAQ, and extracted image knowledge from this team.')) {
+        return;
+      }
+      const button = document.querySelector("#delete-product");
+      button.disabled = true;
+      status("Deleting product...");
+      try {
+        const response = await fetch("/admin/product-flow/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ productId: selectedProduct.id })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          status(data.error || "Delete failed");
+          return;
+        }
+        const nextProduct = (data.products || []).find(product => product.id !== selectedProduct.id) || (data.products || [])[0] || null;
+        await loadProducts(nextProduct && nextProduct.id);
+        status("Deleted product: " + label);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     document.querySelector("#product-select").addEventListener("change", event => {
       selectedProduct = products.find(product => product.id === event.target.value) || null;
       renderProduct();
@@ -9199,6 +9263,7 @@ function productFlowPageHtml() {
       document.querySelector("#new-product-name").value = "";
     });
     document.querySelector("#create-product-form").addEventListener("submit", createProduct);
+    document.querySelector("#delete-product").addEventListener("click", deleteSelectedProduct);
     document.querySelector("#supply-form").addEventListener("submit", saveSupply);
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
     document.querySelector("#new-product-faq").addEventListener("click", newProductFaq);
