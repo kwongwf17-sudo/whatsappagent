@@ -6628,6 +6628,7 @@ function adminDashboardHtml() {
       <h2>Submitted Order Customers</h2>
       <div class="filterbar">
         <label for="order-customers-date">Date <input id="order-customers-date" type="date" /></label>
+        <label for="order-customers-sku-filter">SKU <select id="order-customers-sku-filter"></select></label>
         <button id="order-customers-all" type="button">All Dates</button>
         <span class="muted" id="order-customers-count"></span>
       </div>
@@ -6701,6 +6702,7 @@ function adminDashboardHtml() {
     let activeFollowupLabel = "ALL";
     let activeDashboardDate = localDateInput(new Date());
     let activeOrderCustomersDate = localDateInput(new Date());
+    let activeOrderCustomersSku = "ALL";
     let activeHandoffDate = localDateInput(new Date());
     let activeOrdersDate = localDateInput(new Date());
 
@@ -6837,6 +6839,7 @@ function adminDashboardHtml() {
       renderCustomers();
       renderHandoff();
       renderComplaintSettings();
+      renderOrderCustomerSkuFilter();
       renderOrderCustomers();
       renderOrders();
 
@@ -6926,7 +6929,20 @@ function adminDashboardHtml() {
 
     function orderCustomerRows() {
       const rows = dashboardData ? dashboardData.orderCustomers || [] : [];
-      return rows.filter(row => matchesDate(row.createdAt, activeOrderCustomersDate));
+      return rows
+        .filter(row => matchesDate(row.createdAt, activeOrderCustomersDate))
+        .filter(row => activeOrderCustomersSku === "ALL" || (row.skuCode || "") === activeOrderCustomersSku);
+    }
+
+    function renderOrderCustomerSkuFilter() {
+      const rows = dashboardData ? dashboardData.orderCustomers || [] : [];
+      const dateRows = rows.filter(row => matchesDate(row.createdAt, activeOrderCustomersDate));
+      const skus = [...new Set(dateRows.map(row => row.skuCode || "").filter(Boolean))].sort();
+      if (activeOrderCustomersSku !== "ALL" && !skus.includes(activeOrderCustomersSku)) activeOrderCustomersSku = "ALL";
+      document.querySelector("#order-customers-sku-filter").innerHTML =
+        '<option value="ALL">All SKU</option>' +
+        skus.map(sku => '<option value="' + esc(sku) + '">' + esc(sku) + '</option>').join("");
+      document.querySelector("#order-customers-sku-filter").value = activeOrderCustomersSku;
     }
 
     function bindReachedWarehouseButtons() {
@@ -7194,13 +7210,20 @@ function adminDashboardHtml() {
     }
 
     setupDateFilter("#handoff-date", "#handoff-all", () => activeHandoffDate, value => activeHandoffDate = value, renderHandoff);
-    setupDateFilter("#order-customers-date", "#order-customers-all", () => activeOrderCustomersDate, value => activeOrderCustomersDate = value, renderOrderCustomers);
+    setupDateFilter("#order-customers-date", "#order-customers-all", () => activeOrderCustomersDate, value => {
+      activeOrderCustomersDate = value;
+      renderOrderCustomerSkuFilter();
+    }, renderOrderCustomers);
     setupDateFilter("#orders-date", "#orders-all", () => activeOrdersDate, value => activeOrdersDate = value, renderOrders);
     document.querySelector("#customer-sku-filter").addEventListener("change", event => {
       activeCustomerSku = event.target.value || "ALL";
       activeCustomerLabel = "ALL";
       renderCustomerLabelTabs(skuFilteredCustomers());
       renderCustomers();
+    });
+    document.querySelector("#order-customers-sku-filter").addEventListener("change", event => {
+      activeOrderCustomersSku = event.target.value || "ALL";
+      renderOrderCustomers();
     });
     function openDashboardTab(tabId) {
       document.querySelector("main").classList.toggle("profile-only", tabId === "profile");
