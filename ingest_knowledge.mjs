@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   attachFileToVectorStore,
   createVectorStore,
+  deleteUploadedFile,
   deleteVectorStoreFile,
   getVectorStoreFile,
   listVectorStoreFiles,
@@ -315,12 +316,30 @@ async function listKnowledgeFiles(dir) {
 }
 
 async function clearVectorStore(apiKey, vectorStoreId) {
-  const files = await listVectorStoreFiles(apiKey, vectorStoreId);
-  if (!files.length) return;
-  console.log(`Removing ${files.length} existing vector store file(s).`);
-  for (const file of files) {
-    await deleteVectorStoreFile(apiKey, vectorStoreId, file.id);
-    console.log(`Removed: ${file.id}`);
+  let totalRemoved = 0;
+  for (let pass = 1; pass <= 5; pass += 1) {
+    const files = await listVectorStoreFiles(apiKey, vectorStoreId);
+    if (!files.length) {
+      if (totalRemoved) console.log(`Vector store cleanup complete. Removed ${totalRemoved} file(s).`);
+      return;
+    }
+
+    console.log(`Removing ${files.length} existing vector store file(s). Pass ${pass}.`);
+    for (const file of files) {
+      await deleteVectorStoreFile(apiKey, vectorStoreId, file.id);
+      await deleteUploadedFile(apiKey, file.id).catch((error) => {
+        console.log(`File ${file.id} detached but uploaded-file delete skipped: ${error.message}`);
+      });
+      totalRemoved += 1;
+      console.log(`Removed: ${file.id}`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+
+  const remaining = await listVectorStoreFiles(apiKey, vectorStoreId);
+  if (remaining.length) {
+    throw new Error(`Vector store cleanup did not finish. ${remaining.length} file(s) still attached.`);
   }
 }
 
