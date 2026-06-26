@@ -1780,12 +1780,12 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   const productNameOpening = isProductNameMessage(product, text);
   const messageSource = productNameOpening ? { ...source, productNameMatch: true } : source;
   const fixedOpeningFlow = usesFixedOpeningFlow(customer, text, messageSource);
-  const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse
-    ? null
-    : findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext });
-  const exactSalesReply = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq
+  const exactSalesReply = fixedOpeningFlow || faqSalesResponse
     ? null
     : findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary });
+  const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || exactSalesReply
+    ? null
+    : findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext });
   const approvedFaqMatch = null;
   const salesReplyMatch = null;
   const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || exactSalesReply
