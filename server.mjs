@@ -6150,9 +6150,15 @@ function superAdminSystemHtml() {
     async function saveTeamSettings(event) {
       event.preventDefault();
       const state = document.querySelector("#team-settings-state");
+      const publicBaseUrl = normalizeDashboardUrl(document.querySelector("#team-public-base-url").value || window.location.origin);
+      const assetsBaseUrl = normalizeDashboardUrl(document.querySelector("#team-assets-base-url").value || publicBaseUrl);
+      if (!publicBaseUrl || !assetsBaseUrl) {
+        state.textContent = "Public Base URL and Assets Base URL must be valid http/https URLs.";
+        return;
+      }
       const settings = {
-        publicBaseUrl: document.querySelector("#team-public-base-url").value,
-        assetsBaseUrl: document.querySelector("#team-assets-base-url").value,
+        publicBaseUrl,
+        assetsBaseUrl,
         openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
         followupSendsPerMinute: document.querySelector("#team-followup-sends").value,
         followupIntervalMinutes: document.querySelector("#team-followup-interval").value
@@ -6173,6 +6179,17 @@ function superAdminSystemHtml() {
         state.textContent = "Saved";
       } catch (error) {
         state.textContent = error.message;
+      }
+    }
+    function normalizeDashboardUrl(value) {
+      const text = String(value || "").trim();
+      if (!text) return "";
+      try {
+        const url = new URL(text);
+        if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+        return url.toString().replace(/\\/$/, "");
+      } catch {
+        return "";
       }
     }
     function render() {
