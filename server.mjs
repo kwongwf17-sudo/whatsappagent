@@ -8808,13 +8808,13 @@ function productFlowPageHtml() {
             <input id="product-faq-id" type="hidden" />
             <div class="fields">
               <label class="field wide" for="product-faq-topic">Topic
-                <input id="product-faq-topic" required />
+                <input id="product-faq-topic" />
               </label>
               <label class="field wide" for="product-faq-examples">Example Customer Questions
-                <textarea id="product-faq-examples" required></textarea>
+                <textarea id="product-faq-examples"></textarea>
               </label>
               <label class="field wide" for="product-faq-reply">Approved Reply
-                <textarea class="reply" id="product-faq-reply" required></textarea>
+                <textarea class="reply" id="product-faq-reply"></textarea>
               </label>
               <label class="field wide" for="product-faq-bm-topic">Brunei-Malay Topic
                 <input id="product-faq-bm-topic" />
