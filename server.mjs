@@ -106,6 +106,7 @@ const config = {
   followupPauseWindowMinutes: Number(getEnv("FOLLOWUP_PAUSE_WINDOW_MINUTES", "5")),
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
   openingFlowInitialDelayMs: Number(getEnv("OPENING_FLOW_INITIAL_DELAY_MS", "5000")),
+  statusReplyDelayMs: Number(getEnv("STATUS_REPLY_DELAY_MS", "5000")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
@@ -661,6 +662,7 @@ const server = http.createServer(async (req, res) => {
         const order = await store.updateOrderStatus(orderId, "reached_warehouse", adminSession.accountId);
         const message = reachedWarehouseCustomerMessage(order);
         const outboundAccountId = order.businessAccountId || adminSession.accountId;
+        await delayBeforeStatusReply(order.customerId, "reached warehouse status reply");
         await sendOutbound(order.customerId, [textMessage(message)], {
           businessAccountId: outboundAccountId,
           purpose: "order_reached_warehouse",
@@ -1692,6 +1694,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
       result: latestOrder ? `${latestOrder.id}:${latestOrder.status}` : "no_linked_order",
       businessAccountId,
     });
+    await delayBeforeStatusReply(from, "order status reply");
     await sendOutbound(from, outbound, {
       businessAccountId,
       purpose: "order_status_reply",
@@ -1883,6 +1886,13 @@ async function delayBeforeNewCustomerOpeningFlow(customer, reason = "opening flo
   const delayMs = Math.max(0, Number(config.openingFlowInitialDelayMs) || 0);
   if (!delayMs) return;
   console.log(`Delaying ${reason} for new customer ${customer.id} by ${delayMs}ms`);
+  await wait(delayMs);
+}
+
+async function delayBeforeStatusReply(customerId, reason = "status reply") {
+  const delayMs = Math.max(0, Number(config.statusReplyDelayMs) || 0);
+  if (!delayMs) return;
+  console.log(`Delaying ${reason} for ${customerId} by ${delayMs}ms`);
   await wait(delayMs);
 }
 
