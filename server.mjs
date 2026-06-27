@@ -10,6 +10,7 @@ import {
   classifyFaqSalesPromptResponse,
   findApprovedFaqLocalMatch,
   findProduct,
+  findProductMatch,
   isGeneralBusinessQuestion,
   isProductNameMessage,
   findSalesReplyExactMatch,
@@ -1504,6 +1505,24 @@ async function recentConversationContext(customerId, businessAccountId, limit = 
     .filter((message) => String(message.text || "").trim());
 }
 
+async function recentProductContextMatch(customerId, businessAccountId, catalog, source = {}, limit = 12) {
+  const directMatch = findProductMatch(catalog, "", source);
+  if (directMatch) return directMatch;
+  const messages = await store.listOutbox(businessAccountId);
+  const contextText = messages
+    .filter((message) =>
+      String(message.businessAccountId || config.accountId) === String(businessAccountId || config.accountId) &&
+      (message.from === customerId || message.to === customerId) &&
+      ["customer", "business_admin"].includes(String(message.channel || ""))
+    )
+    .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
+    .slice(-limit)
+    .map((message) => message.body || message.caption || "")
+    .filter(Boolean)
+    .join("\n");
+  return findProductMatch(catalog, contextText, source);
+}
+
 async function processInboundMessage({ id, from, text, source = {}, live = false, businessAccountId = config.accountId }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
   if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
@@ -1539,6 +1558,9 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     source,
   });
   const conversationContext = await recentConversationContext(from, businessAccountId);
+  const contextMatchedProduct = customer.productId
+    ? null
+    : await recentProductContextMatch(from, businessAccountId, teamCatalog, source);
 
   if (live) {
     const blocked = await liveAutomationBlock(businessAccountId);
@@ -1566,6 +1588,49 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   const optOutIntent = detectOptOutIntent(text);
   const textMatchedProduct = findProduct(teamCatalog, text, {}, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
+  if (!isProductNameOnlyOpening && contextMatchedProduct && Number(customer.inboundCount || 0) <= 1) {
+    const messageSource = {
+      ...source,
+      productId: contextMatchedProduct.id,
+      productNameMatch: true,
+      adContextProductMatch: true,
+    };
+    const plan = await buildConversationPlan({
+      catalog: teamCatalog,
+      customer,
+      customerMessage: text,
+      source: messageSource,
+      faqLibrary: teamFaqLibrary,
+      salesReplyLibrary: teamSalesReplyLibrary,
+      approvedFaqMatch: null,
+      salesReplyMatch: null,
+      ragAnswer: null,
+      conversationContext,
+    });
+    console.log(`Skipping OpenAI for ad-context opening flow to ${from}: ${contextMatchedProduct.id}`);
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      ...(plan.customerPatch || {}),
+      productId: contextMatchedProduct.id,
+      complaintCaseId: "",
+      complaintStatus: "",
+      complaintCategory: "",
+      complaintAt: "",
+      followupBlocked: false,
+      followupBlockedReason: "",
+      handoffStatus: "",
+      handoffReason: "",
+    }), businessAccountId);
+    const outbound = clampMessages(plan.messages);
+    await delayBeforeNewCustomerOpeningFlow(customer, "ad-context opening flow");
+    await sendOutbound(from, outbound, { businessAccountId });
+    return {
+      customer: updatedCustomer,
+      order: null,
+      messages: outbound,
+      handoffRequired: Boolean(plan.handoffRequired),
+      handoffReason: plan.handoffReason || "",
+    };
+  }
   if (isProductNameOnlyOpening) {
     const messageSource = {
       ...source,
