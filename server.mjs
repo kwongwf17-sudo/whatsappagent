@@ -1378,6 +1378,7 @@ if (!config.skipHttpServer && webTransportManager) {
     .then((accounts) => webTransportManager.start({
       accounts,
       onMessage: async (message) => {
+        if (alreadyProcessed(message.id)) return;
         if (message.source?.fromMe) {
           await handleManualBusinessMessage(message);
           return;
@@ -1505,11 +1506,22 @@ async function recentConversationContext(customerId, businessAccountId, limit = 
 
 async function processInboundMessage({ id, from, text, source = {}, live = false, businessAccountId = config.accountId }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
+  if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
+    console.log(`Skipping duplicate inbound message ${id} from ${from}.`);
+    return {
+      customer: await store.getOrCreateCustomer(from, { businessAccountId }),
+      order: null,
+      messages: [],
+      handoffRequired: false,
+      handoffReason: "Duplicate inbound message skipped.",
+    };
+  }
   const content = await getTeamContent(businessAccountId);
   const teamCatalog = content.catalog;
   const teamFaqLibrary = content.faqLibrary;
   const teamSalesReplyLibrary = content.salesReplyLibrary;
   await store.appendOutbox({
+    ...(id ? { id } : {}),
     direction: "inbound",
     from,
     to: "agent",
