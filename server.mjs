@@ -607,6 +607,17 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/followups/customer/run") {
+      const body = await readJsonBody(req);
+      const result = await sendCustomerFollowupNow(body.customerId || body.customer, {
+        businessAccountId: body.businessAccountId || body.account,
+        followupKey: body.followupKey || body.key,
+        allowAlreadySent: Boolean(body.allowAlreadySent),
+        respectOperationalControl: body.respectOperationalControl !== false,
+      });
+      return sendJson(res, result.sent ? 200 : 409, result);
+    }
+
     if (req.method === "POST" && url.pathname === "/demo/followups/run") {
       const body = await readJsonBody(req);
       const result = await requestFollowupRun(body.now ? new Date(body.now) : new Date(), {
