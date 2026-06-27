@@ -1588,7 +1588,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   const optOutIntent = detectOptOutIntent(text);
   const textMatchedProduct = findProduct(teamCatalog, text, {}, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
-  if (!isProductNameOnlyOpening && contextMatchedProduct && Number(customer.inboundCount || 0) <= 1) {
+  if (!customer.pendingOrder && !isProductNameOnlyOpening && contextMatchedProduct && Number(customer.inboundCount || 0) <= 1) {
     const messageSource = {
       ...source,
       productId: contextMatchedProduct.id,
@@ -1631,7 +1631,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
       handoffReason: plan.handoffReason || "",
     };
   }
-  if (isProductNameOnlyOpening) {
+  if (!customer.pendingOrder && isProductNameOnlyOpening) {
     const messageSource = {
       ...source,
       productId: textMatchedProduct.id,
