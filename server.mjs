@@ -7134,7 +7134,7 @@ function adminDashboardHtml() {
     }
 
     function dashboardCustomers() {
-      return rowsForDate(dashboardData ? dashboardData.customers : [], "firstSeenAt");
+      return dashboardData ? dashboardData.customers : [];
     }
 
     function skuFilteredCustomers() {
@@ -7161,7 +7161,7 @@ function adminDashboardHtml() {
       const handoffRows = rowsForDate(data.handoffQueue || [], "createdAt", selectedDate);
       const followupRows = rowsForDate(data.followups || [], "nextDueAt", selectedDate);
       return {
-        customers: rowsForDate(data.customers || [], "firstSeenAt", selectedDate).length,
+        customers: (data.customers || []).length,
         handoff: handoffRows.length,
         complaints: handoffRows.filter(row => row.type === "complaint").length,
         orders: rowsForDate(data.orders || [], "createdAt", selectedDate).length,
