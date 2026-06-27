@@ -1299,6 +1299,63 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       return sendJson(res, 200, { deleted: Boolean(deleted), customer: deleted });
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/customer/mark-order-submitted") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "").trim();
+      if (!customerId) return sendJson(res, 400, { error: "Missing customerId." });
+      const customer = await store.getOrCreateCustomer(customerId, { businessAccountId: adminSession.accountId });
+      const content = await getTeamContent(adminSession.accountId);
+      const product =
+        findCatalogProduct(body.productId, content.catalog) ||
+        findCatalogProduct(customer.productId, content.catalog) ||
+        content.catalog.products.find((item) => item.id === content.catalog.default_product_id) ||
+        content.catalog.products[0];
+      if (!product) return sendJson(res, 400, { error: "No product available for this order." });
+      const option = dashboardOrderOptions(product).find((item) => item.id === String(body.orderOptionId || ""));
+      const quantity = Math.max(1, Number(body.quantity || option?.quantity || 1) || 1);
+      const name = String(body.name || "").trim();
+      const phone = String(body.phone || customerId).trim();
+      const address = String(body.address || "").trim();
+      if (!name || !phone || !address) {
+        return sendJson(res, 400, { error: "Name, phone, and address are required to submit the order." });
+      }
+      const order = await store.addOrder({
+        businessAccountId: adminSession.accountId,
+        customerId,
+        productId: product.id,
+        productName: product.name,
+        shoppingLink: product.shopping_link || "",
+        packageId: option?.legacyPackage ? legacyPackageIdForDashboardOption(option) : "",
+        packageName: option?.legacyPackage ? option.name : "",
+        packagePrice: option?.legacyPackage ? option.price : "",
+        orderOptionId: option?.legacyPackage ? "" : option?.id || "",
+        orderOptionName: option?.legacyPackage ? "" : option?.name || String(body.orderOptionName || "").trim(),
+        orderOptionPrice: option?.legacyPackage ? "" : option?.price || String(body.orderOptionPrice || "").trim(),
+        addOnChoice: String(body.addOnChoice || "").trim(),
+        quantity,
+        name,
+        phone,
+        address,
+        rawMessage: String(body.rawMessage || "Manual admin order submission").trim(),
+        statusHistory: [{ status: "pending_admin_order", at: new Date().toISOString(), actor: `admin:${adminSession.accountId}` }],
+      });
+      const updatedCustomer = await store.updateCustomer(customerId, () => ({
+        productId: product.id,
+        pendingOrder: null,
+        awaitingPackageBInterest: false,
+        handoffStatus: "human_required",
+        handoffReason: "Customer submitted complete order details.",
+      }), adminSession.accountId);
+      await store.appendAuditLog({
+        action: "manual_order_submitted",
+        customerId,
+        result: order.id,
+        businessAccountId: adminSession.accountId,
+      });
+      return sendJson(res, 200, { order: formatOrderAdminRow(order), customer: updatedCustomer });
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/reset-demo-data") {
       await store.resetDemoData();
       return sendJson(res, 200, { ok: true, resetAt: new Date().toISOString() });
@@ -2962,6 +3019,9 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       id: customer.id,
       name: latestOrder.name || "",
       whatsappId: customer.id,
+      phone: latestOrder.phone || customer.id,
+      address: latestOrder.address || "",
+      productId: customer.productId || "",
       product: productById.get(customer.productId)?.name || customer.productId || "",
       skuCode: productById.get(customer.productId)?.sku_code || "",
       label: customer.label,
@@ -2985,6 +3045,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
         caseId: complaint.id,
         customerId: complaint.customerId,
         phone: handoffPhone(complaint.customerId),
+        productId: complaint.productId || customerById.get(complaint.customerId)?.productId || "",
         product: productById.get(complaint.productId)?.name || complaint.productId || "",
         category: complaintCategoryDisplay(complaint.category),
         customerMessage: complaint.customerMessage,
@@ -3002,6 +3063,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
         type: "conversation",
         customerId: customer.id,
         phone: handoffPhone(customer.id),
+        productId: customer.productId || "",
         product: productById.get(customer.productId)?.name || customer.productId || "",
         category: "",
         customerMessage: latestInboundForCustomer(customer.id)?.body || "",
@@ -3031,6 +3093,18 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     orderStatusReplies,
     complaintSettings,
     guardrails,
+    products: teamCatalog.products.map((product) => ({
+      id: product.id,
+      name: product.name,
+      skuCode: product.sku_code || "",
+      orderOptions: dashboardOrderOptions(product).map((option) => ({
+        id: option.id,
+        name: option.name,
+        price: option.price,
+        quantity: option.quantity,
+        legacyPackage: option.legacyPackage,
+      })),
+    })),
     customers: customerRows,
     noReplyAlerts,
     handoffQueue,
@@ -3485,6 +3559,31 @@ function formatOrderAdminRow(order) {
     acknowledgedAt: order.acknowledgedAt || "",
     completedAt: order.completedAt || "",
   };
+}
+
+function dashboardOrderOptions(product = {}) {
+  const explicit = Array.isArray(product.order_options) ? product.order_options : [];
+  if (explicit.length) {
+    const packageIds = new Set((product.packages || []).map((item) => String(item.id || "").toLowerCase()));
+    return explicit.map((item) => dashboardOrderOption(item, packageIds.has(String(item.id || "").toLowerCase())));
+  }
+  return (product.packages || []).map((item) => dashboardOrderOption(item, true));
+}
+
+function dashboardOrderOption(item = {}, legacyPackage = false) {
+  const name = String(item.name || item.label || item.id || "").trim();
+  const id = String(item.id || item.name || name).trim();
+  return {
+    id,
+    name,
+    price: String(item.price || "").trim(),
+    quantity: Number(item.quantity || item.total_units || 1) || 1,
+    legacyPackage: Boolean(legacyPackage || /^package\s+[a-z0-9]+$/i.test(name)),
+  };
+}
+
+function legacyPackageIdForDashboardOption(option = {}) {
+  return String(option.name || "").match(/^package\s+([a-z0-9]+)$/i)?.[1] || String(option.id || "");
 }
 
 function formatCurrency(amount) {
@@ -7051,11 +7150,12 @@ function adminDashboardHtml() {
         { label: 'Customer Message', key: 'customerMessage' },
         { label: 'Reason', key: 'reason' },
         { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
-        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-handoff-chat="' + esc(r.customerId) + '">Chat</button><button type="button" data-handoff-ack="' + esc(r.customerId) + '" data-handoff-type="' + esc(r.type) + '" data-handoff-case="' + esc(r.caseId || '') + '">Acknowledge</button>' + (r.type === 'complaint' ? '<button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button>' : '') + '</div>' }
+        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-handoff-chat="' + esc(r.customerId) + '">Chat</button><button type="button" data-manual-order-customer="' + esc(r.customerId) + '">Mark Order Submitted</button><button type="button" data-handoff-ack="' + esc(r.customerId) + '" data-handoff-type="' + esc(r.type) + '" data-handoff-case="' + esc(r.caseId || '') + '">Acknowledge</button>' + (r.type === 'complaint' ? '<button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button>' : '') + '</div>' }
       ]);
       document.querySelectorAll("button[data-handoff-chat]").forEach(button => button.addEventListener("click", () => {
         window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.handoffChat);
       }));
+      bindManualOrderButtons();
       document.querySelectorAll("button[data-handoff-ack]").forEach(button => button.addEventListener("click", async () => {
         if (!confirm("Acknowledge this handoff and remove it from the Handoff tab?")) return;
         await request("/admin/handoff/acknowledge", {
@@ -7136,6 +7236,93 @@ function adminDashboardHtml() {
         } catch (error) {
           button.disabled = false;
           button.textContent = error.message;
+        }
+      }));
+    }
+
+    function findDashboardProduct(value) {
+      const products = dashboardData ? dashboardData.products || [] : [];
+      const text = String(value || "").trim().toLowerCase();
+      return products.find(product =>
+        String(product.id || "").toLowerCase() === text ||
+        String(product.name || "").toLowerCase() === text
+      ) || null;
+    }
+
+    function findDashboardOrderOption(product, value) {
+      const options = product ? product.orderOptions || [] : [];
+      const text = String(value || "").trim().toLowerCase();
+      return options.find(option =>
+        String(option.id || "").toLowerCase() === text ||
+        String(option.name || "").toLowerCase() === text
+      ) || null;
+    }
+
+    function customerDefaultsForManualOrder(customerId) {
+      const customer = (dashboardData.customers || []).find(row => row.whatsappId === customerId) || {};
+      const handoff = (dashboardData.handoffQueue || []).find(row => row.customerId === customerId) || {};
+      const order = (dashboardData.orderCustomers || []).find(row => row.customerId === customerId) || {};
+      return {
+        productId: customer.productId || handoff.productId || "",
+        name: order.name || customer.name || "",
+        phone: order.phone || handoff.phone || customer.phone || customerId,
+        address: order.address || customer.address || "",
+      };
+    }
+
+    async function markCustomerOrderSubmitted(customerId) {
+      const defaults = customerDefaultsForManualOrder(customerId);
+      const products = dashboardData ? dashboardData.products || [] : [];
+      if (!products.length) return alert("No products found.");
+      const defaultProduct = findDashboardProduct(defaults.productId) || products[0];
+      const productList = products.map(product => product.id + " = " + product.name).join("\\n");
+      const productInput = prompt("Which product? Type product id or name:\\n\\n" + productList, defaultProduct.id);
+      if (productInput === null) return;
+      const product = findDashboardProduct(productInput) || defaultProduct;
+      const options = product.orderOptions || [];
+      const optionList = options.map(option => option.id + " = " + option.name + (option.price ? " (" + option.price + ")" : "")).join("\\n");
+      const optionInput = options.length
+        ? prompt("Which order option/package? Type id or name:\\n\\n" + optionList, options[0].id)
+        : "";
+      if (optionInput === null) return;
+      const option = findDashboardOrderOption(product, optionInput) || options[0] || {};
+      const name = prompt("Customer full name:", defaults.name || "");
+      if (name === null) return;
+      const phone = prompt("Customer phone number:", defaults.phone || customerId);
+      if (phone === null) return;
+      const address = prompt("Customer full address:", defaults.address || "");
+      if (address === null) return;
+      const quantity = prompt("Quantity/unit count:", option.quantity || 1);
+      if (quantity === null) return;
+      if (!String(name).trim() || !String(phone).trim() || !String(address).trim()) {
+        return alert("Name, phone, and address are required.");
+      }
+      await request("/admin/customer/mark-order-submitted", {
+        customerId,
+        productId: product.id,
+        orderOptionId: option.id || "",
+        orderOptionName: option.name || "",
+        orderOptionPrice: option.price || "",
+        quantity,
+        name,
+        phone,
+        address,
+        rawMessage: "Manual admin order submission"
+      });
+      await loadDashboard();
+    }
+
+    function bindManualOrderButtons() {
+      document.querySelectorAll("button[data-manual-order-customer]").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        button.textContent = "Submitting...";
+        try {
+          await markCustomerOrderSubmitted(button.dataset.manualOrderCustomer);
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          button.disabled = false;
+          button.textContent = "Mark Order Submitted";
         }
       }));
     }
@@ -7321,8 +7508,10 @@ function adminDashboardHtml() {
         { label: 'Status', key: 'status', render: r => pill(r.status) },
         { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
         { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
+        { label: 'Order', key: 'whatsappId', render: r => '<button type="button" data-manual-order-customer="' + esc(r.whatsappId) + '">Mark Order Submitted</button>' },
         { label: 'Delete', key: 'whatsappId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.whatsappId) + '">Delete</button>' }
       ]);
+      bindManualOrderButtons();
       bindDashboardCustomerDeleteButtons();
     }
 
