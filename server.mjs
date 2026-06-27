@@ -3833,9 +3833,8 @@ function messageForWebTransport(message = {}) {
   };
 }
 
-function resolveWebMediaPath(url = "") {
+function localAssetPath(url = "") {
   const value = String(url || "");
-  if (/^https?:\/\//i.test(value)) return value;
   if (value.startsWith("/assets/")) {
     const relativePath = decodeURIComponent(value.split("?")[0].slice("/assets/".length));
     const filePath = path.resolve(config.assetsDir, relativePath);
@@ -3845,6 +3844,19 @@ function resolveWebMediaPath(url = "") {
     }
     return filePath;
   }
+  return "";
+}
+
+function localAssetExists(url = "") {
+  const filePath = localAssetPath(url);
+  return !filePath || existsSync(filePath);
+}
+
+function resolveWebMediaPath(url = "") {
+  const value = String(url || "");
+  if (/^https?:\/\//i.test(value)) return value;
+  const filePath = localAssetPath(value);
+  if (filePath) return filePath;
   return value;
 }
 
@@ -3997,10 +4009,21 @@ function cleanupProcessedMessages() {
 }
 
 function clampMessages(messages = []) {
-  return messages.filter((message) => message.type !== "image" || String(message.url || "").trim()).map((message) => {
-    if (message.type !== "text") return message;
-    return { ...message, body: String(message.body || "").slice(0, config.maxReplyChars) };
-  });
+  return messages
+    .filter((message) => {
+      if (message.type !== "image") return true;
+      const url = String(message.url || "").trim();
+      if (!url) return false;
+      if (!localAssetExists(url)) {
+        console.warn(`Skipping missing local image in outbound sequence: ${url}`);
+        return false;
+      }
+      return true;
+    })
+    .map((message) => {
+      if (message.type !== "text") return message;
+      return { ...message, body: String(message.body || "").slice(0, config.maxReplyChars) };
+    });
 }
 
 async function readJsonBody(req) {
@@ -5523,7 +5546,10 @@ function isProductFlowComplete(product) {
     PRODUCT_FLOW_TEXT_SLOTS.every((slot) => String(editorData[slot.key] || "").trim()) &&
     PRODUCT_FLOW_IMAGE_SLOTS
       .filter((slot) => REQUIRED_PRODUCT_FLOW_IMAGE_KEYS.has(slot.key))
-      .every((slot) => String(imageByKey.get(slot.key) || "").trim())
+      .every((slot) => {
+        const url = String(imageByKey.get(slot.key) || "").trim();
+        return url && localAssetExists(url);
+      })
   );
 }
 
@@ -8766,9 +8792,12 @@ function productFlowPageHtml() {
     textarea:focus, select:focus, input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
     .image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
     .image-slot { min-width: 0; padding: 10px; border: 1px solid #e5e5ea; border-radius: 8px; background: var(--surface-soft); }
+    .image-slot.missing-image { border-color: #f3b3ad; background: #fff7f6; }
     .image-slot label { display: block; min-height: 34px; margin-bottom: 7px; font-size: 12px; font-weight: 700; color: #1d1d1f; }
     .image-slot img { display: block; width: 100%; height: 190px; object-fit: contain; background: #f5f5f7; border-radius: 6px; margin-bottom: 9px; }
     .image-slot input { display: block; width: 100%; font-size: 12px; color: var(--muted); }
+    .image-missing-note { display: none; margin: 0 0 8px; font-size: 12px; color: #9f1d12; overflow-wrap: anywhere; }
+    .image-slot.missing-image .image-missing-note { display: block; }
     .order-options-panel { padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
     .order-options-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .order-options-head h3 { margin: 0; font-size: 16px; }
@@ -9042,7 +9071,8 @@ function productFlowPageHtml() {
       const url = image.url ? image.url + "?v=" + version : "";
       return '<div class="image-slot">' +
         '<label for="image-' + esc(image.key) + '">' + esc(image.label) + '</label>' +
-        (url ? '<img src="' + esc(url) + '" alt="' + esc(image.label) + '" />' : '') +
+        (url ? '<img src="' + esc(url) + '" alt="' + esc(image.label) + '" onerror="this.closest(&quot;.image-slot&quot;).classList.add(&quot;missing-image&quot;)" />' : '') +
+        (image.url ? '<div class="image-missing-note">Saved image cannot be loaded. Please re-upload this photo.</div>' : '') +
         '<input id="image-' + esc(image.key) + '" type="file" accept="image/png,image/jpeg,image/webp" data-slot="' + esc(image.key) + '" />' +
       '</div>';
     }
