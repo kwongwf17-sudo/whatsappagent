@@ -3134,6 +3134,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       labelDisplay: customer.labelDisplay,
       lastMessageAt: customer.lastMessageAt || "",
       firstSeenAt: customer.firstSeenAt || "",
+      latestOrderCreatedAt: latestOrder.createdAt || "",
       inboundCount: Number(customer.inboundCount || 0),
       status: conversationStatus(customer, customerOrders),
       handoffReason: customer.handoffReason || "",
@@ -7144,6 +7145,14 @@ function adminDashboardHtml() {
         : customers.filter(customer => (customer.skuCode || "") === activeCustomerSku);
     }
 
+    function customerMatchesLabel(customer, label) {
+      if (label === "ALL") return true;
+      if (label === "DONE") {
+        return customer.labelDisplay === "DONE" && matchesDate(customer.latestOrderCreatedAt, dashboardDate());
+      }
+      return customer.labelDisplay === label;
+    }
+
     function dashboardFollowups() {
       return rowsForDate(dashboardData ? dashboardData.followups : [], "nextDueAt");
     }
@@ -7581,7 +7590,9 @@ function adminDashboardHtml() {
       const counts = new Map(labels.map(label => [label, 0]));
       counts.set("ALL", customers.length);
       for (const customer of customers) {
-        counts.set(customer.labelDisplay, (counts.get(customer.labelDisplay) || 0) + 1);
+        if (customerMatchesLabel(customer, customer.labelDisplay)) {
+          counts.set(customer.labelDisplay, (counts.get(customer.labelDisplay) || 0) + 1);
+        }
       }
       if (!labels.includes(activeCustomerLabel)) activeCustomerLabel = "ALL";
       document.querySelector("#customer-label-tabs").innerHTML = labels.map(label => {
@@ -7612,7 +7623,7 @@ function adminDashboardHtml() {
       const customers = skuFilteredCustomers();
       const filtered = activeCustomerLabel === "ALL"
         ? customers
-        : customers.filter(customer => customer.labelDisplay === activeCustomerLabel);
+        : customers.filter(customer => customerMatchesLabel(customer, activeCustomerLabel));
       sections.customers.innerHTML = table(filtered, [
         { label: 'WhatsApp ID', key: 'whatsappId' },
         { label: 'Product', key: 'product' },
