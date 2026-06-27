@@ -330,6 +330,18 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/internal/followups/customer/run") {
+      if (!isLocalRequest(req)) return sendJson(res, 403, { error: "Local requests only." });
+      const body = await readJsonBody(req);
+      const result = await sendCustomerFollowupNow(body.customerId || body.customer, {
+        businessAccountId: body.businessAccountId || body.account,
+        followupKey: body.followupKey || body.key,
+        allowAlreadySent: Boolean(body.allowAlreadySent),
+        respectOperationalControl: body.respectOperationalControl !== false,
+      });
+      return sendJson(res, result.sent ? 200 : 409, result);
+    }
+
     if (url.pathname.startsWith("/admin/") && !(await isAdminAuthenticated(req))) {
       return redirectToLogin(res, url.pathname + url.search);
     }
@@ -4624,6 +4636,11 @@ function redirectToSuperAdminLogin(res) {
 function redirectToOrderAdminLogin(res) {
   res.writeHead(303, { Location: "/order-admin/login" });
   res.end();
+}
+
+function isLocalRequest(req) {
+  const address = req.socket?.remoteAddress || "";
+  return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address);
 }
 
 function sendLoginSession(res, next, account) {
