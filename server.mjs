@@ -3060,7 +3060,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allComplaintCases,
     complaintSettings,
   ] = await Promise.all([
-    store.listCustomers(now, businessAccountId),
+    store.listCustomers(analyticsDate, businessAccountId),
     store.listDeletedCustomers(businessAccountId),
     store.listOrders(businessAccountId),
     store.listOutbox(businessAccountId),
@@ -7161,7 +7161,8 @@ function adminDashboardHtml() {
       const handoffRows = rowsForDate(data.handoffQueue || [], "createdAt", selectedDate);
       const followupRows = rowsForDate(data.followups || [], "nextDueAt", selectedDate);
       return {
-        customers: (data.customers || []).length,
+        activeCustomers: (data.customers || []).length,
+        newCustomers: data.analytics?.totalNewCustomersToday || 0,
         handoff: handoffRows.length,
         complaints: handoffRows.filter(row => row.type === "complaint").length,
         orders: rowsForDate(data.orders || [], "createdAt", selectedDate).length,
@@ -7214,7 +7215,7 @@ function adminDashboardHtml() {
       });
       const stats = dashboardStats(data);
       const summaryItems = [
-        ['Customers', stats.customers],
+        ['Customers', stats.newCustomers],
         ['Handoff', stats.handoff],
         ['Complaints', stats.complaints],
         ['Orders', stats.orders],
@@ -7525,7 +7526,7 @@ function adminDashboardHtml() {
     }
 
     function updateDashboardTabs(stats) {
-      setTabLabel("customers", "Customers", [{ value: stats.customers }]);
+      setTabLabel("customers", "Customers", [{ value: stats.activeCustomers }]);
       setTabLabel("order-customers", "Customer List", [{ value: stats.orderCustomers }]);
       setTabLabel("handoff", "Handoff", [
         { value: stats.handoff, title: "Handoff" },
