@@ -2238,6 +2238,89 @@ function requestFollowupRun(now = new Date(), options = {}) {
   return followupRunPromise;
 }
 
+async function sendCustomerFollowupNow(customerId, options = {}) {
+  const id = String(customerId || "").trim();
+  if (!id) throw new Error("Customer ID is required.");
+  const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
+  const businessAccountId = String(options.businessAccountId || config.accountId);
+  const respectOperationalControl = options.respectOperationalControl !== false;
+  const followupKey = String(options.followupKey || "").trim();
+  const allowAlreadySent = Boolean(options.allowAlreadySent);
+  const customers = await store.listCustomers(now, businessAccountId);
+  const customer = customers.find((item) => item.id === id);
+  if (!customer) {
+    return { sent: false, customerId: id, skipped: "customer_not_found" };
+  }
+  if ((customer.orderIds || []).length > 0) {
+    return { sent: false, customerId: id, skipped: "order_submitted" };
+  }
+  if (customer.optedOut) {
+    return { sent: false, customerId: id, skipped: "opted_out" };
+  }
+  if (customer.followupBlocked) {
+    return { sent: false, customerId: id, skipped: "followup_blocked" };
+  }
+  if (respectOperationalControl) {
+    const blocked = await liveAutomationBlock(customer.businessAccountId || businessAccountId);
+    if (blocked) {
+      return { sent: false, customerId: id, skipped: blocked.code, blocked };
+    }
+  }
+  const teamContent = await getTeamContent(customer.businessAccountId || businessAccountId);
+  const product = teamContent.catalog.products.find((item) => item.id === customer.productId);
+  if (!product) {
+    return { sent: false, customerId: id, skipped: "product_not_found", productId: customer.productId || "" };
+  }
+  const sequence = productFollowupSequence(product);
+  let item = followupKey
+    ? sequence.find((entry) => entry.key === followupKey)
+    : sequence.find((entry) => !customer.followupsSent?.[entry.key]);
+  if (!item && allowAlreadySent) item = sequence[0];
+  if (!item) {
+    return { sent: false, customerId: id, skipped: "all_followups_already_sent" };
+  }
+  if (customer.followupsSent?.[item.key] && !allowAlreadySent) {
+    return {
+      sent: false,
+      customerId: id,
+      followupKey: item.key,
+      skipped: "followup_already_sent",
+      sentAt: customer.followupsSent[item.key],
+    };
+  }
+  const outsideCustomerServiceWindow =
+    config.transportMode === "cloud" && !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
+  const templateName = outsideCustomerServiceWindow ? followupTemplateName(item.key) : "";
+  if (outsideCustomerServiceWindow && !templateName) {
+    return {
+      sent: false,
+      customerId: id,
+      followupKey: item.key,
+      skipped: "approved_template_required",
+    };
+  }
+  const outboundMessage = templateName
+    ? templateMessage(templateName, FOLLOWUP_TEMPLATE_LANGUAGE)
+    : textMessage(item.followup.message);
+  await sendOutbound(id, [outboundMessage], {
+    businessAccountId: customer.businessAccountId || businessAccountId,
+    purpose: "followup",
+    followupKey: item.key,
+    templateName,
+    skipFailureRecord: true,
+  });
+  await store.markFollowupSent(id, item.key, now, customer.businessAccountId || businessAccountId);
+  return {
+    sent: true,
+    customerId: id,
+    businessAccountId: customer.businessAccountId || businessAccountId,
+    productId: product.id,
+    followupKey: item.key,
+    templateName,
+    message: item.followup.message,
+  };
+}
+
 async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
   const pauseUntil = followupPauseUntil(now);
   if (pauseUntil) {
@@ -4231,7 +4314,7 @@ function whatsappWebQrOnlyHtml(accountId = "") {
 </html>`;
 }
 
-export { config, requestFollowupRun };
+export { config, requestFollowupRun, sendCustomerFollowupNow };
 function publicPrivacyHtml() {
   return `<!doctype html>
 <html lang="en">
