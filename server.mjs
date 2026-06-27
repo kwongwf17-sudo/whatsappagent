@@ -7526,7 +7526,7 @@ function adminDashboardHtml() {
     }
 
     function updateDashboardTabs(stats) {
-      setTabLabel("customers", "Customers", [{ value: stats.activeCustomers }]);
+      setTabLabel("customers", "Customers", [{ value: stats.newCustomers }]);
       setTabLabel("order-customers", "Customer List", [{ value: stats.orderCustomers }]);
       setTabLabel("handoff", "Handoff", [
         { value: stats.handoff, title: "Handoff" },
@@ -7575,6 +7575,7 @@ function adminDashboardHtml() {
     function renderCustomerLabelTabs(customers) {
       const labels = ["ALL", "NEW"];
       for (let day = 1; day <= 10; day += 1) labels.push("DAY " + day);
+      labels.push("DONE");
       labels.push("OPTED OUT");
       labels.push("DELETE");
       const counts = new Map(labels.map(label => [label, 0]));
