@@ -574,6 +574,10 @@ const server = http.createServer(async (req, res) => {
       return handleVerification(url, res);
     }
 
+    if (req.method === "GET" && url.pathname.startsWith("/persisted-assets/")) {
+      return handlePersistedAsset(url, res);
+    }
+
     if (req.method === "GET" && url.pathname.startsWith("/assets/")) {
       return handleAsset(url, res);
     }
@@ -1226,10 +1230,18 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         : `${slot.filename}.${image.extension}`;
       await writeFile(path.join(targetDirectory, filename), image.bytes);
       const assetUrl = `/assets/${accountAssetId}/${productAssetId}/${filename}`;
-      updateProductFlowImage(product, slot, assetUrl);
+      const durableUrl = persistedProductImageUrl(adminSession.accountId, product.id, slot.key, image.extension);
+      persistProductFlowImage(product, slot, {
+        dataUrl: body.dataUrl,
+        image,
+        originalName,
+        assetUrl,
+        durableUrl,
+      });
+      updateProductFlowImage(product, slot, durableUrl);
       const extraction = await ingestProductImageKnowledge(product, {
         slot,
-        assetUrl,
+        assetUrl: durableUrl,
         originalName,
         dataUrl: body.dataUrl,
       });
@@ -3966,7 +3978,7 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
   if (config.transportMode === "web") {
     if (!webTransportManager) throw new Error("WhatsApp Web transport is not initialized.");
     const accountId = meta.businessAccountId || config.accountId;
-    const messageId = await webTransportManager.send(accountId, to, messageForWebTransport(message));
+    const messageId = await webTransportManager.send(accountId, to, await messageForWebTransport(message, accountId));
     console.log(`Sent WhatsApp Web ${message.type} to ${to}`);
     return messageId || `web_${Date.now()}`;
   }
@@ -4031,11 +4043,11 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
   return data.messages?.[0]?.id || "";
 }
 
-function messageForWebTransport(message = {}) {
+async function messageForWebTransport(message = {}, accountId = config.accountId) {
   if (message.type !== "image") return message;
   return {
     ...message,
-    url: resolveWebMediaPath(message.url),
+    url: await resolveWebMediaPath(message.url, accountId),
   };
 }
 
@@ -4053,14 +4065,23 @@ function localAssetPath(url = "") {
   return "";
 }
 
+function isPersistedAssetUrl(url = "") {
+  return String(url || "").startsWith("/persisted-assets/");
+}
+
 function localAssetExists(url = "") {
+  if (isPersistedAssetUrl(url)) return true;
   const filePath = localAssetPath(url);
   return !filePath || existsSync(filePath);
 }
 
-function resolveWebMediaPath(url = "") {
+async function resolveWebMediaPath(url = "", accountId = config.accountId) {
   const value = String(url || "");
   if (/^https?:\/\//i.test(value)) return value;
+  if (isPersistedAssetUrl(value)) {
+    const filePath = await materializePersistedAsset(value, accountId);
+    if (filePath) return filePath;
+  }
   const filePath = localAssetPath(value);
   if (filePath) return filePath;
   return value;
@@ -4752,6 +4773,16 @@ async function handleAsset(url, res) {
   }
 }
 
+async function handlePersistedAsset(url, res) {
+  const asset = await persistedAssetFromUrl(url.pathname);
+  if (!asset) return sendText(res, 404, "Asset not found");
+  res.writeHead(200, {
+    "Content-Type": asset.mimeType,
+    "Cache-Control": "public, max-age=3600",
+  });
+  res.end(asset.bytes);
+}
+
 function resolveMediaUrl(url) {
   if (/^https?:\/\//i.test(url)) return url;
   if (config.publicBaseUrl) return new URL(url, config.publicBaseUrl).toString();
@@ -5283,8 +5314,15 @@ function productFlowEditorData(product, options = {}) {
     return String(openingFlow[index]?.body || "");
   };
   const imageUrlForSlot = (slot) => {
-    if (slot.key === "salesPhoto") return String(product.sales_photo_url || "");
-    return String(openingFlow[slot.index]?.url || "");
+    const saved = persistedProductFlowImage(product, slot.key);
+    const currentUrl = slot.key === "salesPhoto"
+      ? String(product.sales_photo_url || "")
+      : String(openingFlow[slot.index]?.url || "");
+    if (!currentUrl) return String(saved?.durableUrl || "");
+    if (currentUrl.startsWith("/assets/") && saved?.durableUrl && !localAssetExists(currentUrl)) {
+      return String(saved.durableUrl || "");
+    }
+    return currentUrl;
   };
   return {
     id: product.id,
@@ -5372,6 +5410,34 @@ function updateProductFlowImage(product, slot, assetUrl) {
     caption: image.label,
   }));
   updateProductFlowReadiness(product);
+}
+
+function ensureProductPersistedImages(product) {
+  product.persisted_images = product.persisted_images && typeof product.persisted_images === "object"
+    ? product.persisted_images
+    : {};
+  return product.persisted_images;
+}
+
+function persistedProductFlowImage(product, slotKey) {
+  const images = product.persisted_images && typeof product.persisted_images === "object"
+    ? product.persisted_images
+    : {};
+  const saved = images[String(slotKey || "")];
+  return saved && typeof saved === "object" ? saved : null;
+}
+
+function persistProductFlowImage(product, slot, { dataUrl, image, originalName = "", assetUrl = "", durableUrl = "" }) {
+  const images = ensureProductPersistedImages(product);
+  images[slot.key] = {
+    dataUrl: String(dataUrl || ""),
+    mimeType: image.mimeType,
+    extension: image.extension,
+    originalName: String(originalName || ""),
+    assetUrl,
+    durableUrl,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, originalName = "" }) {
@@ -5516,6 +5582,11 @@ async function extractExistingProductImageKnowledge(product) {
 
 async function assetUrlToDataUrl(assetUrl) {
   const cleanUrl = String(assetUrl || "").split("?")[0];
+  if (cleanUrl.startsWith("/persisted-assets/")) {
+    const asset = await persistedAssetFromUrl(cleanUrl);
+    if (!asset) throw new Error("Persisted image asset could not be loaded.");
+    return `data:${asset.mimeType};base64,${asset.bytes.toString("base64")}`;
+  }
   if (!cleanUrl.startsWith("/assets/")) {
     throw new Error("Only local uploaded assets can be extracted.");
   }
@@ -5539,6 +5610,66 @@ function imageFilename(assetUrl, originalName = "") {
   const cleanUrl = String(assetUrl || "").split("?")[0];
   if (!cleanUrl) return "";
   return path.basename(decodeURIComponent(cleanUrl));
+}
+
+function persistedProductImageUrl(accountId, productId, slotKey, extension = "jpg") {
+  const ext = safeAssetSegment(extension || "jpg").replace(/[^a-z0-9]/g, "") || "jpg";
+  return `/persisted-assets/${encodeURIComponent(accountId || config.accountId)}/${encodeURIComponent(productId || "product")}/${encodeURIComponent(slotKey || "image")}.${ext}`;
+}
+
+function parsePersistedAssetPath(pathname = "") {
+  const prefix = "/persisted-assets/";
+  if (!String(pathname || "").startsWith(prefix)) return null;
+  const parts = pathname.slice(prefix.length).split("/");
+  if (parts.length !== 3) return null;
+  const accountId = decodeURIComponent(parts[0] || "");
+  const productId = decodeURIComponent(parts[1] || "");
+  const slotFile = decodeURIComponent(parts[2] || "");
+  const extension = slotFile.match(/\.([a-z0-9]+)$/i)?.[1] || "jpg";
+  const slotKey = slotFile.replace(/\.[a-z0-9]+$/i, "");
+  if (!accountId || !productId || !slotKey) return null;
+  return { accountId, productId, slotKey, extension };
+}
+
+function decodePersistedImageDataUrl(dataUrl = "") {
+  const match = String(dataUrl || "").match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)$/);
+  if (!match) return null;
+  const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[match[1]];
+  return {
+    mimeType: match[1],
+    extension,
+    bytes: Buffer.from(match[2].replace(/\s/g, ""), "base64"),
+  };
+}
+
+async function persistedAssetFromUrl(pathname = "") {
+  const parsed = parsePersistedAssetPath(String(pathname || "").split("?")[0]);
+  if (!parsed) return null;
+  const content = await getTeamContent(parsed.accountId);
+  const product = findCatalogProduct(parsed.productId, content.catalog || catalog);
+  const saved = product ? persistedProductFlowImage(product, parsed.slotKey) : null;
+  const image = decodePersistedImageDataUrl(saved?.dataUrl);
+  return image ? { ...image, product, saved, ...parsed } : null;
+}
+
+async function materializePersistedAsset(url = "", fallbackAccountId = config.accountId) {
+  let asset = await persistedAssetFromUrl(url);
+  if (!asset && fallbackAccountId) {
+    const parsed = parsePersistedAssetPath(String(url || "").split("?")[0]);
+    if (parsed) {
+      asset = await persistedAssetFromUrl(persistedProductImageUrl(fallbackAccountId, parsed.productId, parsed.slotKey, parsed.extension));
+    }
+  }
+  if (!asset) return "";
+  const accountAssetId = safeAssetSegment(asset.accountId);
+  const productAssetId = safeAssetSegment(asset.productId);
+  const slot = PRODUCT_FLOW_IMAGE_SLOTS.find((item) => item.key === asset.slotKey);
+  const filename = `${slot?.filename || safeAssetSegment(asset.slotKey)}.${asset.extension}`;
+  const targetDirectory = path.join(config.assetsDir, accountAssetId, productAssetId);
+  await mkdir(targetDirectory, { recursive: true });
+  const filePath = path.join(targetDirectory, filename);
+  await writeFile(filePath, asset.bytes);
+  return filePath;
 }
 
 function categoryFromImageName(filename = "", fallback = "") {
@@ -5769,10 +5900,7 @@ function updateProductFlowReadiness(product) {
 }
 
 function decodeUploadedImage(dataUrl) {
-  const match = String(dataUrl || "").match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)$/);
-  if (!match) return null;
-  const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[match[1]];
-  return { extension, bytes: Buffer.from(match[2].replace(/\s/g, ""), "base64") };
+  return decodePersistedImageDataUrl(dataUrl);
 }
 
 async function persistCatalog() {
