@@ -343,6 +343,15 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, result.sent ? 200 : 409, result);
     }
 
+    if (req.method === "POST" && url.pathname === "/internal/followups/run") {
+      if (!isLocalRequest(req)) return sendJson(res, 403, { error: "Local requests only." });
+      const body = await readJsonBody(req);
+      const result = await requestFollowupRun(body.now ? new Date(body.now) : new Date(), {
+        respectOperationalControl: body.respectOperationalControl !== false,
+      });
+      return sendJson(res, 200, result);
+    }
+
     if (url.pathname.startsWith("/admin/") && !(await isAdminAuthenticated(req))) {
       return redirectToLogin(res, url.pathname + url.search);
     }
