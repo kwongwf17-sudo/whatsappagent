@@ -108,6 +108,7 @@ const config = {
   followupActiveWindowMinutes: Number(getEnv("FOLLOWUP_ACTIVE_WINDOW_MINUTES", "10")),
   followupPauseWindowMinutes: Number(getEnv("FOLLOWUP_PAUSE_WINDOW_MINUTES", "5")),
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
+  businessTimeZone: getEnv("BUSINESS_TIME_ZONE", "Asia/Kuala_Lumpur"),
   openingFlowInitialDelayMs: Number(getEnv("OPENING_FLOW_INITIAL_DELAY_MS", "5000")),
   statusReplyDelayMs: Number(getEnv("STATUS_REPLY_DELAY_MS", "5000")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
@@ -3198,7 +3199,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       handoff: handoffQueue.length,
       complaints: complaintCases.filter((complaint) => complaint.status !== "resolved").length,
       orders: orders.length,
-      followupsDue: followupRows.filter((row) => row.status === "due").length,
+      followupsDue: followupRows.filter((row) => /^due\b/i.test(row.status || "")).length,
       followupsQueued: pendingFollowupDispatches,
       deleted: deletedCustomers.length,
       outbox: outbox.length,
@@ -3794,22 +3795,65 @@ function formatLocalDate(value) {
 
 function firstFollowupDueAt(firstSeenAt, options = {}) {
   const firstSeen = new Date(firstSeenAt);
-  const due = new Date(firstSeen);
   const cutoffHour = Number.isFinite(options.cutoffHour) ? options.cutoffHour : 19;
   const sendHour = Number.isFinite(options.sendHour) ? options.sendHour : 20;
-  if (firstSeen.getHours() < cutoffHour) {
-    due.setHours(sendHour, 0, 0, 0);
-    return due;
+  const firstSeenLocal = followupZonedDateParts(firstSeen);
+  const dueLocal = { ...firstSeenLocal, hour: sendHour, minute: 0, second: 0, millisecond: 0 };
+  if (firstSeenLocal.hour >= cutoffHour) {
+    const next = addFollowupLocalDays(dueLocal, 1);
+    return followupZonedLocalToDate(next);
   }
-  due.setDate(due.getDate() + 1);
-  due.setHours(sendHour, 0, 0, 0);
-  return due;
+  return followupZonedLocalToDate(dueLocal);
 }
 
-function addDays(date, days) {
-  const next = new Date(date);
-  next.setDate(next.getDate() + days);
-  return next;
+function addFollowupLocalDays(parts, days) {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, parts.hour || 0, parts.minute || 0, parts.second || 0, parts.millisecond || 0));
+  return {
+    ...parts,
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+  };
+}
+
+function followupZonedDateParts(date, timeZone = config.businessTimeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    hour12: false,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+  return {
+    year: value.year,
+    month: value.month,
+    day: value.day,
+    hour: value.hour,
+    minute: value.minute,
+    second: value.second,
+    millisecond: date.getMilliseconds(),
+  };
+}
+
+function followupZonedLocalToDate(parts, timeZone = config.businessTimeZone) {
+  const targetUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour || 0, parts.minute || 0, parts.second || 0, parts.millisecond || 0);
+  const guess = new Date(targetUtc);
+  const guessParts = followupZonedDateParts(guess, timeZone);
+  const guessAsUtc = Date.UTC(
+    guessParts.year,
+    guessParts.month - 1,
+    guessParts.day,
+    guessParts.hour || 0,
+    guessParts.minute || 0,
+    guessParts.second || 0,
+    guessParts.millisecond || 0
+  );
+  return new Date(targetUtc - (guessAsUtc - guess.getTime()));
 }
 
 function productFollowupSequence(product) {
@@ -3842,13 +3886,11 @@ function followupDueAt(firstSeenAt, item) {
   });
   if (item.key === "first_day_followup") return firstDueAt;
 
-  const firstSeen = new Date(firstSeenAt);
-  const due = addDays(firstSeen, item.dayOffset);
-  due.setHours(item.sendHour, 0, 0, 0);
+  const firstSeenLocal = followupZonedDateParts(new Date(firstSeenAt));
+  const dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, item.dayOffset);
+  let due = followupZonedLocalToDate(dueLocal);
   if (due <= firstDueAt) {
-    due.setTime(firstDueAt.getTime());
-    due.setDate(due.getDate() + 1);
-    due.setHours(item.sendHour, 0, 0, 0);
+    due = followupZonedLocalToDate(addFollowupLocalDays({ ...followupZonedDateParts(firstDueAt), hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, 1));
   }
   return due;
 }
@@ -7304,7 +7346,7 @@ function adminDashboardHtml() {
         complaints: handoffRows.filter(row => row.type === "complaint").length,
         orders: rowsForDate(data.orders || [], "createdAt", selectedDate).length,
         orderCustomers: new Set(rowsForDate(data.orderCustomers || [], "createdAt", selectedDate).map(row => row.customerId).filter(Boolean)).size,
-        followupsDue: followupRows.filter(row => row.status === "due").length,
+        followupsDue: followupRows.filter(row => /^due\b/i.test(row.status || "")).length,
         followupsQueued: followupRows.filter(row => row.queueStatus).length,
         deleted: rowsForDate(data.deletedCustomers || [], "deletedAt", selectedDate).length,
         noReplyAlerts: rowsForDate(data.noReplyAlerts || [], "receivedAt", selectedDate).length,
