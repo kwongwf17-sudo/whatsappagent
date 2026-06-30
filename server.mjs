@@ -8617,6 +8617,23 @@ function adminChatPageHtml() {
       const day = String(date.getDate()).padStart(2, "0");
       return year + "-" + month + "-" + day;
     }
+    function selectedChatDate() {
+      return chatDate.value || localDateInput(new Date());
+    }
+    function matchesChatDate(value) {
+      const selectedDate = selectedChatDate();
+      if (!selectedDate) return true;
+      return localDateInput(value) === selectedDate;
+    }
+    function messagesForCustomer(customerId, selectedDateOnly = false) {
+      return (data ? data.conversationMessages || [] : [])
+        .filter(message => message.to === customerId || message.from === customerId)
+        .filter(message => !selectedDateOnly || matchesChatDate(message.createdAt));
+    }
+    function customerHasConversationOnSelectedDate(customer) {
+      if (messagesForCustomer(customer.id, true).length) return true;
+      return matchesChatDate(customer.lastMessageAt) || matchesChatDate(customer.firstSeenAt);
+    }
     async function request(path, body) {
       const response = await fetch(path, {
         method: "POST",
@@ -8630,11 +8647,14 @@ function adminChatPageHtml() {
     function customerRows() {
       const q = search.value.trim().toLowerCase();
       const rows = data ? data.customers || [] : [];
-      return rows.filter(customer => {
-        if (!q) return true;
-        return [customer.id, customer.product, customer.name, customer.status, customer.labelDisplay]
-          .some(value => String(value || "").toLowerCase().includes(q));
-      }).sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
+      return rows
+        .filter(customer => customerHasConversationOnSelectedDate(customer))
+        .filter(customer => {
+          if (!q) return true;
+          return [customer.id, customer.product, customer.name, customer.status, customer.labelDisplay]
+            .some(value => String(value || "").toLowerCase().includes(q));
+        })
+        .sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
     }
     function renderList() {
       const rows = customerRows();
@@ -8661,7 +8681,7 @@ function adminChatPageHtml() {
       });
     }
     function renderThread() {
-      const customer = (data.customers || []).find(item => item.id === activeCustomerId);
+      const customer = customerRows().find(item => item.id === activeCustomerId);
       replyText.disabled = !customer;
       sendButton.disabled = !customer;
       if (!customer) {
@@ -8673,12 +8693,11 @@ function adminChatPageHtml() {
         esc(customer.product || '-') + ' | ' + esc(customer.status || '-') + ' | ' + esc(customer.guardrail || '') +
         '</span></div><div class="chat-header-actions"><button id="delete-conversation" class="danger" type="button">Delete Chat</button></div>';
       document.querySelector("#delete-conversation").addEventListener("click", deleteConversation);
-      const messages = (data.conversationMessages || [])
-        .filter(message => message.to === activeCustomerId || message.from === activeCustomerId)
+      const messages = messagesForCustomer(activeCustomerId, true)
         .slice()
         .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
       if (!messages.length) {
-        thread.innerHTML = '<div class="empty">No messages for this customer yet.</div>';
+        thread.innerHTML = '<div class="empty">No messages for this customer on ' + esc(selectedChatDate()) + '.</div>';
         return;
       }
       thread.innerHTML = messages.map(message => {
@@ -8696,11 +8715,11 @@ function adminChatPageHtml() {
       renderThread();
     }
     async function load() {
-      const selectedDate = chatDate.value || localDateInput(new Date());
+      const selectedDate = selectedChatDate();
       const response = await fetch("/admin/dashboard-data?date=" + encodeURIComponent(selectedDate));
       data = await response.json();
       applyProfile(data.profile);
-      document.querySelector("#status").textContent = "Loaded " + (data.customers || []).length + " customer(s) for " + selectedDate + ".";
+      document.querySelector("#status").textContent = "Loaded " + customerRows().length + " conversation(s) for " + selectedDate + ".";
       render();
     }
     async function deleteConversation() {
