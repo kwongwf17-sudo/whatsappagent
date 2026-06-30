@@ -142,6 +142,15 @@ const FOLLOWUP_EDITOR_STAGES = [
     return { key: `day_${day}_followup`, label: `Day ${day}`, dayOffset: day, defaultSendHour: 20 };
   }),
 ];
+const FOLLOWUP_MEDIA_MAX_BYTES = 30 * 1024 * 1024;
+const FOLLOWUP_MEDIA_TYPES = new Map([
+  ["image/jpeg", { extension: "jpg", type: "image" }],
+  ["image/png", { extension: "png", type: "image" }],
+  ["image/webp", { extension: "webp", type: "image" }],
+  ["video/mp4", { extension: "mp4", type: "video" }],
+  ["video/webm", { extension: "webm", type: "video" }],
+  ["video/quicktime", { extension: "mov", type: "video" }],
+]);
 const DEFAULT_ORDER_CLOSING_MESSAGES = [
   "Sorry Dear our stock just finish , I will take order again, will take around 15-18 days for arrived brunei new stock 🥰 But i will try my best to get it quick for you ya.",
   "REMINDER ✨: \n-Order after 1 hour cannot be canceled. \n-Brg Sampai baru byr runner",
@@ -655,19 +664,59 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, result.sent ? 200 : 409, result);
     }
 
+    if (req.method === "GET" && url.pathname === "/admin/follow-up-settings") {
+      return sendHtml(res, 200, followupSettingsPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/followup-settings-data") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendJson(res, 200, await buildFollowupSettingsData(adminSession.accountId));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/followup-settings/media") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      const media = decodeUploadedFollowupMedia(body.dataUrl);
+      if (!media) return sendJson(res, 400, { error: "Please upload an image or video file." });
+      if (media.bytes.length > FOLLOWUP_MEDIA_MAX_BYTES) {
+        return sendJson(res, 400, { error: "Media must be 30 MB or smaller." });
+      }
+      const accountAssetId = safeAssetSegment(adminSession.accountId);
+      const targetDirectory = path.join(config.assetsDir, accountAssetId, "followups");
+      await mkdir(targetDirectory, { recursive: true });
+      const originalName = String(body.originalName || "").trim();
+      const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName))) || "followup";
+      const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${originalBase}.${media.extension}`;
+      await writeFile(path.join(targetDirectory, filename), media.bytes);
+      return sendJson(res, 200, {
+        block: {
+          id: `block_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`,
+          type: media.type,
+          url: `/assets/${accountAssetId}/followups/${filename}`,
+          caption: "",
+        },
+      });
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/followup-settings/save") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       const content = await getTeamContent(adminSession.accountId);
       const saved = updateTeamFollowupMessages(content, body.followups || body.stages || []);
       await saveTeamContent(adminSession.accountId, content);
+      if (body.settings && typeof body.settings === "object") {
+        await adminAccounts.updateTeamSettings(adminSession.accountId, {
+          followupSendsPerMinute: body.settings.followupSendsPerMinute,
+          followupIntervalMinutes: body.settings.followupIntervalMinutes,
+        });
+      }
       await store.appendAuditLog({
         actor: `business_admin:${adminSession.accountId}`,
         action: "followup_messages_updated",
         result: `${saved.updatedProducts} product(s)`,
         businessAccountId: adminSession.accountId,
       });
-      return sendJson(res, 200, { followupMessages: teamFollowupMessages(content), saved });
+      return sendJson(res, 200, { ...(await buildFollowupSettingsData(adminSession.accountId, content)), saved });
     }
 
     if (req.method === "POST" && url.pathname === "/demo/followups/run") {
@@ -1526,9 +1575,35 @@ if (!config.skipHttpServer && webTransportManager) {
 }
 
 if (!config.skipHttpServer && config.followupAutorun) {
-  setInterval(() => {
-    void requestFollowupRun().catch((error) => recordSystemError("followup_run", error));
-  }, Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
+  scheduleFollowupAutorun();
+}
+
+async function followupAutorunIntervalMinutes() {
+  try {
+    const accounts = await adminAccounts.listAccounts();
+    const intervals = accounts
+      .map((account) => Number(account.settings?.followupIntervalMinutes || 0))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (intervals.length) return Math.min(...intervals);
+  } catch (error) {
+    await recordSystemError("followup_interval_settings", error);
+  }
+  return Math.max(config.followupIntervalMinutes, 1);
+}
+
+function scheduleFollowupAutorun() {
+  void (async () => {
+    const intervalMinutes = await followupAutorunIntervalMinutes();
+    setTimeout(async () => {
+      try {
+        await requestFollowupRun();
+      } catch (error) {
+        await recordSystemError("followup_run", error);
+      } finally {
+        scheduleFollowupAutorun();
+      }
+    }, Math.max(intervalMinutes, 1) * 60 * 1000);
+  })();
 }
 
 function handleVerification(url, res) {
@@ -2382,10 +2457,10 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
       skipped: "approved_template_required",
     };
   }
-  const outboundMessage = templateName
+  const outboundMessages = templateName
     ? templateMessage(templateName, FOLLOWUP_TEMPLATE_LANGUAGE)
-    : textMessage(item.followup.message);
-  await sendOutbound(id, [outboundMessage], {
+    : followupOutboundMessages(item.followup);
+  await sendOutbound(id, Array.isArray(outboundMessages) ? outboundMessages : [outboundMessages], {
     businessAccountId: customer.businessAccountId || businessAccountId,
     purpose: "followup",
     followupKey: item.key,
@@ -2446,6 +2521,7 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
       labelDisplay: item.customer.labelDisplay,
       followupKey: item.followupKey,
       message: item.followup.message,
+      messages: item.followup.messages,
     })),
     now
   );
@@ -2526,9 +2602,7 @@ async function dispatchFollowupQueue(now = new Date()) {
   const pauseUntil = followupPauseUntil(now);
   if (pauseUntil) return { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], pausedUntil: pauseUntil.toISOString() };
 
-  const batch = rotateFollowupBatch(
-    await operations.claimFollowupBatch(Math.max(config.followupSendsPerMinute, 1), now)
-  );
+  const batch = rotateFollowupBatch(await claimFollowupDispatchBatch(now));
   const customers = await store.listCustomers(now);
   const customerById = new Map(customers.map((customer) => [customerKey(customer.businessAccountId || config.accountId, customer.id), customer]));
   const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [] };
@@ -2571,10 +2645,10 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     try {
       await wait(randomFollowupDelayMs());
-      const outboundMessage = templateName
+      const outboundMessages = templateName
         ? templateMessage(templateName, FOLLOWUP_TEMPLATE_LANGUAGE)
-        : textMessage(item.message);
-      await sendOutbound(item.customerId, [outboundMessage], {
+        : followupOutboundMessages({ message: item.message, messages: item.messages });
+      await sendOutbound(item.customerId, Array.isArray(outboundMessages) ? outboundMessages : [outboundMessages], {
         businessAccountId: itemAccountId,
         purpose: "followup",
         followupKey: item.followupKey,
@@ -2595,6 +2669,27 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
   }
   return result;
+}
+
+async function claimFollowupDispatchBatch(now = new Date()) {
+  const claimed = [];
+  const seenAccounts = new Set();
+  try {
+    const accounts = await adminAccounts.listAccounts();
+    for (const account of accounts) {
+      const accountId = String(account.id || "");
+      if (!accountId || seenAccounts.has(accountId)) continue;
+      seenAccounts.add(accountId);
+      const limit = Number(account.settings?.followupSendsPerMinute || 0) || config.followupSendsPerMinute;
+      claimed.push(...await operations.claimFollowupBatch(Math.max(limit, 1), now, accountId));
+    }
+  } catch (error) {
+    await recordSystemError("followup_batch_settings", error);
+  }
+  if (!seenAccounts.has(config.accountId)) {
+    claimed.push(...await operations.claimFollowupBatch(Math.max(config.followupSendsPerMinute, 1), now, config.accountId));
+  }
+  return claimed;
 }
 
 function customerKey(businessAccountId, customerId) {
@@ -3103,6 +3198,19 @@ async function appendSimMessage(message) {
     return;
   }
   await store.appendOutbox(message);
+}
+
+async function buildFollowupSettingsData(businessAccountId = config.accountId, content = null) {
+  const teamContent = content || await getTeamContent(businessAccountId);
+  const settings = await adminAccounts.getTeamSettings(businessAccountId);
+  return {
+    profile: normalizeDashboardProfile((await store.getSystemState()).dashboardProfile),
+    followupMessages: teamFollowupMessages(teamContent),
+    settings: {
+      followupSendsPerMinute: Number(settings.followupSendsPerMinute || 0) || config.followupSendsPerMinute,
+      followupIntervalMinutes: Number(settings.followupIntervalMinutes || 0) || config.followupIntervalMinutes,
+    },
+  };
 }
 
 async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId) {
@@ -3843,11 +3951,12 @@ function formatLocalDate(value) {
 
 function firstFollowupDueAt(firstSeenAt, options = {}) {
   const firstSeen = new Date(firstSeenAt);
+  const cutoffEnabled = options.cutoffEnabled !== false;
   const cutoffHour = Number.isFinite(options.cutoffHour) ? options.cutoffHour : 19;
   const sendHour = Number.isFinite(options.sendHour) ? options.sendHour : 20;
   const firstSeenLocal = followupZonedDateParts(firstSeen);
   const dueLocal = { ...firstSeenLocal, hour: sendHour, minute: 0, second: 0, millisecond: 0 };
-  if (firstSeenLocal.hour >= cutoffHour) {
+  if (cutoffEnabled && firstSeenLocal.hour >= cutoffHour) {
     const next = addFollowupLocalDays(dueLocal, 1);
     return followupZonedLocalToDate(next);
   }
@@ -3908,14 +4017,22 @@ function productFollowupSequence(product) {
   const entries = Object.entries(product?.followups || {});
   const firstFollowup = entries.find(([key]) => key === "first_day_followup")?.[1] || {};
   return entries
-    .map(([key, followup], index) => ({
-      key,
-      followup,
-      firstFollowup,
-      index,
-      dayOffset: followupDayOffset(key, followup, index),
-      sendHour: Number.isFinite(followup?.send_hour) ? followup.send_hour : 20,
-    }))
+    .map(([key, followup], index) => {
+      const messages = normalizeFollowupMessageBlocks(followup?.messages, followup?.message);
+      return {
+        key,
+        followup: {
+          ...followup,
+          message: followupTextSummary(messages, followup?.message),
+          messages,
+        },
+        firstFollowup,
+        index,
+        dayOffset: followupDayOffset(key, followup, index),
+        sendHour: Number.isFinite(followup?.send_hour) ? followup.send_hour : 20,
+      };
+    })
+    .filter((item) => item.followup.messages.length)
     .sort((a, b) => a.dayOffset - b.dayOffset || a.index - b.index);
 }
 
@@ -3924,13 +4041,26 @@ function teamFollowupMessages(content = defaultTeamContent) {
   const sourceProduct = products.find((product) => product?.followups && Object.keys(product.followups).length) || products[0] || {};
   return FOLLOWUP_EDITOR_STAGES.map((stage) => {
     const followup = sourceProduct.followups?.[stage.key] || {};
+    const messages = normalizeFollowupMessageBlocks(followup.messages, followup.message);
     return {
       key: stage.key,
       label: stage.label,
       dayOffset: Number.isFinite(followup.day_offset) ? followup.day_offset : stage.dayOffset,
       sendHour: Number.isFinite(followup.send_hour) ? followup.send_hour : stage.defaultSendHour,
-      message: String(followup.message || ""),
-      enabled: Boolean(String(followup.message || "").trim()),
+      message: followupTextSummary(messages, followup.message),
+      messages,
+      enabled: messages.length > 0,
+      firstChatCutoffEnabled: stage.firstChatCutoffHour !== undefined
+        ? followup.first_chat_cutoff_enabled !== false
+        : undefined,
+      firstChatCutoffHour: stage.firstChatCutoffHour !== undefined
+        ? clampNumber(
+            followup.first_chat_cutoff_hour,
+            0,
+            23,
+            stage.firstChatCutoffHour
+          )
+        : undefined,
     };
   });
 }
@@ -3945,8 +4075,8 @@ function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
     for (const stage of FOLLOWUP_EDITOR_STAGES) {
       if (!byKey.has(stage.key)) continue;
       const input = byKey.get(stage.key) || {};
-      const message = String(input.message || "").trim();
-      if (!message) {
+      const messages = normalizeFollowupMessageBlocks(input.messages, input.message);
+      if (!messages.length) {
         if (product.followups[stage.key]) {
           delete product.followups[stage.key];
           changed = true;
@@ -3958,9 +4088,11 @@ function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
         ...existing,
         send_hour: clampNumber(input.sendHour, 0, 23, Number.isFinite(existing.send_hour) ? existing.send_hour : stage.defaultSendHour),
         day_offset: stage.dayOffset,
-        message,
+        message: followupTextSummary(messages, ""),
+        messages,
       };
       if (stage.firstChatCutoffHour !== undefined) {
+        product.followups[stage.key].first_chat_cutoff_enabled = input.firstChatCutoffEnabled !== false;
         product.followups[stage.key].first_chat_cutoff_hour = clampNumber(
           input.firstChatCutoffHour,
           0,
@@ -3973,6 +4105,48 @@ function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
     if (changed) updatedProducts += 1;
   }
   return { updatedProducts, stages: teamFollowupMessages(content) };
+}
+
+function normalizeFollowupMessageBlocks(blocks, fallbackMessage = "") {
+  const source = Array.isArray(blocks) ? blocks : [];
+  const normalized = source.map((block, index) => normalizeFollowupMessageBlock(block, index)).filter(Boolean);
+  if (normalized.length) return normalized;
+  const message = String(fallbackMessage || "").trim();
+  return message ? [{ id: `text_${Date.now()}_0`, type: "text", body: message }] : [];
+}
+
+function normalizeFollowupMessageBlock(block = {}, index = 0) {
+  const type = String(block.type || "text").trim().toLowerCase();
+  const id = String(block.id || `block_${Date.now()}_${index}`).trim();
+  if (type === "image" || type === "video") {
+    const url = String(block.url || "").trim();
+    if (!url) return null;
+    return {
+      id,
+      type,
+      url,
+      caption: String(block.caption || "").trim(),
+    };
+  }
+  const body = String(block.body || block.message || block.text || "").trim();
+  return body ? { id, type: "text", body } : null;
+}
+
+function followupTextSummary(messages = [], fallback = "") {
+  const text = messages.find((message) => message.type === "text" && String(message.body || "").trim());
+  if (text) return String(text.body || "").trim();
+  const caption = messages.find((message) => String(message.caption || "").trim());
+  if (caption) return String(caption.caption || "").trim();
+  return String(fallback || "").trim();
+}
+
+function followupOutboundMessages(followup = {}) {
+  return normalizeFollowupMessageBlocks(followup.messages, followup.message).map((message) => {
+    if (message.type === "image" || message.type === "video") {
+      return { type: message.type, url: message.url, caption: message.caption || "" };
+    }
+    return textMessage(message.body);
+  });
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -3991,6 +4165,7 @@ function followupDayOffset(key, followup, index) {
 
 function followupDueAt(firstSeenAt, item) {
   const firstDueAt = firstFollowupDueAt(firstSeenAt, {
+    cutoffEnabled: item.firstFollowup?.first_chat_cutoff_enabled !== false,
     cutoffHour: item.firstFollowup?.first_chat_cutoff_hour,
     sendHour: Number.isFinite(item.firstFollowup?.send_hour) ? item.firstFollowup.send_hour : item.sendHour,
   });
@@ -4135,8 +4310,10 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
     return messageId || `web_${Date.now()}`;
   }
 
-  const image = message.type === "image" ? { link: resolveMediaUrl(message.url) } : null;
+  const image = message.type === "image" ? { link: resolveMediaUrl(message.url, "Image") } : null;
   if (image && message.caption) image.caption = message.caption;
+  const video = message.type === "video" ? { link: resolveMediaUrl(message.url, "Video") } : null;
+  if (video && message.caption) video.caption = message.caption;
   const payload =
     message.type === "image"
       ? {
@@ -4144,6 +4321,13 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
           to,
           type: "image",
           image,
+        }
+      : message.type === "video"
+      ? {
+          messaging_product: "whatsapp",
+          to,
+          type: "video",
+          video,
         }
       : message.type === "template"
       ? {
@@ -4196,7 +4380,7 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
 }
 
 async function messageForWebTransport(message = {}, accountId = config.accountId) {
-  if (message.type !== "image") return message;
+  if (message.type !== "image" && message.type !== "video") return message;
   return {
     ...message,
     url: await resolveWebMediaPath(message.url, accountId),
@@ -4646,6 +4830,7 @@ function whatsappWebStatusHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <button id="refresh" type="button">Refresh</button>
   </nav>
   <main>
@@ -4935,10 +5120,10 @@ async function handlePersistedAsset(url, res) {
   res.end(asset.bytes);
 }
 
-function resolveMediaUrl(url) {
+function resolveMediaUrl(url, label = "Media") {
   if (/^https?:\/\//i.test(url)) return url;
   if (config.publicBaseUrl) return new URL(url, config.publicBaseUrl).toString();
-  throw new Error("Image messages need PUBLIC_BASE_URL when DEMO_MODE=false.");
+  throw new Error(`${label} messages need PUBLIC_BASE_URL when DEMO_MODE=false.`);
 }
 
 function contentTypeFor(filePath) {
@@ -4946,6 +5131,9 @@ function contentTypeFor(filePath) {
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".png") return "image/png";
   if (ext === ".webp") return "image/webp";
+  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".webm") return "video/webm";
+  if (ext === ".mov") return "video/quicktime";
   return "application/octet-stream";
 }
 
@@ -6257,6 +6445,19 @@ function decodeUploadedImage(dataUrl) {
   return decodePersistedImageDataUrl(dataUrl);
 }
 
+function decodeUploadedFollowupMedia(dataUrl) {
+  const match = /^data:([^;]+);base64,(.+)$/i.exec(String(dataUrl || ""));
+  if (!match) return null;
+  const mimeType = match[1].toLowerCase();
+  const mediaType = FOLLOWUP_MEDIA_TYPES.get(mimeType);
+  if (!mediaType) return null;
+  return {
+    ...mediaType,
+    mimeType,
+    bytes: Buffer.from(match[2], "base64"),
+  };
+}
+
 async function persistCatalog() {
   const contents = `${JSON.stringify(catalog, null, 2)}\n`;
   catalogWriteQueue = catalogWriteQueue.then(() => writeFile(config.catalogPath, contents, "utf8"));
@@ -6858,12 +7059,6 @@ function superAdminSystemHtml() {
             <option value="gpt-5.4-mini">GPT-5.4 mini</option>
           </select>
         </label>
-        <label for="team-followup-sends">Follow-Up Sends Per Minute
-          <input id="team-followup-sends" name="followupSendsPerMinute" type="number" min="1" max="100" />
-        </label>
-        <label for="team-followup-interval">Follow-Up Worker Interval Minutes
-          <input id="team-followup-interval" name="followupIntervalMinutes" type="number" min="1" max="1440" />
-        </label>
         <div class="actions">
           <button class="primary" type="submit">Save Team Settings</button>
           <span id="team-settings-state"></span>
@@ -6944,8 +7139,6 @@ function superAdminSystemHtml() {
       document.querySelector("#team-access-token").value = "";
       document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
       document.querySelector("#team-openai-model").value = settings.openaiModel || "";
-      document.querySelector("#team-followup-sends").value = settings.followupSendsPerMinute || "";
-      document.querySelector("#team-followup-interval").value = settings.followupIntervalMinutes || "";
       document.querySelector("#team-phone-number-id-current").textContent =
         settings.whatsappPhoneNumberId ? "Current: " + settings.whatsappPhoneNumberId : "No team-specific phone number ID saved.";
       document.querySelector("#team-access-token-current").textContent =
@@ -6964,9 +7157,7 @@ function superAdminSystemHtml() {
         publicBaseUrl,
         assetsBaseUrl,
         openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
-        openaiModel: document.querySelector("#team-openai-model").value,
-        followupSendsPerMinute: document.querySelector("#team-followup-sends").value,
-        followupIntervalMinutes: document.querySelector("#team-followup-interval").value
+        openaiModel: document.querySelector("#team-openai-model").value
       };
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
@@ -7548,6 +7739,7 @@ function adminDashboardHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -7607,15 +7799,7 @@ function adminDashboardHtml() {
     <section id="followups" class="panel">
       <h2>Follow-Up Monitor</h2>
       <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are queued, rotated by stage, delayed ${escapeHtml(Math.round(config.followupSendDelayMinMs / 1000))}-${escapeHtml(Math.round(config.followupSendDelayMaxMs / 1000))} second(s) before each send, and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute for ${escapeHtml(Math.max(config.followupActiveWindowMinutes, 1))} minutes, then paused for ${escapeHtml(Math.max(config.followupPauseWindowMinutes, 0))} minutes. In live WhatsApp mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
-      <form class="followup-settings" id="followup-settings-form">
-        <h3>Follow-Up Message Settings</h3>
-        <div class="muted">Edit the team follow-up messages here. Empty message means that stage is disabled. Send hour uses 24-hour Brunei/Malaysia time.</div>
-        <div class="followup-editor-grid" id="followup-message-editor"></div>
-        <div class="profile-actions">
-          <button type="submit">Save Follow-Up Messages</button>
-          <span id="followup-settings-state"></span>
-        </div>
-      </form>
+      <p class="note"><a href="/admin/follow-up-settings">Edit follow-up messages and schedule settings</a></p>
       <div class="subtabs" id="followup-label-tabs"></div>
       <div class="table-wrap"></div>
     </section>
@@ -7904,7 +8088,6 @@ function adminDashboardHtml() {
       renderOrders();
 
       renderFollowupLabelTabs(dashboardFollowups());
-      renderFollowupSettings();
       renderFollowups();
       renderNoReplyAlerts();
 
@@ -8471,7 +8654,6 @@ function adminDashboardHtml() {
     }
 
     document.querySelector("#complaint-settings-form").addEventListener("submit", saveComplaintSettings);
-    document.querySelector("#followup-settings-form").addEventListener("submit", saveFollowupSettings);
     document.querySelector("#profile-form").addEventListener("submit", saveProfile);
     document.querySelector('#refresh').addEventListener('click', loadDashboard);
     document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
@@ -8554,6 +8736,7 @@ function adminChatPageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -8832,6 +9015,7 @@ function replyLibraryPageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -9031,6 +9215,7 @@ function faqLibraryPageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -9554,6 +9739,7 @@ function salesRepliesPageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -9803,6 +9989,264 @@ function salesRepliesPageHtml() {
 </html>`;
 }
 
+function followupSettingsPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Follow-Up Settings</title>
+  <style>
+    :root { --accent:#0071e3; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Arial,sans-serif; color:#1d1d1f; background:#f5f5f7; }
+    * { box-sizing:border-box; }
+    body { margin:0; }
+    header, nav, main { padding:16px 20px; }
+    header { background:#fbfbfd; border-bottom:1px solid #d2d2d7; }
+    h1 { margin:0 0 4px; font-size:28px; }
+    .muted { color:#6e6e73; }
+    nav { display:flex; gap:10px; flex-wrap:wrap; background:#f5f5f7; border-bottom:1px solid #d2d2d7; }
+    nav a, button { border:1px solid #d2d2d7; border-radius:8px; background:#fff; color:#1d1d1f; padding:10px 14px; text-decoration:none; font:inherit; font-weight:700; cursor:pointer; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    main { display:grid; gap:14px; }
+    section { background:#fff; border:1px solid #e5e5ea; border-radius:8px; padding:16px; }
+    h2 { margin:0 0 12px; font-size:18px; }
+    .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end; }
+    label { display:grid; gap:6px; font-weight:800; }
+    input, textarea, select { width:100%; border:1px solid #d2d2d7; border-radius:8px; padding:10px 12px; font:inherit; background:#fff; }
+    input[type="checkbox"] { width:auto; }
+    textarea { min-height:110px; resize:vertical; line-height:1.38; }
+    .stage-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+    .stage-card { display:grid; gap:10px; border:1px solid #e5e5ea; border-radius:8px; padding:14px; background:#fbfbfd; }
+    .stage-head { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .stage-head strong { font-size:16px; }
+    .block { display:grid; gap:8px; border:1px solid #d2d2d7; border-radius:8px; padding:10px; background:#fff; }
+    .block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; color:#6e6e73; font-weight:800; text-transform:uppercase; }
+    .block-actions { display:flex; gap:8px; flex-wrap:wrap; }
+    .media-preview { max-width:100%; max-height:220px; border-radius:8px; background:#f5f5f7; }
+    .danger { color:#a11; border-color:#f0c7c7; background:#fff5f5; }
+    .state { color:#6e6e73; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="page-title">Follow-Up Settings</h1>
+    <p class="muted">Edit team follow-up messages, media, send hours, and first-follow-up cutoff rules.</p>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
+  </nav>
+  <main>
+    <section>
+      <h2>Schedule Controls</h2>
+      <div class="settings-grid">
+        <label>Follow-Up Sends Per Minute
+          <input id="followup-sends-per-minute" type="number" min="1" max="100" />
+        </label>
+        <label>Follow-Up Worker Interval Minutes
+          <input id="followup-interval-minutes" type="number" min="1" max="1440" />
+        </label>
+        <label>
+          <span><input id="first-cutoff-enabled" type="checkbox" /> Enable first follow-up cutoff</span>
+          <span class="muted">When enabled, customers who first message at/after the cutoff hour skip the first follow-up until the next day.</span>
+        </label>
+        <label>First Follow-Up Cutoff Hour
+          <input id="first-cutoff-hour" type="number" min="0" max="23" />
+        </label>
+      </div>
+    </section>
+    <section>
+      <h2>Follow-Up Messages</h2>
+      <p class="muted">Each stage can contain as many text, image, or video blocks as you need. Empty stages are disabled.</p>
+      <div class="stage-grid" id="followup-stage-grid"></div>
+      <div class="block-actions" style="margin-top:14px;">
+        <button class="primary" id="save-followups" type="button">Save Follow-Up Settings</button>
+        <span class="state" id="save-state"></span>
+      </div>
+    </section>
+  </main>
+  <script>
+    let data = null;
+    const mediaInput = document.createElement("input");
+    mediaInput.type = "file";
+    mediaInput.style.display = "none";
+    document.body.appendChild(mediaInput);
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+      });
+    }
+    function blockId() {
+      return "block_" + Date.now() + "_" + Math.random().toString(16).slice(2);
+    }
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Action failed.");
+      return result;
+    }
+    function normalizeBlock(block) {
+      if (!block || typeof block !== "object") return null;
+      const type = String(block.type || "text").toLowerCase();
+      if (type === "image" || type === "video") {
+        return { id: block.id || blockId(), type, url: block.url || "", caption: block.caption || "" };
+      }
+      return { id: block.id || blockId(), type: "text", body: block.body || block.message || "" };
+    }
+    function render() {
+      const settings = data.settings || {};
+      document.querySelector("#followup-sends-per-minute").value = settings.followupSendsPerMinute || "";
+      document.querySelector("#followup-interval-minutes").value = settings.followupIntervalMinutes || "";
+      const first = (data.followupMessages || []).find(stage => stage.key === "first_day_followup") || {};
+      document.querySelector("#first-cutoff-enabled").checked = first.firstChatCutoffEnabled !== false;
+      document.querySelector("#first-cutoff-hour").value = first.firstChatCutoffHour ?? 19;
+      document.querySelector("#followup-stage-grid").innerHTML = (data.followupMessages || []).map(renderStage).join("");
+      bindStageButtons();
+    }
+    function renderStage(stage) {
+      const blocks = (stage.messages || (stage.message ? [{ type: "text", body: stage.message }] : [])).map(normalizeBlock).filter(Boolean);
+      return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '">' +
+        '<div class="stage-head"><strong>' + esc(stage.label) + '</strong><span class="muted">Day offset: ' + esc(stage.dayOffset) + '</span></div>' +
+        '<label>Send Hour<input data-stage-field="sendHour" type="number" min="0" max="23" value="' + esc(stage.sendHour ?? 20) + '" /></label>' +
+        '<div class="blocks">' + blocks.map(renderBlock).join("") + '</div>' +
+        '<div class="block-actions">' +
+          '<button type="button" data-add-block="text">Add Text</button>' +
+          '<button type="button" data-add-block="image">Add Image</button>' +
+          '<button type="button" data-add-block="video">Add Video</button>' +
+        '</div>' +
+      '</article>';
+    }
+    function renderBlock(block) {
+      if (block.type === "image") {
+        return '<div class="block" data-block-id="' + esc(block.id) + '" data-block-type="image">' +
+          '<div class="block-head"><span>Image</span><button class="danger" type="button" data-remove-block>Remove</button></div>' +
+          '<img class="media-preview" src="' + esc(block.url) + '" alt="Follow-up image" />' +
+          '<input data-block-field="url" type="hidden" value="' + esc(block.url) + '" />' +
+          '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' +
+        '</div>';
+      }
+      if (block.type === "video") {
+        return '<div class="block" data-block-id="' + esc(block.id) + '" data-block-type="video">' +
+          '<div class="block-head"><span>Video</span><button class="danger" type="button" data-remove-block>Remove</button></div>' +
+          '<video class="media-preview" controls src="' + esc(block.url) + '"></video>' +
+          '<input data-block-field="url" type="hidden" value="' + esc(block.url) + '" />' +
+          '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' +
+        '</div>';
+      }
+      return '<div class="block" data-block-id="' + esc(block.id) + '" data-block-type="text">' +
+        '<div class="block-head"><span>Text</span><button class="danger" type="button" data-remove-block>Remove</button></div>' +
+        '<textarea data-block-field="body">' + esc(block.body || "") + '</textarea>' +
+      '</div>';
+    }
+    function bindStageButtons() {
+      document.querySelectorAll("[data-add-block]").forEach(button => {
+        button.addEventListener("click", () => addBlock(button.closest(".stage-card"), button.dataset.addBlock));
+      });
+      document.querySelectorAll("[data-remove-block]").forEach(button => {
+        button.addEventListener("click", () => button.closest(".block").remove());
+      });
+    }
+    function addBlock(card, type) {
+      if (type === "text") {
+        card.querySelector(".blocks").insertAdjacentHTML("beforeend", renderBlock({ id: blockId(), type: "text", body: "" }));
+        bindStageButtons();
+        return;
+      }
+      mediaInput.accept = type === "image" ? "image/png,image/jpeg,image/webp" : "video/mp4,video/webm,video/quicktime";
+      mediaInput.onchange = async () => {
+        const file = mediaInput.files && mediaInput.files[0];
+        mediaInput.value = "";
+        if (!file) return;
+        const state = document.querySelector("#save-state");
+        state.textContent = "Uploading " + type + "...";
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(file);
+        });
+        try {
+          const result = await request("/admin/followup-settings/media", { dataUrl, originalName: file.name });
+          card.querySelector(".blocks").insertAdjacentHTML("beforeend", renderBlock(result.block));
+          bindStageButtons();
+          state.textContent = "Uploaded. Remember to save.";
+        } catch (error) {
+          state.textContent = error.message;
+        }
+      };
+      mediaInput.click();
+    }
+    function readStage(card) {
+      return {
+        key: card.dataset.stageKey,
+        sendHour: card.querySelector('[data-stage-field="sendHour"]').value,
+        messages: [...card.querySelectorAll(".block")].map(block => {
+          const type = block.dataset.blockType;
+          if (type === "image" || type === "video") {
+            return {
+              id: block.dataset.blockId,
+              type,
+              url: block.querySelector('[data-block-field="url"]').value,
+              caption: block.querySelector('[data-block-field="caption"]').value
+            };
+          }
+          return {
+            id: block.dataset.blockId,
+            type: "text",
+            body: block.querySelector('[data-block-field="body"]').value
+          };
+        }),
+      };
+    }
+    async function save() {
+      const state = document.querySelector("#save-state");
+      state.textContent = "Saving...";
+      const followups = [...document.querySelectorAll(".stage-card")].map(readStage);
+      const first = followups.find(stage => stage.key === "first_day_followup");
+      if (first) {
+        first.firstChatCutoffEnabled = document.querySelector("#first-cutoff-enabled").checked;
+        first.firstChatCutoffHour = document.querySelector("#first-cutoff-hour").value;
+      }
+      try {
+        data = await request("/admin/followup-settings/save", {
+          settings: {
+            followupSendsPerMinute: document.querySelector("#followup-sends-per-minute").value,
+            followupIntervalMinutes: document.querySelector("#followup-interval-minutes").value
+          },
+          followups
+        });
+        render();
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
+    async function load() {
+      const response = await fetch("/admin/followup-settings-data", { cache: "no-store" });
+      data = await response.json();
+      const name = String(data.profile?.name || "").trim();
+      if (name) document.querySelector("#page-title").textContent = name + " Follow-Up Settings";
+      render();
+    }
+    document.querySelector("#save-followups").addEventListener("click", save);
+    load();
+  </script>
+</body>
+</html>`;
+}
+
 function productFlowPageHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -9944,6 +10388,7 @@ function productFlowPageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -11059,6 +11504,7 @@ function analyticsPageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -11231,6 +11677,7 @@ function compliancePageHtml() {
     <a href="/admin/analytics">Analytics</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
@@ -11610,6 +12057,7 @@ function demoChatHtml() {
       <a href="/admin/analytics">Analytics</a>
       <a href="/admin/reply-library">Reply Library</a>
       <a href="/admin/product-flow">Product Flow</a>
+      <a href="/admin/follow-up-settings">Follow-Up Settings</a>
       <a href="/admin/compliance">Compliance</a>
       <a href="/demo/chat">Customer Demo</a>
       <a href="/admin/dashboard?tab=profile">Profile</a>
