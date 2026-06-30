@@ -135,6 +135,13 @@ const FOLLOWUP_TEMPLATE_BY_KEY = {
   day_9_followup: "daynine_followup",
   day_10_followup: "dayten_followup",
 };
+const FOLLOWUP_EDITOR_STAGES = [
+  { key: "first_day_followup", label: "First Follow-Up", dayOffset: 0, defaultSendHour: 20, firstChatCutoffHour: 19 },
+  ...Array.from({ length: 10 }, (_, index) => {
+    const day = index + 1;
+    return { key: `day_${day}_followup`, label: `Day ${day}`, dayOffset: day, defaultSendHour: 20 };
+  }),
+];
 
 const catalog = JSON.parse(await readSeedFile(config.catalogPath, "product_catalog.json"));
 const faqLibrary = await loadFaqLibrary();
@@ -641,6 +648,21 @@ const server = http.createServer(async (req, res) => {
         respectOperationalControl: body.respectOperationalControl !== false,
       });
       return sendJson(res, result.sent ? 200 : 409, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/followup-settings/save") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      const content = await getTeamContent(adminSession.accountId);
+      const saved = updateTeamFollowupMessages(content, body.followups || body.stages || []);
+      await saveTeamContent(adminSession.accountId, content);
+      await store.appendAuditLog({
+        actor: `business_admin:${adminSession.accountId}`,
+        action: "followup_messages_updated",
+        result: `${saved.updatedProducts} product(s)`,
+        businessAccountId: adminSession.accountId,
+      });
+      return sendJson(res, 200, { followupMessages: teamFollowupMessages(content), saved });
     }
 
     if (req.method === "POST" && url.pathname === "/demo/followups/run") {
@@ -1851,7 +1873,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
   const obviousComplaint = detectObviousComplaint(text);
   const complaintIntent = faqSalesResponse || (initialAdOpening && !obviousComplaint)
     ? null
-    : obviousComplaint || await maybeDetectComplaintIntent(text);
+    : obviousComplaint || await maybeDetectComplaintIntent(text, businessAccountId);
   if (complaintIntent) {
     const product = findProduct(teamCatalog, text, source, customer.productId);
     const complaint = await store.addComplaintCase({
@@ -1932,7 +1954,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     };
   }
 
-  if (!faqSalesResponse && !initialAdOpening && await maybeDetectOrderStatusIntent(text)) {
+  if (!faqSalesResponse && !initialAdOpening && await maybeDetectOrderStatusIntent(text, businessAccountId)) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
     const statusReplies = await store.getOrderStatusReplies(businessAccountId);
     const outbound = [textMessage(customerOrderStatusReply(latestOrder, statusReplies))];
@@ -2091,10 +2113,11 @@ async function maybeSelectApprovedSalesReply({
   if (!config.openaiApiKey) return null;
   const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
   if (!vectorStoreId) return null;
+  const model = await openAiModelForAccount(businessAccountId);
   try {
     const selected = await selectSalesReplyFromVectorStore({
       apiKey: config.openaiApiKey,
-      model: config.openaiModel,
+      model,
       vectorStoreId,
       customerMessage,
       productName: product.name,
@@ -2112,12 +2135,13 @@ async function maybeSelectApprovedSalesReply({
   }
 }
 
-async function maybeDetectOrderStatusIntent(customerMessage) {
+async function maybeDetectOrderStatusIntent(customerMessage, businessAccountId = config.accountId) {
   if (!config.openaiApiKey) return isLikelyOrderStatusQuestion(customerMessage);
   try {
+    const model = await openAiModelForAccount(businessAccountId);
     return await detectOrderStatusIntent({
       apiKey: config.openaiApiKey,
-      model: config.openaiModel,
+      model,
       customerMessage,
     });
   } catch (error) {
@@ -2126,12 +2150,13 @@ async function maybeDetectOrderStatusIntent(customerMessage) {
   }
 }
 
-async function maybeDetectComplaintIntent(customerMessage) {
+async function maybeDetectComplaintIntent(customerMessage, businessAccountId = config.accountId) {
   if (!config.openaiApiKey) return detectObviousComplaint(customerMessage);
   try {
+    const model = await openAiModelForAccount(businessAccountId);
     return await detectComplaintIntent({
       apiKey: config.openaiApiKey,
-      model: config.openaiModel,
+      model,
       customerMessage,
     });
   } catch (error) {
@@ -2144,10 +2169,11 @@ async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customer
   if (!config.openaiApiKey) return null;
   const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
   if (!vectorStoreId) return null;
+  const model = await openAiModelForAccount(businessAccountId);
   try {
     const answer = await createCustomerServiceResponse({
       apiKey: config.openaiApiKey,
-      model: config.openaiModel,
+      model,
       vectorStoreId,
       businessName: config.businessName,
       supportLanguage: config.supportLanguage,
@@ -3226,6 +3252,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     profile: normalizeDashboardProfile(systemState.dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
+    followupMessages: teamFollowupMessages({ catalog: teamCatalog }),
     complaintSettings,
     guardrails,
     products: teamCatalog.products.map((product) => ({
@@ -3884,6 +3911,68 @@ function productFollowupSequence(product) {
       sendHour: Number.isFinite(followup?.send_hour) ? followup.send_hour : 20,
     }))
     .sort((a, b) => a.dayOffset - b.dayOffset || a.index - b.index);
+}
+
+function teamFollowupMessages(content = defaultTeamContent) {
+  const products = content?.catalog?.products || [];
+  const sourceProduct = products.find((product) => product?.followups && Object.keys(product.followups).length) || products[0] || {};
+  return FOLLOWUP_EDITOR_STAGES.map((stage) => {
+    const followup = sourceProduct.followups?.[stage.key] || {};
+    return {
+      key: stage.key,
+      label: stage.label,
+      dayOffset: Number.isFinite(followup.day_offset) ? followup.day_offset : stage.dayOffset,
+      sendHour: Number.isFinite(followup.send_hour) ? followup.send_hour : stage.defaultSendHour,
+      message: String(followup.message || ""),
+      enabled: Boolean(String(followup.message || "").trim()),
+    };
+  });
+}
+
+function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
+  const byKey = new Map((Array.isArray(stages) ? stages : []).map((stage) => [String(stage.key || ""), stage]));
+  const products = content?.catalog?.products || [];
+  let updatedProducts = 0;
+  for (const product of products) {
+    product.followups = product.followups && typeof product.followups === "object" ? product.followups : {};
+    let changed = false;
+    for (const stage of FOLLOWUP_EDITOR_STAGES) {
+      if (!byKey.has(stage.key)) continue;
+      const input = byKey.get(stage.key) || {};
+      const message = String(input.message || "").trim();
+      if (!message) {
+        if (product.followups[stage.key]) {
+          delete product.followups[stage.key];
+          changed = true;
+        }
+        continue;
+      }
+      const existing = product.followups[stage.key] || {};
+      product.followups[stage.key] = {
+        ...existing,
+        send_hour: clampNumber(input.sendHour, 0, 23, Number.isFinite(existing.send_hour) ? existing.send_hour : stage.defaultSendHour),
+        day_offset: stage.dayOffset,
+        message,
+      };
+      if (stage.firstChatCutoffHour !== undefined) {
+        product.followups[stage.key].first_chat_cutoff_hour = clampNumber(
+          input.firstChatCutoffHour,
+          0,
+          23,
+          Number.isFinite(existing.first_chat_cutoff_hour) ? existing.first_chat_cutoff_hour : stage.firstChatCutoffHour
+        );
+      }
+      changed = true;
+    }
+    if (changed) updatedProducts += 1;
+  }
+  return { updatedProducts, stages: teamFollowupMessages(content) };
+}
+
+function clampNumber(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(number)));
 }
 
 function followupDayOffset(key, followup, index) {
@@ -4925,6 +5014,11 @@ async function webTransportHealthData() {
 async function vectorStoreIdForAccount(businessAccountId = config.accountId) {
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return settings.openaiVectorStoreId || config.vectorStoreId;
+}
+
+async function openAiModelForAccount(businessAccountId = config.accountId) {
+  const settings = await adminAccounts.getTeamSettings(businessAccountId);
+  return settings.openaiModel || config.openaiModel;
 }
 
 function runTeamKnowledgeIngest(accountId) {
@@ -6731,6 +6825,13 @@ function superAdminSystemHtml() {
         <label for="team-vector-store-id">Approved Knowledge Vector Store ID
           <input id="team-vector-store-id" name="openaiVectorStoreId" placeholder="vs_..." />
         </label>
+        <label for="team-openai-model">OpenAI Reply Model
+          <select id="team-openai-model" name="openaiModel">
+            <option value="">Use Railway default (${escapeHtml(config.openaiModel)})</option>
+            <option value="gpt-5">GPT-5</option>
+            <option value="gpt-5.4-mini">GPT-5.4 mini</option>
+          </select>
+        </label>
         <label for="team-followup-sends">Follow-Up Sends Per Minute
           <input id="team-followup-sends" name="followupSendsPerMinute" type="number" min="1" max="100" />
         </label>
@@ -6816,6 +6917,7 @@ function superAdminSystemHtml() {
       document.querySelector("#team-phone-number-id").value = "";
       document.querySelector("#team-access-token").value = "";
       document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
+      document.querySelector("#team-openai-model").value = settings.openaiModel || "";
       document.querySelector("#team-followup-sends").value = settings.followupSendsPerMinute || "";
       document.querySelector("#team-followup-interval").value = settings.followupIntervalMinutes || "";
       document.querySelector("#team-phone-number-id-current").textContent =
@@ -6836,6 +6938,7 @@ function superAdminSystemHtml() {
         publicBaseUrl,
         assetsBaseUrl,
         openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
+        openaiModel: document.querySelector("#team-openai-model").value,
         followupSendsPerMinute: document.querySelector("#team-followup-sends").value,
         followupIntervalMinutes: document.querySelector("#team-followup-interval").value
       };
@@ -7326,7 +7429,51 @@ function adminDashboardHtml() {
       line-height: 1.38;
       background: #fff;
     }
+    .followup-settings {
+      padding: 14px;
+      border-bottom: 1px solid #e5e5ea;
+      background: var(--surface-soft);
+    }
+    .followup-settings h3 { margin: 0 0 6px; font-size: 14px; }
+    .followup-editor-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .followup-message-card {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid #e5e5ea;
+      border-radius: 8px;
+      background: #fff;
+    }
+    .followup-message-card label {
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .followup-message-card textarea {
+      min-height: 96px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      line-height: 1.38;
+      background: #fff;
+    }
+    .followup-message-card input {
+      width: 110px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font: inherit;
+    }
     #complaint-settings-state { margin-left: 9px; color: var(--muted); font-size: 12px; }
+    #followup-settings-state { color: var(--muted); font-size: 12px; }
     @media (max-width: 800px) {
       .dashboard-header-row { align-items: stretch; flex-direction: column; }
       .dashboard-date-panel { min-width: 0; text-align: left; }
@@ -7413,6 +7560,15 @@ function adminDashboardHtml() {
     <section id="followups" class="panel">
       <h2>Follow-Up Monitor</h2>
       <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are queued, rotated by stage, delayed ${escapeHtml(Math.round(config.followupSendDelayMinMs / 1000))}-${escapeHtml(Math.round(config.followupSendDelayMaxMs / 1000))} second(s) before each send, and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute for ${escapeHtml(Math.max(config.followupActiveWindowMinutes, 1))} minutes, then paused for ${escapeHtml(Math.max(config.followupPauseWindowMinutes, 0))} minutes. In live WhatsApp mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
+      <form class="followup-settings" id="followup-settings-form">
+        <h3>Follow-Up Message Settings</h3>
+        <div class="muted">Edit the team follow-up messages here. Empty message means that stage is disabled. Send hour uses 24-hour Brunei/Malaysia time.</div>
+        <div class="followup-editor-grid" id="followup-message-editor"></div>
+        <div class="profile-actions">
+          <button type="submit">Save Follow-Up Messages</button>
+          <span id="followup-settings-state"></span>
+        </div>
+      </form>
       <div class="subtabs" id="followup-label-tabs"></div>
       <div class="table-wrap"></div>
     </section>
@@ -7607,6 +7763,7 @@ function adminDashboardHtml() {
       renderOrders();
 
       renderFollowupLabelTabs(dashboardFollowups());
+      renderFollowupSettings();
       renderFollowups();
       renderNoReplyAlerts();
 
@@ -7671,6 +7828,53 @@ function adminDashboardHtml() {
         state.textContent = "Saved";
       } catch (error) {
       state.textContent = error.message;
+      }
+    }
+
+    function renderFollowupSettings() {
+      const stages = dashboardData ? dashboardData.followupMessages || [] : [];
+      const editor = document.querySelector("#followup-message-editor");
+      if (!editor) return;
+      if (!stages.length) {
+        editor.innerHTML = '<div class="empty">No follow-up settings found.</div>';
+        return;
+      }
+      editor.innerHTML = stages.map(stage => {
+        return '<div class="followup-message-card" data-followup-key="' + esc(stage.key) + '">' +
+          '<label>' + esc(stage.label) + ' Message<textarea data-followup-field="message">' + esc(stage.message || "") + '</textarea></label>' +
+          '<label>Send Hour<input data-followup-field="sendHour" type="number" min="0" max="23" value="' + esc(stage.sendHour ?? 20) + '" /></label>' +
+          '<div class="muted">Key: ' + esc(stage.key) + ' | Day offset: ' + esc(stage.dayOffset ?? "") + '</div>' +
+        '</div>';
+      }).join("");
+    }
+
+    function readFollowupSettings() {
+      return [...document.querySelectorAll(".followup-message-card[data-followup-key]")].map(card => {
+        const message = card.querySelector('[data-followup-field="message"]')?.value || "";
+        const sendHour = card.querySelector('[data-followup-field="sendHour"]')?.value || "";
+        return {
+          key: card.dataset.followupKey,
+          message,
+          sendHour,
+        };
+      });
+    }
+
+    async function saveFollowupSettings(event) {
+      event.preventDefault();
+      const state = document.querySelector("#followup-settings-state");
+      state.textContent = "Saving...";
+      try {
+        const result = await request("/admin/followup-settings/save", {
+          followups: readFollowupSettings()
+        });
+        dashboardData.followupMessages = result.followupMessages || result.saved?.stages || [];
+        renderFollowupSettings();
+        renderFollowupLabelTabs(dashboardFollowups());
+        renderFollowups();
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
       }
     }
 
@@ -8113,6 +8317,7 @@ function adminDashboardHtml() {
     }
 
     document.querySelector("#complaint-settings-form").addEventListener("submit", saveComplaintSettings);
+    document.querySelector("#followup-settings-form").addEventListener("submit", saveFollowupSettings);
     document.querySelector("#profile-form").addEventListener("submit", saveProfile);
     document.querySelector('#refresh').addEventListener('click', loadDashboard);
     document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
