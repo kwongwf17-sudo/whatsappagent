@@ -7205,6 +7205,27 @@ function adminDashboardHtml() {
       flex-wrap: wrap;
       gap: 6px;
     }
+    .bulkbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      background: #fff;
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .bulkbar .muted {
+      margin-right: auto;
+      font-size: 13px;
+    }
+    .bulk-select-cell {
+      width: 42px;
+      text-align: center;
+    }
+    .bulk-select-cell input {
+      width: 16px;
+      height: 16px;
+    }
     .tabs {
       display: flex;
       flex-wrap: wrap;
@@ -7736,13 +7757,107 @@ function adminDashboardHtml() {
       return '<span class="' + cls + '">' + esc(text) + '</span>';
     }
 
-    function table(rows, columns) {
+    function table(rows, columns, options = {}) {
       if (!rows.length) return '<div class="empty">No records yet.</div>';
-      return '<table><thead><tr>' + columns.map(c => '<th>' + esc(c.label) + '</th>').join('') +
+      const selectHead = options.bulkSection
+        ? '<th class="bulk-select-cell"><input type="checkbox" data-bulk-select-all="' + esc(options.bulkSection) + '" aria-label="Select all rows" /></th>'
+        : '';
+      return '<table><thead><tr>' + selectHead + columns.map(c => '<th>' + esc(c.label) + '</th>').join('') +
         '</tr></thead><tbody>' + rows.map(row => '<tr>' + columns.map(c => {
           const value = c.render ? c.render(row) : esc(row[c.key]);
           return '<td>' + value + '</td>';
-        }).join('') + '</tr>').join('') + '</tbody></table>';
+        }).join('').replace(/^/, options.bulkSection
+          ? '<td class="bulk-select-cell"><input type="checkbox" data-bulk-row="' + esc(options.bulkSection) + '" data-bulk-id="' + esc(options.idForRow ? options.idForRow(row) : "") + '" aria-label="Select row" /></td>'
+          : '') + '</tr>').join('') + '</tbody></table>';
+    }
+
+    function bulkToolbar(sectionKey, actions) {
+      if (!actions.length) {
+        return '<div class="bulkbar"><span class="muted" data-bulk-count="' + esc(sectionKey) + '">0 selected</span></div>';
+      }
+      return '<div class="bulkbar">' +
+        '<span class="muted" data-bulk-count="' + esc(sectionKey) + '">0 selected</span>' +
+        actions.map(action => '<button type="button" data-bulk-action="' + esc(action.key) + '" data-bulk-section="' + esc(sectionKey) + '" ' + (action.danger ? 'class="danger"' : '') + '>' + esc(action.label) + '</button>').join('') +
+      '</div>';
+    }
+
+    function bulkTable(sectionKey, rows, columns, actions, idForRow) {
+      if (!rows.length) return '<div class="empty">No records yet.</div>';
+      return bulkToolbar(sectionKey, actions) + table(rows, columns, { bulkSection: sectionKey, idForRow });
+    }
+
+    function selectedBulkIds(sectionKey) {
+      return [...document.querySelectorAll('input[data-bulk-row="' + sectionKey + '"]:checked')]
+        .map(input => input.dataset.bulkId)
+        .filter(Boolean);
+    }
+
+    function updateBulkCount(sectionKey) {
+      const count = selectedBulkIds(sectionKey).length;
+      const label = document.querySelector('[data-bulk-count="' + sectionKey + '"]');
+      if (label) label.textContent = count + " selected";
+      document.querySelectorAll('button[data-bulk-section="' + sectionKey + '"]').forEach(button => {
+        button.disabled = count === 0;
+      });
+    }
+
+    function bindBulkSelection(sectionKey) {
+      const all = document.querySelector('input[data-bulk-select-all="' + sectionKey + '"]');
+      if (all) {
+        all.addEventListener("change", () => {
+          document.querySelectorAll('input[data-bulk-row="' + sectionKey + '"]').forEach(input => {
+            input.checked = all.checked;
+          });
+          updateBulkCount(sectionKey);
+        });
+      }
+      document.querySelectorAll('input[data-bulk-row="' + sectionKey + '"]').forEach(input => {
+        input.addEventListener("change", () => updateBulkCount(sectionKey));
+      });
+      document.querySelectorAll('button[data-bulk-section="' + sectionKey + '"]').forEach(button => {
+        button.addEventListener("click", () => runBulkAction(sectionKey, button.dataset.bulkAction));
+      });
+      updateBulkCount(sectionKey);
+    }
+
+    async function runBulkAction(sectionKey, actionKey) {
+      const ids = selectedBulkIds(sectionKey);
+      if (!ids.length) return;
+      if (!confirm("Apply this action to " + ids.length + " selected record(s)?")) return;
+      try {
+        if (actionKey === "delete-customers") {
+          for (const item of ids) {
+            const parts = String(item).split("::");
+            await request("/admin/customer/delete", { customerId: parts[1] || parts[0] || "", reason: "Bulk deletion from dashboard" });
+          }
+        } else if (actionKey === "ack-handoff") {
+          for (const item of ids) {
+            const parts = String(item).split("::");
+            await request("/admin/handoff/acknowledge", {
+              customerId: parts[0] || "",
+              type: parts[1] || "conversation",
+              caseId: parts[2] || "",
+            });
+          }
+        } else if (actionKey === "reached-warehouse") {
+          for (const item of ids) {
+            const parts = String(item).split("::");
+            await request("/admin/orders/reached-warehouse", { orderId: parts[0] || "" });
+          }
+        } else if (actionKey === "no-reply-handoff") {
+          for (const customerId of ids) {
+            await request("/admin/no-reply/handoff", { customerId });
+          }
+        } else if (actionKey === "no-reply-resolve") {
+          for (const item of ids) {
+            const parts = item.split("::");
+            await request("/admin/no-reply/resolve", { customerId: parts[0] || "", inboundMessageId: parts[1] || "" });
+          }
+        }
+        await loadDashboard();
+      } catch (error) {
+        alert(error.message || "Bulk action failed.");
+      }
     }
 
     function applyDashboardProfile(profile = {}) {
@@ -7793,7 +7908,7 @@ function adminDashboardHtml() {
       renderFollowups();
       renderNoReplyAlerts();
 
-      sections.deleted.innerHTML = table(dashboardDeletedCustomers(), [
+      sections.deleted.innerHTML = bulkTable("deleted", dashboardDeletedCustomers(), [
         { label: 'Customer', key: 'id' },
         { label: 'Product', key: 'product' },
         { label: 'SKU', key: 'skuCode' },
@@ -7801,13 +7916,14 @@ function adminDashboardHtml() {
         { label: 'First Seen', key: 'firstSeenAt', render: r => fmtTime(r.firstSeenAt) },
         { label: 'Deleted At', key: 'deletedAt', render: r => fmtTime(r.deletedAt) },
         { label: 'Reason', key: 'deleteReason' }
-      ]);
+      ], [], r => r.id);
+      bindBulkSelection("deleted");
     }
 
     function renderHandoff() {
       const rows = dashboardData ? dashboardData.handoffQueue : [];
       const filtered = rows.filter(row => matchesDate(row.createdAt, activeHandoffDate));
-      sections.handoff.innerHTML = table(filtered, [
+      sections.handoff.innerHTML = bulkTable("handoff", filtered, [
         { label: 'Type', key: 'type', render: r => pill(r.type) },
         { label: 'Customer', key: 'customerId' },
         { label: 'Phone', key: 'phone' },
@@ -7817,7 +7933,8 @@ function adminDashboardHtml() {
         { label: 'Reason', key: 'reason' },
         { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
         { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-handoff-chat="' + esc(r.customerId) + '">Chat</button><button type="button" data-manual-order-customer="' + esc(r.customerId) + '">Mark Order Submitted</button><button type="button" data-handoff-ack="' + esc(r.customerId) + '" data-handoff-type="' + esc(r.type) + '" data-handoff-case="' + esc(r.caseId || '') + '">Acknowledge</button>' + (r.type === 'complaint' ? '<button type="button" data-complaint-resolve="' + esc(r.caseId) + '">Resolve</button>' : '') + '</div>' }
-      ]);
+      ], [{ key: "ack-handoff", label: "Acknowledge Selected" }], r => String(r.customerId || "") + "::" + String(r.type || "conversation") + "::" + String(r.caseId || ""));
+      bindBulkSelection("handoff");
       document.querySelectorAll("button[data-handoff-chat]").forEach(button => button.addEventListener("click", () => {
         window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.handoffChat);
       }));
@@ -8045,7 +8162,7 @@ function adminDashboardHtml() {
       const uniqueCustomers = new Set(filtered.map(row => row.customerId).filter(Boolean)).size;
       document.querySelector("#order-customers-count").textContent =
         "Total customers: " + uniqueCustomers + " | Orders: " + filtered.length;
-      sections.orderCustomers.innerHTML = table(filtered, [
+      sections.orderCustomers.innerHTML = bulkTable("order-customers", filtered, [
         { label: 'Order Time', key: 'orderTimestamp', render: r => fmtTime(r.orderTimestamp) },
         { label: 'Customer', key: 'customerId' },
         { label: 'Product', key: 'product' },
@@ -8062,7 +8179,11 @@ function adminDashboardHtml() {
           ? '<button type="button" data-reached-warehouse="' + esc(r.id) + '">Reached Warehouse</button>'
           : '<span class="muted">-</span>' },
         { label: 'Delete', key: 'customerId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.customerId) + '">Delete</button>' }
-      ]);
+      ], [
+        { key: "reached-warehouse", label: "Reached Warehouse" },
+        { key: "delete-customers", label: "Delete Selected", danger: true }
+      ], r => String(r.id || "") + "::" + String(r.customerId || ""));
+      bindBulkSelection("order-customers");
       bindReachedWarehouseButtons();
       bindDashboardCustomerDeleteButtons();
     }
@@ -8070,7 +8191,7 @@ function adminDashboardHtml() {
     function renderOrders() {
       const rows = dashboardData ? dashboardData.orders : [];
       const filtered = rows.filter(row => matchesDate(row.createdAt, activeOrdersDate));
-      sections.orders.innerHTML = table(filtered, [
+      sections.orders.innerHTML = bulkTable("orders", filtered, [
         { label: 'Order Timestamp', key: 'orderTimestamp', render: r => fmtTime(r.orderTimestamp) },
         { label: 'Order ID', key: 'id' },
         { label: 'WhatsApp ID', key: 'customerId' },
@@ -8078,7 +8199,8 @@ function adminDashboardHtml() {
         { label: 'Submitted Details', key: 'rawMessage' },
         { label: 'Status', key: 'statusDisplay', render: r => pill(r.statusDisplay) },
         { label: 'Status Updated', key: 'statusUpdatedAt', render: r => fmtTime(r.statusUpdatedAt) }
-      ]);
+      ], [], r => r.customerId || r.id);
+      bindBulkSelection("orders");
     }
 
     function syncPanelDatesToDashboard() {
@@ -8148,7 +8270,7 @@ function adminDashboardHtml() {
         sections.noReply.innerHTML = '<div class="empty">No unanswered customer messages waiting for review.</div>';
         return;
       }
-      sections.noReply.innerHTML = table(rows, [
+      sections.noReply.innerHTML = bulkTable("no-reply", rows, [
         { label: 'Received', key: 'receivedAt', render: r => fmtTime(r.receivedAt) },
         { label: 'Customer', key: 'customerId' },
         { label: 'Product', key: 'product' },
@@ -8156,7 +8278,11 @@ function adminDashboardHtml() {
         { label: 'Customer Message', key: 'customerMessage' },
         { label: 'Reason', key: 'reason' },
         { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-no-reply-reply="' + esc(r.customerId) + '">Reply</button><button type="button" data-no-reply-handoff="' + esc(r.customerId) + '">Send to Handoff</button><button type="button" data-no-reply-resolve="' + esc(r.customerId) + '" data-message-id="' + esc(r.inboundMessageId) + '">Mark Resolved</button></div>' }
-      ]);
+      ], [
+        { key: "no-reply-handoff", label: "Send Selected to Handoff" },
+        { key: "no-reply-resolve", label: "Mark Selected Resolved" }
+      ], r => String(r.customerId || "") + "::" + String(r.inboundMessageId || ""));
+      bindBulkSelection("no-reply");
       document.querySelectorAll("button[data-no-reply-reply]").forEach(button => button.addEventListener("click", () => {
         window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.noReplyReply);
       }));
@@ -8216,7 +8342,7 @@ function adminDashboardHtml() {
       const filtered = activeCustomerLabel === "ALL"
         ? customers
         : customers.filter(customer => customerMatchesLabel(customer, activeCustomerLabel));
-      sections.customers.innerHTML = table(filtered, [
+      sections.customers.innerHTML = bulkTable("customers", filtered, [
         { label: 'WhatsApp ID', key: 'whatsappId' },
         { label: 'Product', key: 'product' },
         { label: 'SKU', key: 'skuCode' },
@@ -8226,7 +8352,8 @@ function adminDashboardHtml() {
         { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
         { label: 'Order', key: 'whatsappId', render: r => '<button type="button" data-manual-order-customer="' + esc(r.whatsappId) + '">Mark Order Submitted</button>' },
         { label: 'Delete', key: 'whatsappId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.whatsappId) + '">Delete</button>' }
-      ]);
+      ], [{ key: "delete-customers", label: "Delete Selected", danger: true }], r => r.whatsappId);
+      bindBulkSelection("customers");
       bindManualOrderButtons();
       bindDashboardCustomerDeleteButtons();
     }
@@ -8282,7 +8409,7 @@ function adminDashboardHtml() {
       const filtered = activeFollowupLabel === "ALL"
         ? followups
         : followups.filter(row => row.labelDisplay === activeFollowupLabel);
-      sections.followups.innerHTML = table(filtered, [
+      sections.followups.innerHTML = bulkTable("followups", filtered, [
         { label: 'Customer', key: 'customerId' },
         { label: 'Product', key: 'product' },
         { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
@@ -8294,7 +8421,8 @@ function adminDashboardHtml() {
         { label: 'Sent Count', key: 'sentCount', render: r => esc((r.sentCount || 0) + ' / ' + (r.totalFollowups || 0)) },
         { label: 'First Follow-Up Sent', key: 'sentFirst', render: r => fmtTime(r.sentFirst) },
         { label: 'Second Follow-Up Sent', key: 'sentDay1', render: r => fmtTime(r.sentDay1) }
-      ]);
+      ], [{ key: "delete-customers", label: "Delete Selected", danger: true }], r => r.customerId);
+      bindBulkSelection("followups");
     }
 
     function followupStageName(value) {
