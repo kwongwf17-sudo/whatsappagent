@@ -5334,6 +5334,22 @@ const PRODUCT_FLOW_IMAGE_SLOTS = [
 const REQUIRED_PRODUCT_FLOW_IMAGE_KEYS = new Set(PRODUCT_FLOW_IMAGE_SLOTS
   .filter((slot) => slot.key !== "salesPhoto")
   .map((slot) => slot.key));
+const LEGACY_OPENING_FLOW_BLOCKS = [
+  { id: "greeting", type: "text", label: "Greeting", field: "greeting" },
+  { id: "infoPhoto1", type: "image", label: "Product info photo 1", imageKey: "infoPhoto1" },
+  { id: "infoPhoto2", type: "image", label: "Product info photo 2", imageKey: "infoPhoto2" },
+  { id: "infoPhoto3", type: "image", label: "Product info photo 3", imageKey: "infoPhoto3" },
+  { id: "description", type: "text", label: "Product Description", field: "description" },
+  { id: "testimonialPhoto1", type: "image", label: "Testimonial photo 1", imageKey: "testimonialPhoto1" },
+  { id: "testimonialPhoto2", type: "image", label: "Testimonial photo 2", imageKey: "testimonialPhoto2" },
+  { id: "testimonialPhoto3", type: "image", label: "Testimonial photo 3", imageKey: "testimonialPhoto3" },
+  { id: "testimonialPhoto4", type: "image", label: "Testimonial photo 4", imageKey: "testimonialPhoto4" },
+  { id: "testimonialText", type: "text", label: "Testimonial Text", field: "testimonialText" },
+  { id: "pricePhoto", type: "image", label: "Price photo", imageKey: "pricePhoto" },
+  { id: "salesPhoto", type: "image", label: "Optional sales photo", imageKey: "salesPhoto", optional: true },
+  { id: "priceText", type: "text", label: "Price Text", field: "priceText" },
+  { id: "packageQuestion", type: "text", label: "Closing / Order Option Question", field: "packageQuestion" },
+];
 
 function findCatalogProduct(productId, activeCatalog = catalog) {
   return activeCatalog.products.find((product) => product.id === String(productId || ""));
@@ -5391,7 +5407,88 @@ function productFlowEditorData(product, options = {}) {
       label: slot.label,
       url: imageUrlForSlot(slot),
     })),
+    openingFlowBlocks: openingFlowBlocksForEditor(product, {
+      ...Object.fromEntries(
+        PRODUCT_FLOW_TEXT_SLOTS.map((slot) => [slot.key, textValueForSlot(slot)])
+      ),
+      images: PRODUCT_FLOW_IMAGE_SLOTS.map((slot) => ({
+        key: slot.key,
+        label: slot.label,
+        url: imageUrlForSlot(slot),
+      })),
+    }),
   };
+}
+
+function openingFlowBlocksForEditor(product, editorData) {
+  const saved = Array.isArray(product.opening_flow_blocks) ? product.opening_flow_blocks : null;
+  return normalizeOpeningFlowBlocks(saved?.length ? saved : legacyOpeningFlowBlocks(editorData), editorData);
+}
+
+function legacyOpeningFlowBlocks(editorData) {
+  const imageByKey = new Map((editorData.images || []).map((image) => [image.key, image]));
+  return LEGACY_OPENING_FLOW_BLOCKS.map((block) => {
+    if (block.type === "image") {
+      const image = imageByKey.get(block.imageKey) || {};
+      return {
+        id: block.id,
+        type: "image",
+        label: block.label,
+        imageKey: block.imageKey,
+        url: image.url || "",
+        caption: "",
+        enabled: block.optional ? Boolean(image.url) : true,
+      };
+    }
+    return {
+      id: block.id,
+      type: "text",
+      label: block.label,
+      body: String(editorData[block.field] || ""),
+      enabled: true,
+    };
+  });
+}
+
+function normalizeOpeningFlowBlocks(blocks, editorData = {}) {
+  const imageByKey = new Map((editorData.images || []).map((image) => [image.key, image]));
+  return (Array.isArray(blocks) ? blocks : [])
+    .map((block, index) => {
+      const type = block?.type === "image" ? "image" : "text";
+      const id = safeOpeningFlowBlockId(block?.id || `${type}_${Date.now()}_${index + 1}`);
+      const label = String(block?.label || (type === "image" ? "Image block" : "Text block")).trim().slice(0, 120);
+      const enabled = block?.enabled !== false;
+      if (type === "image") {
+        const imageKey = String(block?.imageKey || block?.slot || "").trim();
+        const image = imageByKey.get(imageKey) || {};
+        const url = String(block?.url || image.url || "").trim();
+        return {
+          id,
+          type,
+          label,
+          imageKey,
+          url,
+          caption: String(block?.caption || "").trim(),
+          enabled,
+        };
+      }
+      return {
+        id,
+        type,
+        label,
+        body: String(block?.body || "").trim(),
+        enabled,
+      };
+    })
+    .filter((block) => block.type === "image" || block.body);
+}
+
+function safeOpeningFlowBlockId(value) {
+  return String(value || "block")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80) || "block";
 }
 
 function approvedProductFaqsForEditor(product) {
@@ -5429,14 +5526,28 @@ function updateProductFlowText(product, body) {
   const hasFlowTextUpdate = PRODUCT_FLOW_TEXT_SLOTS.some((slot) =>
     Object.prototype.hasOwnProperty.call(body, slot.key)
   );
+  const hasBlockUpdate = Object.prototype.hasOwnProperty.call(body, "openingFlowBlocks");
   if (hasFlowTextUpdate) {
     product.package_question = String(body.packageQuestion ?? current.packageQuestion ?? "");
-    product.opening_flow = buildProductOpeningFlow({
+    const next = {
       ...current,
       ...Object.fromEntries(
         PRODUCT_FLOW_TEXT_SLOTS.map((slot) => [slot.key, String(body[slot.key] ?? current[slot.key])])
       ),
-    });
+    };
+    product.opening_flow = buildProductOpeningFlow(next);
+    if (!hasBlockUpdate && Array.isArray(product.opening_flow_blocks)) {
+      product.opening_flow_blocks = normalizeOpeningFlowBlocks(product.opening_flow_blocks.map((block) => {
+        const legacy = LEGACY_OPENING_FLOW_BLOCKS.find((item) => item.id === block.id && item.type === "text");
+        return legacy ? { ...block, body: next[legacy.field] } : block;
+      }), next);
+      product.opening_flow = buildProductOpeningFlowFromBlocks(product.opening_flow_blocks);
+    }
+  }
+  if (hasBlockUpdate) {
+    const editorData = productFlowEditorData(product, { skipReady: true });
+    product.opening_flow_blocks = normalizeOpeningFlowBlocks(body.openingFlowBlocks, editorData);
+    product.opening_flow = buildProductOpeningFlowFromBlocks(product.opening_flow_blocks);
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderOptions")) {
     product.order_options = normalizeOrderOptions(body.orderOptions);
@@ -5454,7 +5565,14 @@ function updateProductFlowImage(product, slot, assetUrl) {
     image.key === slot.key ? { ...image, url: assetUrl } : image
   );
   if (slot.key === "salesPhoto") product.sales_photo_url = assetUrl;
-  product.opening_flow = buildProductOpeningFlow(current);
+  if (Array.isArray(product.opening_flow_blocks)) {
+    product.opening_flow_blocks = normalizeOpeningFlowBlocks(product.opening_flow_blocks.map((block) =>
+      block.imageKey === slot.key ? { ...block, url: assetUrl, enabled: true } : block
+    ), current);
+    product.opening_flow = buildProductOpeningFlowFromBlocks(product.opening_flow_blocks);
+  } else {
+    product.opening_flow = buildProductOpeningFlow(current);
+  }
   product.images = current.images.map((image) => ({
     url: image.url,
     caption: image.label,
@@ -5854,6 +5972,9 @@ function normalizeLines(value) {
 }
 
 function buildProductOpeningFlow(flow) {
+  if (Array.isArray(flow.openingFlowBlocks) && flow.openingFlowBlocks.length) {
+    return buildProductOpeningFlowFromBlocks(flow.openingFlowBlocks);
+  }
   const images = Object.fromEntries((flow.images || []).map((image) => [image.key, image.url]));
   return [
     textMessage(flow.greeting),
@@ -5873,6 +5994,21 @@ function buildProductOpeningFlow(flow) {
   ];
 }
 
+function buildProductOpeningFlowFromBlocks(blocks) {
+  return normalizeOpeningFlowBlocks(blocks)
+    .filter((block) => block.enabled !== false)
+    .map((block) => {
+      if (block.type === "image") {
+        const url = String(block.url || "").trim();
+        if (!url) return null;
+        return { type: "image", url, caption: String(block.caption || "") };
+      }
+      const body = String(block.body || "").trim();
+      return body ? textMessage(body) : null;
+    })
+    .filter(Boolean);
+}
+
 function safeAssetSegment(value) {
   return String(value || "product").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "product";
 }
@@ -5886,6 +6022,14 @@ function createCatalogProduct(name) {
     suffix += 1;
   }
   const followupTemplate = catalog.products.find((product) => product.id === catalog.default_product_id)?.followups || {};
+  const emptyFlow = {
+    greeting: "",
+    description: "",
+    testimonialText: "",
+    priceText: "",
+    packageQuestion: "",
+    images: PRODUCT_FLOW_IMAGE_SLOTS.map((slot) => ({ key: slot.key, label: slot.label, url: "" })),
+  };
   const product = {
     id,
     name,
@@ -5899,14 +6043,8 @@ function createCatalogProduct(name) {
     order_options: [],
     images: [],
     openingFlowEnabled: false,
-    opening_flow: buildProductOpeningFlow({
-      greeting: "",
-      description: "",
-      testimonialText: "",
-      priceText: "",
-      packageQuestion: "",
-      images: PRODUCT_FLOW_IMAGE_SLOTS.map((slot) => ({ key: slot.key, url: "" })),
-    }),
+    opening_flow_blocks: legacyOpeningFlowBlocks(emptyFlow),
+    opening_flow: buildProductOpeningFlow(emptyFlow),
     faqs: [],
     sales_replies: [],
     standard_replies: [],
@@ -5933,6 +6071,16 @@ function normalizeSkuCode(value) {
 
 function isProductFlowComplete(product) {
   const editorData = productFlowEditorData(product, { skipReady: true });
+  if (Array.isArray(product.opening_flow_blocks) && product.opening_flow_blocks.length) {
+    const blocks = normalizeOpeningFlowBlocks(product.opening_flow_blocks, editorData).filter((block) => block.enabled !== false);
+    return blocks.length > 0 && blocks.every((block) => {
+      if (block.type === "image") {
+        const url = String(block.url || "").trim();
+        return url && localAssetExists(url);
+      }
+      return Boolean(String(block.body || "").trim());
+    });
+  }
   const imageByKey = new Map((editorData.images || []).map((image) => [image.key, image.url]));
   return (
     PRODUCT_FLOW_TEXT_SLOTS.every((slot) => String(editorData[slot.key] || "").trim()) &&
@@ -9306,6 +9454,23 @@ function productFlowPageHtml() {
     .option-card .check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: #1d1d1f; }
     .option-card .check input { width: auto; min-height: 0; }
     .option-card .remove-option { padding: 6px 10px; border-color: #ffd1d1; color: #9b1c12; background: #fff7f7; }
+    .flow-builder { padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
+    .flow-builder-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .flow-builder-head h3 { margin: 0; font-size: 16px; }
+    .flow-builder-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .flow-block-list { display: grid; gap: 10px; }
+    .flow-block { border: 1px solid #e5e5ea; border-radius: 10px; background: #fff; overflow: hidden; }
+    .flow-block.disabled { opacity: .62; }
+    .flow-block-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; background: #f5f5f7; border-bottom: 1px solid #e5e5ea; }
+    .flow-block-title { display: flex; align-items: center; gap: 8px; font-weight: 800; }
+    .flow-block-type { border-radius: 999px; padding: 3px 8px; background: #eaf4ff; color: var(--accent); font-size: 11px; text-transform: uppercase; }
+    .flow-block-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .flow-block-body { display: grid; grid-template-columns: minmax(180px, .45fr) minmax(240px, 1fr); gap: 10px; padding: 12px; }
+    .flow-block-body label { display: grid; gap: 6px; margin: 0; font-size: 12px; font-weight: 700; color: #1d1d1f; }
+    .flow-block-body input, .flow-block-body textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: inherit; background: #fff; }
+    .flow-block-body textarea { min-height: 78px; }
+    .flow-block-body .image-preview { width: 100%; max-height: 110px; object-fit: contain; background: #f5f5f7; border-radius: 6px; }
+    .flow-block-body .image-url { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .empty-options { padding: 12px; border: 1px dashed #d2d2d7; border-radius: 8px; color: var(--muted); background: #fff; }
     .knowledge-panel { padding: 14px; border-top: 1px solid #e5e5ea; background: #fff; }
     .knowledge-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
@@ -9483,6 +9648,16 @@ function productFlowPageHtml() {
             </div>
           </div>
         </div>
+        <div class="flow-builder">
+          <div class="flow-builder-head">
+            <div>
+              <h3>Opening Flow Sequence</h3>
+              <p>Reorder, disable, or add blocks for this product. The agent sends enabled blocks from top to bottom.</p>
+            </div>
+            <button id="add-text-block" type="button">Add Text Block</button>
+          </div>
+          <div class="flow-block-list" id="opening-flow-blocks"></div>
+        </div>
         <div class="steps">
           <div class="step">
             <div class="number">01</div>
@@ -9608,6 +9783,96 @@ function productFlowPageHtml() {
           selectedProduct.orderOptions = (selectedProduct.orderOptions || []).filter((_, index) => index !== Number(button.dataset.removeOption));
           renderOrderOptions();
         });
+      });
+    }
+
+    function blockHtml(block, index) {
+      const disabled = block.enabled === false;
+      const type = block.type === "image" ? "image" : "text";
+      const preview = type === "image" && block.url
+        ? '<img class="image-preview" src="' + esc(block.url) + '" alt="' + esc(block.label || "Opening flow image") + '" />'
+        : '';
+      const content = type === "image"
+        ? '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' +
+          '<div><div class="image-url">' + esc(block.url || "No image uploaded for this block yet") + '</div>' + preview + '</div>'
+        : '<label>Message<textarea data-block-field="body">' + esc(block.body || "") + '</textarea></label>';
+      return '<div class="flow-block' + (disabled ? ' disabled' : '') + '" data-block-index="' + index + '">' +
+        '<div class="flow-block-head">' +
+          '<div class="flow-block-title"><span class="option-index">' + esc(index + 1) + '</span><span class="flow-block-type">' + esc(type) + '</span><span>' + esc(block.label || "Opening block") + '</span></div>' +
+          '<div class="flow-block-actions">' +
+            '<button type="button" data-move-block="up">Up</button>' +
+            '<button type="button" data-move-block="down">Down</button>' +
+            '<button type="button" data-toggle-block>' + (disabled ? 'Enable' : 'Disable') + '</button>' +
+            '<button class="danger" type="button" data-delete-block>Delete</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="flow-block-body">' +
+          '<label>Label<input data-block-field="label" value="' + esc(block.label || "") + '" /></label>' +
+          content +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderOpeningFlowBlocks() {
+      selectedProduct.openingFlowBlocks = selectedProduct.openingFlowBlocks || [];
+      document.querySelector("#opening-flow-blocks").innerHTML = selectedProduct.openingFlowBlocks.map(blockHtml).join("") || '<div class="empty-options">No opening flow blocks yet. Add a text block or upload product images.</div>';
+      document.querySelectorAll(".flow-block").forEach(card => {
+        const index = Number(card.dataset.blockIndex);
+        card.querySelectorAll("[data-block-field]").forEach(input => {
+          input.addEventListener("input", () => {
+            const field = input.dataset.blockField;
+            selectedProduct.openingFlowBlocks[index][field] = input.value;
+          });
+        });
+        card.querySelector("[data-move-block='up']").addEventListener("click", () => moveBlock(index, -1));
+        card.querySelector("[data-move-block='down']").addEventListener("click", () => moveBlock(index, 1));
+        card.querySelector("[data-toggle-block]").addEventListener("click", () => {
+          selectedProduct.openingFlowBlocks[index].enabled = selectedProduct.openingFlowBlocks[index].enabled === false;
+          renderOpeningFlowBlocks();
+        });
+        card.querySelector("[data-delete-block]").addEventListener("click", () => {
+          selectedProduct.openingFlowBlocks.splice(index, 1);
+          renderOpeningFlowBlocks();
+        });
+      });
+    }
+
+    function moveBlock(index, delta) {
+      const blocks = selectedProduct.openingFlowBlocks || [];
+      const target = index + delta;
+      if (target < 0 || target >= blocks.length) return;
+      const item = blocks[index];
+      blocks.splice(index, 1);
+      blocks.splice(target, 0, item);
+      renderOpeningFlowBlocks();
+    }
+
+    function addTextBlock() {
+      if (!selectedProduct) return;
+      selectedProduct.openingFlowBlocks = selectedProduct.openingFlowBlocks || [];
+      selectedProduct.openingFlowBlocks.push({
+        id: "custom_text_" + Date.now(),
+        type: "text",
+        label: "Custom text",
+        body: "",
+        enabled: true
+      });
+      renderOpeningFlowBlocks();
+    }
+
+    function readOpeningFlowBlocks() {
+      return Array.from(document.querySelectorAll(".flow-block")).map(card => {
+        const index = Number(card.dataset.blockIndex);
+        const original = selectedProduct.openingFlowBlocks[index] || {};
+        const read = field => card.querySelector('[data-block-field="' + field + '"]');
+        const legacyTextFields = ["greeting", "description", "testimonialText", "priceText", "packageQuestion"];
+        const legacyField = legacyTextFields.includes(original.id) ? original.id : "";
+        return {
+          ...original,
+          label: read("label") ? read("label").value : original.label,
+          body: legacyField ? document.querySelector("#" + legacyField).value : (read("body") ? read("body").value : original.body),
+          caption: read("caption") ? read("caption").value : original.caption
+        };
       });
     }
 
@@ -9890,6 +10155,7 @@ function productFlowPageHtml() {
       renderApprovedFaqs();
       renderKnowledge();
       renderImages();
+      renderOpeningFlowBlocks();
       renderReadiness();
       status(selectedProduct.ready ? "Ready for opening flow" : "Setup in progress");
     }
@@ -9978,6 +10244,7 @@ function productFlowPageHtml() {
       products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
       renderImages();
       renderKnowledge();
+      renderOpeningFlowBlocks();
       renderReadiness();
       updateSelectedOptionLabel();
       status(data.extraction && data.extraction.status === "completed"
@@ -10000,6 +10267,7 @@ function productFlowPageHtml() {
         body[field] = document.querySelector("#" + field).value;
       });
       body.orderOptions = readOrderOptions();
+      body.openingFlowBlocks = readOpeningFlowBlocks();
       try {
         const response = await fetch("/admin/product-flow/save", {
           method: "POST",
@@ -10013,6 +10281,7 @@ function productFlowPageHtml() {
         }
         selectedProduct = data.product;
         products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
+        renderOpeningFlowBlocks();
         renderReadiness();
         updateSelectedOptionLabel();
         status("Saved");
@@ -10130,6 +10399,7 @@ function productFlowPageHtml() {
     document.querySelector("#delete-product").addEventListener("click", deleteSelectedProduct);
     document.querySelector("#supply-form").addEventListener("submit", saveSupply);
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
+    document.querySelector("#add-text-block").addEventListener("click", addTextBlock);
     document.querySelector("#new-product-faq").addEventListener("click", newProductFaq);
     document.querySelector("#cancel-product-faq").addEventListener("click", () => {
       document.querySelector("#product-faq-form").hidden = true;
