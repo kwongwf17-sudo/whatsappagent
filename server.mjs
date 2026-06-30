@@ -1221,7 +1221,14 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       const content = await getTeamContent(adminSession.accountId);
       const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
-      const slot = PRODUCT_FLOW_IMAGE_SLOTS.find((item) => item.key === body.slot);
+      const existingBlocks = Object.prototype.hasOwnProperty.call(body, "openingFlowBlocks")
+        ? normalizeOpeningFlowBlocks(body.openingFlowBlocks, productFlowEditorData(product, { skipReady: true }))
+        : null;
+      if (existingBlocks) {
+        product.opening_flow_blocks = existingBlocks;
+        product.opening_flow = buildProductOpeningFlowFromBlocks(product.opening_flow_blocks);
+      }
+      const slot = productFlowImageSlotForUpload(product, body.slot);
       if (!slot) return sendJson(res, 400, { error: "Unknown image slot." });
       const image = decodeUploadedImage(body.dataUrl);
       if (!image) return sendJson(res, 400, { error: "Please upload a PNG, JPG, or WEBP image." });
@@ -5580,6 +5587,21 @@ function updateProductFlowImage(product, slot, assetUrl) {
   updateProductFlowReadiness(product);
 }
 
+function productFlowImageSlotForUpload(product, slotKey) {
+  const key = String(slotKey || "").trim();
+  const standard = PRODUCT_FLOW_IMAGE_SLOTS.find((item) => item.key === key);
+  if (standard) return standard;
+  const block = Array.isArray(product.opening_flow_blocks)
+    ? product.opening_flow_blocks.find((item) => item?.type === "image" && item.imageKey === key)
+    : null;
+  if (!block) return null;
+  return {
+    key,
+    label: String(block.label || "Opening flow image"),
+    filename: safeAssetSegment(key || block.id || "opening-flow-image"),
+  };
+}
+
 function ensureProductPersistedImages(product) {
   product.persisted_images = product.persisted_images && typeof product.persisted_images === "object"
     ? product.persisted_images
@@ -9654,7 +9676,10 @@ function productFlowPageHtml() {
               <h3>Opening Flow Sequence</h3>
               <p>Reorder, disable, or add blocks for this product. The agent sends enabled blocks from top to bottom.</p>
             </div>
-            <button id="add-text-block" type="button">Add Text Block</button>
+            <div class="toolbar-tools">
+              <button id="add-text-block" type="button">Add Text Block</button>
+              <button id="add-image-block" type="button">Add Image Block</button>
+            </div>
           </div>
           <div class="flow-block-list" id="opening-flow-blocks"></div>
         </div>
@@ -9794,7 +9819,8 @@ function productFlowPageHtml() {
         : '';
       const content = type === "image"
         ? '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' +
-          '<div><div class="image-url">' + esc(block.url || "No image uploaded for this block yet") + '</div>' + preview + '</div>'
+          '<div><div class="image-url">' + esc(block.url || "No image uploaded for this block yet") + '</div>' + preview +
+          '<input type="file" accept="image/png,image/jpeg,image/webp" data-block-image-upload data-slot="' + esc(block.imageKey || block.id) + '" /></div>'
         : '<label>Message<textarea data-block-field="body">' + esc(block.body || "") + '</textarea></label>';
       return '<div class="flow-block' + (disabled ? ' disabled' : '') + '" data-block-index="' + index + '">' +
         '<div class="flow-block-head">' +
@@ -9834,6 +9860,8 @@ function productFlowPageHtml() {
           selectedProduct.openingFlowBlocks.splice(index, 1);
           renderOpeningFlowBlocks();
         });
+        const imageInput = card.querySelector("[data-block-image-upload]");
+        if (imageInput) imageInput.addEventListener("change", uploadImage);
       });
     }
 
@@ -9855,6 +9883,22 @@ function productFlowPageHtml() {
         type: "text",
         label: "Custom text",
         body: "",
+        enabled: true
+      });
+      renderOpeningFlowBlocks();
+    }
+
+    function addImageBlock() {
+      if (!selectedProduct) return;
+      const id = "custom_image_" + Date.now();
+      selectedProduct.openingFlowBlocks = selectedProduct.openingFlowBlocks || [];
+      selectedProduct.openingFlowBlocks.push({
+        id,
+        type: "image",
+        label: "Custom image",
+        imageKey: id,
+        url: "",
+        caption: "",
         enabled: true
       });
       renderOpeningFlowBlocks();
@@ -10232,6 +10276,7 @@ function productFlowPageHtml() {
           productId: selectedProduct.id,
           slot: input.dataset.slot,
           originalName: file.name,
+          openingFlowBlocks: readOpeningFlowBlocks(),
           dataUrl: await readFileDataUrl(file)
         })
       });
@@ -10400,6 +10445,7 @@ function productFlowPageHtml() {
     document.querySelector("#supply-form").addEventListener("submit", saveSupply);
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
     document.querySelector("#add-text-block").addEventListener("click", addTextBlock);
+    document.querySelector("#add-image-block").addEventListener("click", addImageBlock);
     document.querySelector("#new-product-faq").addEventListener("click", newProductFaq);
     document.querySelector("#cancel-product-faq").addEventListener("click", () => {
       document.querySelector("#product-faq-form").hidden = true;
