@@ -9683,44 +9683,6 @@ function productFlowPageHtml() {
           </div>
           <div class="flow-block-list" id="opening-flow-blocks"></div>
         </div>
-        <div class="steps">
-          <div class="step">
-            <div class="number">01</div>
-            <div class="field"><label for="greeting">Greeting</label><textarea id="greeting" name="greeting"></textarea></div>
-          </div>
-          <div class="step">
-            <div class="number">02-04</div>
-            <div><div class="group-title">Product Info Photos</div><div class="image-grid" id="info-images"></div></div>
-          </div>
-          <div class="step">
-            <div class="number">05</div>
-            <div class="field"><label for="description">Product Description</label><textarea class="long" id="description" name="description"></textarea></div>
-          </div>
-          <div class="step">
-            <div class="number">06-09</div>
-            <div><div class="group-title">Testimonial Photos</div><div class="image-grid" id="testimonial-images"></div></div>
-          </div>
-          <div class="step">
-            <div class="number">10</div>
-            <div class="field"><label for="testimonialText">Testimonial Text</label><textarea id="testimonialText" name="testimonialText"></textarea></div>
-          </div>
-          <div class="step">
-            <div class="number">11</div>
-            <div><div class="group-title">Price Photo</div><div class="image-grid" id="price-image"></div></div>
-          </div>
-          <div class="step">
-            <div class="number">11A</div>
-            <div><div class="group-title">Optional Sales Photo</div><div class="image-grid" id="sales-image"></div></div>
-          </div>
-          <div class="step">
-            <div class="number">12</div>
-            <div class="field"><label for="priceText">Price Text</label><textarea class="medium" id="priceText" name="priceText"></textarea></div>
-          </div>
-          <div class="step">
-            <div class="number">13</div>
-            <div class="field"><label for="packageQuestion">Closing / Order Option Question</label><textarea id="packageQuestion" name="packageQuestion"></textarea></div>
-          </div>
-        </div>
         <div class="actions">
           <span id="save-state"></span>
           <button class="primary" id="save-flow" type="submit">Save Flow</button>
@@ -9755,26 +9717,6 @@ function productFlowPageHtml() {
       if (!selectedProduct) return;
       const option = document.querySelector("#product-select option[value='" + CSS.escape(selectedProduct.id) + "']");
       if (option) option.textContent = selectedProduct.name + (selectedProduct.ready ? "" : " (Setup)");
-    }
-
-    function imageSlotHtml(image) {
-      const version = selectedProduct ? Date.now() : "";
-      const url = image.url ? image.url + "?v=" + version : "";
-      return '<div class="image-slot">' +
-        '<label for="image-' + esc(image.key) + '">' + esc(image.label) + '</label>' +
-        (url ? '<img src="' + esc(url) + '" alt="' + esc(image.label) + '" onerror="this.closest(&quot;.image-slot&quot;).classList.add(&quot;missing-image&quot;)" />' : '') +
-        (image.url ? '<div class="image-missing-note">Saved image cannot be loaded. Please re-upload this photo.</div>' : '') +
-        '<input id="image-' + esc(image.key) + '" type="file" accept="image/png,image/jpeg,image/webp" data-slot="' + esc(image.key) + '" />' +
-      '</div>';
-    }
-
-    function renderImages() {
-      const images = selectedProduct.images || [];
-      document.querySelector("#info-images").innerHTML = images.filter(image => image.key.indexOf("infoPhoto") === 0).map(imageSlotHtml).join("");
-      document.querySelector("#testimonial-images").innerHTML = images.filter(image => image.key.indexOf("testimonialPhoto") === 0).map(imageSlotHtml).join("");
-      document.querySelector("#price-image").innerHTML = images.filter(image => image.key === "pricePhoto").map(imageSlotHtml).join("");
-      document.querySelector("#sales-image").innerHTML = images.filter(image => image.key === "salesPhoto").map(imageSlotHtml).join("");
-      document.querySelectorAll("input[data-slot]").forEach(input => input.addEventListener("change", uploadImage));
     }
 
     function optionCardHtml(option, index) {
@@ -9909,12 +9851,10 @@ function productFlowPageHtml() {
         const index = Number(card.dataset.blockIndex);
         const original = selectedProduct.openingFlowBlocks[index] || {};
         const read = field => card.querySelector('[data-block-field="' + field + '"]');
-        const legacyTextFields = ["greeting", "description", "testimonialText", "priceText", "packageQuestion"];
-        const legacyField = legacyTextFields.includes(original.id) ? original.id : "";
         return {
           ...original,
           label: read("label") ? read("label").value : original.label,
-          body: legacyField ? document.querySelector("#" + legacyField).value : (read("body") ? read("body").value : original.body),
+          body: read("body") ? read("body").value : original.body,
           caption: read("caption") ? read("caption").value : original.caption
         };
       });
@@ -10192,13 +10132,9 @@ function productFlowPageHtml() {
       resetProductFaqForm();
       document.querySelector("#skuCode").value = selectedProduct.skuCode || "";
       document.querySelector("#shoppingLink").value = selectedProduct.shoppingLink || "";
-      ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
-        document.querySelector("#" + field).value = selectedProduct[field] || "";
-      });
       renderOrderOptions();
       renderApprovedFaqs();
       renderKnowledge();
-      renderImages();
       renderOpeningFlowBlocks();
       renderReadiness();
       status(selectedProduct.ready ? "Ready for opening flow" : "Setup in progress");
@@ -10287,7 +10223,6 @@ function productFlowPageHtml() {
       }
       selectedProduct = data.product;
       products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
-      renderImages();
       renderKnowledge();
       renderOpeningFlowBlocks();
       renderReadiness();
@@ -10308,9 +10243,6 @@ function productFlowPageHtml() {
         skuCode: document.querySelector("#skuCode").value,
         shoppingLink: selectedProduct.shoppingLink || ""
       };
-      ["greeting", "description", "testimonialText", "priceText", "packageQuestion"].forEach(field => {
-        body[field] = document.querySelector("#" + field).value;
-      });
       body.orderOptions = readOrderOptions();
       body.openingFlowBlocks = readOpeningFlowBlocks();
       try {
