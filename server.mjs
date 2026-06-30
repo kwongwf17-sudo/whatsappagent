@@ -5710,19 +5710,12 @@ async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, o
 async function extractExistingProductImageKnowledge(product) {
   ensureProductKnowledge(product);
   const editorData = productFlowEditorData(product);
-  const eligibleKeys = new Set(["infoPhoto1", "infoPhoto2", "infoPhoto3", "pricePhoto", "salesPhoto"]);
-  const images = (editorData.images || [])
-    .filter((image) => eligibleKeys.has(image.key) && image.url)
-    .map((image) => ({
-      ...image,
-      slot: PRODUCT_FLOW_IMAGE_SLOTS.find((slot) => slot.key === image.key),
-    }))
-    .filter((image) => image.slot);
+  const images = productFlowImagesForExtraction(product, editorData);
 
   if (!images.length) {
     product.extracted_knowledge.lastExtraction = {
       status: "skipped",
-      reason: "No existing product, price, or sales images found.",
+      reason: "No existing opening-flow images found.",
       at: new Date().toISOString(),
       batch: true,
     };
@@ -5768,6 +5761,27 @@ async function extractExistingProductImageKnowledge(product) {
     ...(completed.length ? {} : { reason: failed[0]?.reason || "Extraction failed." }),
   };
   return product.extracted_knowledge.lastExtraction;
+}
+
+function productFlowImagesForExtraction(product, editorData = productFlowEditorData(product)) {
+  const images = [];
+  const seenUrls = new Set();
+  const addImage = (image, slot) => {
+    const url = String(image?.url || "").trim();
+    if (!url || !slot || seenUrls.has(url)) return;
+    seenUrls.add(url);
+    images.push({ ...image, key: slot.key, label: slot.label, url, slot });
+  };
+  for (const block of editorData.openingFlowBlocks || []) {
+    if (block?.type !== "image" || block.enabled === false) continue;
+    const slot = productFlowImageSlotForUpload(product, block.imageKey || block.id);
+    addImage({ key: block.imageKey || block.id, label: block.label, url: block.url }, slot);
+  }
+  for (const image of editorData.images || []) {
+    const slot = productFlowImageSlotForUpload(product, image.key);
+    addImage(image, slot);
+  }
+  return images;
 }
 
 async function assetUrlToDataUrl(assetUrl) {
