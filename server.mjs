@@ -142,6 +142,11 @@ const FOLLOWUP_EDITOR_STAGES = [
     return { key: `day_${day}_followup`, label: `Day ${day}`, dayOffset: day, defaultSendHour: 20 };
   }),
 ];
+const DEFAULT_ORDER_CLOSING_MESSAGES = [
+  "Sorry Dear our stock just finish , I will take order again, will take around 15-18 days for arrived brunei new stock 🥰 But i will try my best to get it quick for you ya.",
+  "REMINDER ✨: \n-Order after 1 hour cannot be canceled. \n-Brg Sampai baru byr runner",
+  "Terima kasih❤️",
+];
 
 const catalog = JSON.parse(await readSeedFile(config.catalogPath, "product_catalog.json"));
 const faqLibrary = await loadFaqLibrary();
@@ -2054,7 +2059,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
     await notifyAdmin(`Human handoff requested for ${from}: ${plan.handoffReason || "No reason supplied."}`);
   }
 
-  const outbound = clampMessages(order ? orderSubmittedCustomerMessages() : plan.messages);
+  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : plan.messages);
   if (!order && fixedOpeningFlow) {
     await delayBeforeNewCustomerOpeningFlow(customer, "fixed opening flow");
   }
@@ -2222,12 +2227,13 @@ function sanitizeProductKnowledgeReply(reply) {
     .trim();
 }
 
-function orderSubmittedCustomerMessages() {
-  return [
-    textMessage("Sorry Dear our stock just finish , I will take order again, will take around 15-18 days for arrived brunei new stock 🥰 But i will try my best to get it quick for you ya."),
-    textMessage("REMINDER ✨: \n-Order after 1 hour cannot be canceled. \n-Brg Sampai baru byr runner"),
-    textMessage("Terima kasih❤️"),
-  ];
+function orderSubmittedCustomerMessages(product) {
+  const hasSavedMessages = Array.isArray(product?.order_closing_messages);
+  const messages = hasSavedMessages ? product.order_closing_messages : DEFAULT_ORDER_CLOSING_MESSAGES;
+  const cleaned = messages
+    .map((message) => String(message || "").trim())
+    .filter(Boolean);
+  return cleaned.map(textMessage);
 }
 
 function followupTemplateName(followupKey) {
@@ -5497,6 +5503,7 @@ function productFlowEditorData(product, options = {}) {
     skuCode: String(product.sku_code || ""),
     shoppingLink: String(product.shopping_link || ""),
     orderOptions: orderOptionsForEditor(product),
+    orderClosingMessages: orderClosingMessagesForEditor(product),
     approvedFaqs: approvedProductFaqsForEditor(product),
     extractedKnowledge: productKnowledgeForEditor(product),
     ready: options.skipReady ? false : product.openingFlowEnabled !== false && isProductFlowComplete(product),
@@ -5613,6 +5620,20 @@ function approvedProductFaqsForEditor(product) {
     }));
 }
 
+function orderClosingMessagesForEditor(product) {
+  if (Array.isArray(product?.order_closing_messages)) {
+    return normalizeOrderClosingMessages(product.order_closing_messages);
+  }
+  return [...DEFAULT_ORDER_CLOSING_MESSAGES];
+}
+
+function normalizeOrderClosingMessages(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .map((message) => String(message || "").trim())
+    .filter(Boolean)
+    .slice(0, 20);
+}
+
 function productKnowledgeForEditor(product) {
   const knowledge = ensureProductKnowledge(product);
   return {
@@ -5652,6 +5673,9 @@ function updateProductFlowText(product, body) {
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderOptions")) {
     product.order_options = normalizeOrderOptions(body.orderOptions);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "orderClosingMessages")) {
+    product.order_closing_messages = normalizeOrderClosingMessages(body.orderClosingMessages);
   }
   if (Object.prototype.hasOwnProperty.call(body, "skuCode")) {
     product.sku_code = normalizeSkuCode(body.skuCode);
@@ -6152,6 +6176,7 @@ function createCatalogProduct(name) {
     suffix += 1;
   }
   const followupTemplate = catalog.products.find((product) => product.id === catalog.default_product_id)?.followups || {};
+  const closingTemplate = catalog.products.find((product) => product.id === catalog.default_product_id)?.order_closing_messages || DEFAULT_ORDER_CLOSING_MESSAGES;
   const emptyFlow = {
     greeting: "",
     description: "",
@@ -6179,6 +6204,7 @@ function createCatalogProduct(name) {
     sales_replies: [],
     standard_replies: [],
     followups: structuredClone(followupTemplate),
+    order_closing_messages: structuredClone(closingTemplate),
   };
   return product;
 }
@@ -9712,6 +9738,17 @@ function productFlowPageHtml() {
     .flow-block-body textarea { min-height: 78px; }
     .flow-block-body .image-preview { width: 100%; max-height: 110px; object-fit: contain; background: #f5f5f7; border-radius: 6px; }
     .flow-block-body .image-url { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .closing-sequence { margin-top: 14px; padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
+    .closing-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .closing-head h3 { margin: 0; font-size: 16px; }
+    .closing-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .closing-list { display: grid; gap: 10px; }
+    .closing-card { border: 1px solid #e5e5ea; border-radius: 10px; background: #fff; overflow: hidden; }
+    .closing-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; background: #f5f5f7; border-bottom: 1px solid #e5e5ea; }
+    .closing-card-title { display: flex; align-items: center; gap: 8px; font-weight: 800; }
+    .closing-card-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .closing-card-body { padding: 12px; }
+    .closing-card-body textarea { min-height: 92px; }
     .empty-options { padding: 12px; border: 1px dashed #d2d2d7; border-radius: 8px; color: var(--muted); background: #fff; }
     .knowledge-panel { padding: 14px; border-top: 1px solid #e5e5ea; background: #fff; }
     .knowledge-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
@@ -9902,6 +9939,16 @@ function productFlowPageHtml() {
           </div>
           <div class="flow-block-list" id="opening-flow-blocks"></div>
         </div>
+        <div class="closing-sequence">
+          <div class="closing-head">
+            <div>
+              <h3>Order Closing Sequence</h3>
+              <p>Sent after the customer submits complete order details. Add as many messages as you want; the agent sends them from top to bottom.</p>
+            </div>
+            <button id="add-closing-message" type="button">Add Message</button>
+          </div>
+          <div class="closing-list" id="order-closing-messages"></div>
+        </div>
         <div class="actions">
           <span id="save-state"></span>
           <button class="primary" id="save-flow" type="submit">Save Flow</button>
@@ -10077,6 +10124,62 @@ function productFlowPageHtml() {
           caption: read("caption") ? read("caption").value : original.caption
         };
       });
+    }
+
+    function closingMessageHtml(message, index) {
+      return '<div class="closing-card" data-closing-index="' + index + '">' +
+        '<div class="closing-card-head">' +
+          '<div class="closing-card-title"><span class="option-index">' + esc(index + 1) + '</span><span>Message ' + esc(index + 1) + '</span></div>' +
+          '<div class="closing-card-actions">' +
+            '<button type="button" data-move-closing="up">Up</button>' +
+            '<button type="button" data-move-closing="down">Down</button>' +
+            '<button class="danger" type="button" data-delete-closing>Delete</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="closing-card-body">' +
+          '<textarea data-closing-message placeholder="Closing message after order submission">' + esc(message || "") + '</textarea>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderOrderClosingMessages() {
+      selectedProduct.orderClosingMessages = selectedProduct.orderClosingMessages || [];
+      document.querySelector("#order-closing-messages").innerHTML = selectedProduct.orderClosingMessages.map(closingMessageHtml).join("") || '<div class="empty-options">No closing messages. Add at least one message if you want the agent to reply after order submission.</div>';
+      document.querySelectorAll(".closing-card").forEach(card => {
+        const index = Number(card.dataset.closingIndex);
+        card.querySelector("[data-closing-message]").addEventListener("input", event => {
+          selectedProduct.orderClosingMessages[index] = event.target.value;
+        });
+        card.querySelector("[data-move-closing='up']").addEventListener("click", () => moveClosingMessage(index, -1));
+        card.querySelector("[data-move-closing='down']").addEventListener("click", () => moveClosingMessage(index, 1));
+        card.querySelector("[data-delete-closing]").addEventListener("click", () => {
+          selectedProduct.orderClosingMessages.splice(index, 1);
+          renderOrderClosingMessages();
+        });
+      });
+    }
+
+    function moveClosingMessage(index, delta) {
+      const messages = selectedProduct.orderClosingMessages || [];
+      const target = index + delta;
+      if (target < 0 || target >= messages.length) return;
+      const item = messages[index];
+      messages.splice(index, 1);
+      messages.splice(target, 0, item);
+      renderOrderClosingMessages();
+    }
+
+    function addClosingMessage() {
+      if (!selectedProduct) return;
+      selectedProduct.orderClosingMessages = selectedProduct.orderClosingMessages || [];
+      selectedProduct.orderClosingMessages.push("");
+      renderOrderClosingMessages();
+    }
+
+    function readOrderClosingMessages() {
+      return Array.from(document.querySelectorAll("[data-closing-message]"))
+        .map(textarea => textarea.value)
+        .filter(message => message.trim());
     }
 
     function faqItemHtml(faq) {
@@ -10355,6 +10458,7 @@ function productFlowPageHtml() {
       renderApprovedFaqs();
       renderKnowledge();
       renderOpeningFlowBlocks();
+      renderOrderClosingMessages();
       renderReadiness();
       status(selectedProduct.ready ? "Ready for opening flow" : "Setup in progress");
     }
@@ -10464,6 +10568,7 @@ function productFlowPageHtml() {
       };
       body.orderOptions = readOrderOptions();
       body.openingFlowBlocks = readOpeningFlowBlocks();
+      body.orderClosingMessages = readOrderClosingMessages();
       try {
         const response = await fetch("/admin/product-flow/save", {
           method: "POST",
@@ -10478,6 +10583,7 @@ function productFlowPageHtml() {
         selectedProduct = data.product;
         products = products.map(product => product.id === selectedProduct.id ? selectedProduct : product);
         renderOpeningFlowBlocks();
+        renderOrderClosingMessages();
         renderReadiness();
         updateSelectedOptionLabel();
         status("Saved");
@@ -10597,6 +10703,7 @@ function productFlowPageHtml() {
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
     document.querySelector("#add-text-block").addEventListener("click", addTextBlock);
     document.querySelector("#add-image-block").addEventListener("click", addImageBlock);
+    document.querySelector("#add-closing-message").addEventListener("click", addClosingMessage);
     document.querySelector("#new-product-faq").addEventListener("click", newProductFaq);
     document.querySelector("#cancel-product-faq").addEventListener("click", () => {
       document.querySelector("#product-faq-form").hidden = true;
