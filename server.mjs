@@ -299,7 +299,6 @@ const OPT_OUT_INTENT_PATTERNS = [
 ];
 const OPT_OUT_UNCERTAIN_PATTERNS = [
   /\b(kacau|annoying|spam|terlalu banyak|banyak message|banyak msg)\b/i,
-  /\b(saya fikir dulu|fikir dulu|later dulu|nanti dulu)\b/i,
 ];
 const DEMO_ACCOUNT_ID = "__demo__";
 
