@@ -10000,14 +10000,14 @@ function followupSettingsPageHtml() {
     :root { --accent:#0071e3; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Arial,sans-serif; color:#1d1d1f; background:#f5f5f7; }
     * { box-sizing:border-box; }
     body { margin:0; }
-    header, nav, main { padding:16px 20px; }
-    header { background:#fbfbfd; border-bottom:1px solid #d2d2d7; }
-    h1 { margin:0 0 4px; font-size:28px; }
+    header { padding:16px 22px 10px; background:rgba(251,251,253,.9); border-bottom:1px solid rgba(210,210,215,.8); backdrop-filter:saturate(180%) blur(16px); }
+    h1 { margin:0; font-size:20px; }
+    header .muted { margin-top:4px; min-height:18px; font-size:13px; }
     .muted { color:#6e6e73; }
-    nav { display:flex; gap:10px; flex-wrap:wrap; background:#f5f5f7; border-bottom:1px solid #d2d2d7; }
-    nav a, button { border:1px solid #d2d2d7; border-radius:8px; background:#fff; color:#1d1d1f; padding:10px 14px; text-decoration:none; font:inherit; font-weight:700; cursor:pointer; }
+    nav { display:flex; flex-wrap:wrap; gap:8px; padding:10px 22px 14px; background:rgba(251,251,253,.9); border-bottom:1px solid rgba(210,210,215,.8); backdrop-filter:saturate(180%) blur(16px); }
+    nav a, button { border:1px solid #d2d2d7; border-radius:8px; background:#fff; color:#1d1d1f; padding:8px 11px; text-decoration:none; font:inherit; font-weight:600; cursor:pointer; }
     button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-    main { display:grid; gap:14px; }
+    main { display:grid; gap:14px; padding:22px; }
     section { background:#fff; border:1px solid #e5e5ea; border-radius:8px; padding:16px; }
     h2 { margin:0 0 12px; font-size:18px; }
     .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end; }
