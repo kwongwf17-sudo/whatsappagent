@@ -4791,13 +4791,13 @@ function whatsappWebStatusHtml() {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>WhatsApp Web Connector</title>
   <style>
-    :root { --accent: #0b7cff; --line: #d8dee4; --muted: #6b7280; --bg: #f6f7fb; }
-    body { margin: 0; font-family: Arial, sans-serif; color: #222; background: var(--bg); }
-    header, nav, main { padding: 18px 24px; }
-    header { background: #fff; border-bottom: 1px solid var(--line); }
-    h1 { margin: 0 0 6px; font-size: 28px; }
-    nav { display: flex; flex-wrap: wrap; gap: 10px; border-bottom: 1px solid var(--line); background: #fff; }
-    nav a, nav button { border: 1px solid #cfd4dc; background: #fff; border-radius: 8px; padding: 10px 13px; color: #222; text-decoration: none; font-weight: 700; font-size: 15px; }
+    :root { --accent: #0b7cff; --line: #d2d2d7; --muted: #6e6e73; --bg: #f5f5f7; --surface: #ffffff; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: var(--bg); }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    header .muted { margin-top: 4px; min-height: 18px; font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; border-bottom: 1px solid rgba(210,210,215,.8); background: rgba(251,251,253,.9); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, nav button { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 8px 11px; color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
     .card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 18px; max-width: 760px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
     .status { display: inline-block; border-radius: 999px; padding: 6px 10px; font-weight: 700; background: #f1f5f9; }
     .connected { color: #176f37; background: #dcfce7; }
@@ -4816,6 +4816,7 @@ function whatsappWebStatusHtml() {
     .pairing-code { display: none; margin-top: 14px; font-size: 30px; font-weight: 800; letter-spacing: 3px; }
     .danger { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
     .danger button { border: 1px solid #fecaca; border-radius: 8px; padding: 11px 14px; background: #fee2e2; color: #991b1b; font-weight: 800; cursor: pointer; }
+    main { padding: 22px; }
     .muted { color: var(--muted); }
     code { background: #f1f5f9; padding: 2px 5px; border-radius: 5px; }
   </style>
@@ -4829,9 +4830,14 @@ function whatsappWebStatusHtml() {
     <a href="/admin/dashboard">Dashboard</a>
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/compliance">Compliance</a>
+    <a href="/demo/chat">Customer Demo</a>
     <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
     <section class="card">
@@ -12093,6 +12099,7 @@ function demoChatHtml() {
       <a href="/admin/follow-up-settings">Follow-Up Settings</a>
       <a href="/admin/compliance">Compliance</a>
       <a href="/demo/chat">Customer Demo</a>
+      <button id="refresh" type="button">Refresh</button>
       <a href="/admin/dashboard?tab=profile">Profile</a>
     </nav>
   <main>
@@ -12298,6 +12305,7 @@ function demoChatHtml() {
     productSelect.addEventListener("change", () => {
       switchDemoProduct(productSelect.value);
     });
+    document.querySelector("#refresh").addEventListener("click", () => window.location.reload());
 
     async function runFollowup(now, label) {
       const response = await fetch("/demo/followups/run", {
