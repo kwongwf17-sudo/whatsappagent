@@ -670,7 +670,12 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/admin/followup-settings-data") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      return sendJson(res, 200, await buildFollowupSettingsData(adminSession.accountId));
+      try {
+        return sendJson(res, 200, await buildFollowupSettingsData(adminSession.accountId));
+      } catch (error) {
+        await recordSystemError("followup_settings_load", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 500, { error: error.message || "Unable to load follow-up settings." });
+      }
     }
 
     if (req.method === "POST" && url.pathname === "/admin/followup-settings/media") {
@@ -700,23 +705,23 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/admin/followup-settings/save") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      const body = await readJsonBody(req);
-      const content = await getTeamContent(adminSession.accountId);
-      const saved = updateTeamFollowupMessages(content, body.followups || body.stages || []);
-      await saveTeamContent(adminSession.accountId, content);
-      if (body.settings && typeof body.settings === "object") {
-        await adminAccounts.updateTeamSettings(adminSession.accountId, {
-          followupSendsPerMinute: body.settings.followupSendsPerMinute,
-          followupIntervalMinutes: body.settings.followupIntervalMinutes,
+      try {
+        const body = await readJsonBody(req);
+        const content = await getTeamContent(adminSession.accountId);
+        const saved = updateTeamFollowupMessages(content, body.followups || body.stages || []);
+        await saveTeamContent(adminSession.accountId, content);
+        await saveFollowupRuntimeSettings(adminSession.accountId, body.settings);
+        await store.appendAuditLog({
+          actor: `business_admin:${adminSession.accountId}`,
+          action: "followup_messages_updated",
+          result: `${saved.updatedProducts} product(s)`,
+          businessAccountId: adminSession.accountId,
         });
+        return sendJson(res, 200, { ...(await buildFollowupSettingsData(adminSession.accountId, content)), saved });
+      } catch (error) {
+        await recordSystemError("followup_settings_save", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 500, { error: error.message || "Unable to save follow-up settings." });
       }
-      await store.appendAuditLog({
-        actor: `business_admin:${adminSession.accountId}`,
-        action: "followup_messages_updated",
-        result: `${saved.updatedProducts} product(s)`,
-        businessAccountId: adminSession.accountId,
-      });
-      return sendJson(res, 200, { ...(await buildFollowupSettingsData(adminSession.accountId, content)), saved });
     }
 
     if (req.method === "POST" && url.pathname === "/demo/followups/run") {
@@ -3211,6 +3216,23 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
       followupIntervalMinutes: Number(settings.followupIntervalMinutes || 0) || config.followupIntervalMinutes,
     },
   };
+}
+
+async function saveFollowupRuntimeSettings(businessAccountId = config.accountId, settings = {}) {
+  if (!settings || typeof settings !== "object") return null;
+  const runtimeSettings = {
+    followupSendsPerMinute: settings.followupSendsPerMinute,
+    followupIntervalMinutes: settings.followupIntervalMinutes,
+  };
+  try {
+    return await adminAccounts.updateTeamSettings(businessAccountId, runtimeSettings);
+  } catch (error) {
+    if (String(error?.message || "").toLowerCase().includes("account not found")) {
+      console.warn(`Skipped follow-up runtime settings save for missing account ${businessAccountId}.`);
+      return null;
+    }
+    throw error;
+  }
 }
 
 async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId) {
@@ -10111,13 +10133,22 @@ function followupSettingsPageHtml() {
     function blockId() {
       return "block_" + Date.now() + "_" + Math.random().toString(16).slice(2);
     }
+    async function readResponseJson(response) {
+      const text = await response.text();
+      if (!text) return {};
+      try {
+        return JSON.parse(text);
+      } catch (error) {
+        return { error: text };
+      }
+    }
     async function request(path, body) {
       const response = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
-      const result = await response.json();
+      const result = await readResponseJson(response);
       if (!response.ok) throw new Error(result.error || "Action failed.");
       return result;
     }
@@ -10267,7 +10298,7 @@ function followupSettingsPageHtml() {
       state.textContent = "Loading...";
       try {
         const response = await fetch("/admin/followup-settings-data", { cache: "no-store" });
-        const result = await response.json();
+        const result = await readResponseJson(response);
         if (!response.ok) throw new Error(result.error || "Unable to load follow-up settings.");
         data = result;
         const name = String(data.profile?.name || "").trim();
