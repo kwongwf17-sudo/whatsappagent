@@ -10042,6 +10042,8 @@ function followupSettingsPageHtml() {
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
     <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
     <section>
@@ -10073,6 +10075,20 @@ function followupSettingsPageHtml() {
     </section>
   </main>
   <script>
+    const defaultFollowupStages = ${JSON.stringify(FOLLOWUP_EDITOR_STAGES.map((stage) => ({
+      key: stage.key,
+      label: stage.label,
+      dayOffset: stage.dayOffset,
+      sendHour: stage.defaultSendHour,
+      message: "",
+      messages: [],
+      firstChatCutoffEnabled: stage.firstChatCutoffHour === undefined ? undefined : true,
+      firstChatCutoffHour: stage.firstChatCutoffHour,
+    })))};
+    const defaultFollowupSettings = {
+      followupSendsPerMinute: ${JSON.stringify(Math.max(config.followupSendsPerMinute, 1))},
+      followupIntervalMinutes: ${JSON.stringify(Math.max(config.followupIntervalMinutes, 1))}
+    };
     let data = null;
     const mediaInput = document.createElement("input");
     mediaInput.type = "file";
@@ -10106,17 +10122,22 @@ function followupSettingsPageHtml() {
       return { id: block.id || blockId(), type: "text", body: block.body || block.message || "" };
     }
     function render() {
-      const settings = data.settings || {};
+      data = data && typeof data === "object" ? data : {};
+      const settings = data.settings || defaultFollowupSettings;
       document.querySelector("#followup-sends-per-minute").value = settings.followupSendsPerMinute || "";
       document.querySelector("#followup-interval-minutes").value = settings.followupIntervalMinutes || "";
-      const first = (data.followupMessages || []).find(stage => stage.key === "first_day_followup") || {};
+      const stages = Array.isArray(data.followupMessages) && data.followupMessages.length
+        ? data.followupMessages
+        : defaultFollowupStages;
+      const first = stages.find(stage => stage.key === "first_day_followup") || {};
       document.querySelector("#first-cutoff-enabled").checked = first.firstChatCutoffEnabled !== false;
       document.querySelector("#first-cutoff-hour").value = first.firstChatCutoffHour ?? 19;
-      document.querySelector("#followup-stage-grid").innerHTML = (data.followupMessages || []).map(renderStage).join("");
+      document.querySelector("#followup-stage-grid").innerHTML = stages.map(renderStage).join("");
       bindStageButtons();
     }
     function renderStage(stage) {
       const blocks = (stage.messages || (stage.message ? [{ type: "text", body: stage.message }] : [])).map(normalizeBlock).filter(Boolean);
+      if (!blocks.length) blocks.push({ id: blockId(), type: "text", body: "" });
       return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '">' +
         '<div class="stage-head"><strong>' + esc(stage.label) + '</strong><span class="muted">Day offset: ' + esc(stage.dayOffset) + '</span></div>' +
         '<label>Send Hour<input data-stage-field="sendHour" type="number" min="0" max="23" value="' + esc(stage.sendHour ?? 20) + '" /></label>' +
@@ -10234,13 +10255,25 @@ function followupSettingsPageHtml() {
       }
     }
     async function load() {
-      const response = await fetch("/admin/followup-settings-data", { cache: "no-store" });
-      data = await response.json();
-      const name = String(data.profile?.name || "").trim();
-      if (name) document.querySelector("#page-title").textContent = name + " Follow-Up Settings";
-      render();
+      const state = document.querySelector("#save-state");
+      state.textContent = "Loading...";
+      try {
+        const response = await fetch("/admin/followup-settings-data", { cache: "no-store" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Unable to load follow-up settings.");
+        data = result;
+        const name = String(data.profile?.name || "").trim();
+        if (name) document.querySelector("#page-title").textContent = name + " Follow-Up Settings";
+        render();
+        state.textContent = "";
+      } catch (error) {
+        data = { settings: defaultFollowupSettings, followupMessages: defaultFollowupStages };
+        render();
+        state.textContent = "Could not load saved settings: " + (error.message || error);
+      }
     }
     document.querySelector("#save-followups").addEventListener("click", save);
+    document.querySelector("#refresh").addEventListener("click", load);
     load();
   </script>
 </body>
