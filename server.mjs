@@ -2592,9 +2592,10 @@ async function getDueFollowupsForTeams(now = new Date()) {
     const teamCatalog = contentByAccount.get(accountId).catalog;
     const product = teamCatalog.products.find((item) => item.id === customer.productId);
     if (!product) continue;
-    for (const item of productFollowupSequence(product)) {
+    const sequence = productFollowupSequence(product);
+    for (const item of sequence) {
       if (customer.followupsSent?.[item.key]) continue;
-      if (now >= followupDueAt(customer.firstSeenAt, item)) {
+      if (now >= effectiveFollowupDueAt(customer, item, sequence)) {
         due.push({ customer, product, followup: item.followup, followupKey: item.key });
       }
       break;
@@ -2623,6 +2624,7 @@ async function dispatchFollowupQueue(now = new Date()) {
   const batch = rotateFollowupBatch(await claimFollowupDispatchBatch(now));
   const customers = await store.listCustomers(now);
   const customerById = new Map(customers.map((customer) => [customerKey(customer.businessAccountId || config.accountId, customer.id), customer]));
+  const contentByAccount = new Map();
   const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [] };
 
   for (const item of batch) {
@@ -2646,6 +2648,23 @@ async function dispatchFollowupQueue(now = new Date()) {
     if (customer.followupsSent?.[item.followupKey]) {
       await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: customer.followupsSent[item.followupKey] });
       continue;
+    }
+    if (!contentByAccount.has(itemAccountId)) {
+      contentByAccount.set(itemAccountId, await getTeamContent(itemAccountId));
+    }
+    const product = contentByAccount.get(itemAccountId).catalog.products.find((entry) => entry.id === customer.productId);
+    const followupSequence = productFollowupSequence(product);
+    const sequenceItem = followupSequence.find((entry) => entry.key === item.followupKey);
+    if (sequenceItem) {
+      const effectiveDueAt = effectiveFollowupDueAt(customer, sequenceItem, followupSequence);
+      if (now < effectiveDueAt) {
+        await operations.updateFollowupDispatch(item.id, {
+          status: "queued",
+          availableAt: effectiveDueAt.toISOString(),
+          lastError: "Waiting for the next scheduled follow-up stage.",
+        });
+        continue;
+      }
     }
     const outsideCustomerServiceWindow = config.transportMode === "cloud" && !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
     const templateName = outsideCustomerServiceWindow ? followupTemplateName(item.followupKey) : "";
@@ -3673,7 +3692,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
     const followups = productFollowupSequence(product);
     const nextItem = followups.find((item) => !sent[item.key]);
     let nextFollowup = nextItem?.key || "";
-    let nextDueAt = nextItem ? followupDueAt(customer.firstSeenAt || now, nextItem) : null;
+    let nextDueAt = nextItem ? effectiveFollowupDueAt(customer, nextItem, followups) : null;
     let status = nextDueAt && now >= nextDueAt ? "due" : "scheduled";
     const dispatchKey = [
       customer.businessAccountId || config.accountId,
@@ -4213,6 +4232,39 @@ function followupDueAt(firstSeenAt, item) {
     due = followupZonedLocalToDate(addFollowupLocalDays({ ...followupZonedDateParts(firstDueAt), hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, 1));
   }
   return due;
+}
+
+function previousFollowupSentAt(customer, item, sequence = []) {
+  const itemIndex = sequence.findIndex((entry) => entry.key === item.key);
+  if (itemIndex <= 0) return null;
+  for (let index = itemIndex - 1; index >= 0; index -= 1) {
+    const sentAt = customer.followupsSent?.[sequence[index].key];
+    if (!sentAt) continue;
+    const date = new Date(sentAt);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return null;
+}
+
+function followupDueAfterPreviousSent(previousSentAt, item) {
+  const previousLocal = followupZonedDateParts(previousSentAt);
+  const nextLocal = addFollowupLocalDays(
+    { ...previousLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 },
+    1
+  );
+  let due = followupZonedLocalToDate(nextLocal);
+  if (due <= previousSentAt) {
+    due = followupZonedLocalToDate(addFollowupLocalDays(nextLocal, 1));
+  }
+  return due;
+}
+
+function effectiveFollowupDueAt(customer, item, sequence = []) {
+  const scheduledDueAt = followupDueAt(customer.firstSeenAt, item);
+  const previousSentAt = previousFollowupSentAt(customer, item, sequence);
+  if (!previousSentAt) return scheduledDueAt;
+  const previousGateAt = followupDueAfterPreviousSent(previousSentAt, item);
+  return scheduledDueAt > previousGateAt ? scheduledDueAt : previousGateAt;
 }
 
 function isWithinCustomerServiceWindow(customer, at = new Date()) {
