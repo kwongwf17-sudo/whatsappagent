@@ -10307,7 +10307,7 @@ function productFlowPageHtml() {
     nav a:hover, button:hover { border-color: #a8a8ad; }
     button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     button:disabled { opacity: .55; cursor: wait; }
-    main { padding: 22px; max-width: 1280px; margin: 0 auto; }
+    main { padding: 22px; max-width: 1380px; margin: 0 auto; }
     .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; margin-bottom: 14px; border: 1px solid #e5e5ea; border-radius: 8px; background: var(--surface); }
     .toolbar label { display: inline-flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; }
     .toolbar-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
@@ -10338,7 +10338,7 @@ function productFlowPageHtml() {
     .image-slot.missing-image .image-missing-note { display: block; }
     .order-options-panel { padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
     .order-options-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .order-options-head h3 { margin: 0; font-size: 16px; }
+    .order-options-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
     .order-options-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
     .option-list { display: grid; gap: 10px; }
     .option-card { border: 1px solid #e5e5ea; border-radius: 10px; background: #fff; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
@@ -10355,7 +10355,7 @@ function productFlowPageHtml() {
     .option-card .remove-option { padding: 6px 10px; border-color: #ffd1d1; color: #9b1c12; background: #fff7f7; }
     .flow-builder { padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
     .flow-builder-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .flow-builder-head h3 { margin: 0; font-size: 16px; }
+    .flow-builder-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
     .flow-builder-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
     .flow-block-list { display: grid; gap: 10px; }
     .flow-block { border: 1px solid #e5e5ea; border-radius: 10px; background: #fff; overflow: hidden; }
@@ -10372,7 +10372,7 @@ function productFlowPageHtml() {
     .flow-block-body .image-url { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .closing-sequence { margin-top: 14px; padding: 14px; border: 1px solid #e5e5ea; border-radius: 10px; background: #fbfbfd; }
     .closing-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .closing-head h3 { margin: 0; font-size: 16px; }
+    .closing-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
     .closing-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
     .closing-list { display: grid; gap: 10px; }
     .closing-card { border: 1px solid #e5e5ea; border-radius: 10px; background: #fff; overflow: hidden; }
@@ -10384,7 +10384,7 @@ function productFlowPageHtml() {
     .empty-options { padding: 12px; border: 1px dashed #d2d2d7; border-radius: 8px; color: var(--muted); background: #fff; }
     .knowledge-panel { padding: 14px; border-top: 1px solid #e5e5ea; background: #fff; }
     .knowledge-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-    .knowledge-head h3 { margin: 0; font-size: 16px; }
+    .knowledge-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
     .knowledge-note { color: var(--muted); font-size: 13px; }
     .knowledge-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .knowledge-list { display: grid; gap: 8px; }
