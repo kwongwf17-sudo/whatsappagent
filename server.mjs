@@ -3209,7 +3209,7 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
   const teamContent = content || await getTeamContent(businessAccountId);
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return {
-    profile: normalizeDashboardProfile((await store.getSystemState()).dashboardProfile),
+    profile: normalizeDashboardProfile((await operations.getState()).dashboardProfile),
     followupMessages: teamFollowupMessages(teamContent),
     settings: {
       followupSendsPerMinute: Number(settings.followupSendsPerMinute || 0) || config.followupSendsPerMinute,
