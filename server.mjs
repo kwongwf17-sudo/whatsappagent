@@ -1742,6 +1742,45 @@ async function recentProductContextMatch(customerId, businessAccountId, catalog,
   return findProductMatch(catalog, contextText, source);
 }
 
+function shouldStartNewProductJourney(customer = {}, product = null) {
+  return Boolean(
+    product?.id &&
+    customer.productId &&
+    product.id !== customer.productId &&
+    !customer.pendingOrder &&
+    customer.complaintStatus !== "open"
+  );
+}
+
+function newProductJourneyPatch(customer = {}, product = null, now = new Date()) {
+  if (!shouldStartNewProductJourney(customer, product)) return {};
+  const nowIso = now.toISOString();
+  return {
+    firstSeenAt: nowIso,
+    lastMessageAt: nowIso,
+    lastInboundAt: nowIso,
+    productId: product.id,
+    followupsSent: {},
+    pendingOrder: null,
+    awaitingPackageBInterest: false,
+    lastSalesReplyId: "",
+    lastApprovedFaqId: "",
+    handoffStatus: "",
+    handoffReason: "",
+    source: {
+      ...(customer.source || {}),
+      previousProductId: customer.productId || "",
+      productJourneyResetAt: nowIso,
+    },
+    ...(customer.optedOut
+      ? {}
+      : {
+          followupBlocked: false,
+          followupBlockedReason: "",
+        }),
+  };
+}
+
 async function processInboundMessage({
   id,
   from,
@@ -1786,8 +1825,9 @@ async function processInboundMessage({
     source,
   });
   const conversationContext = await recentConversationContext(from, businessAccountId);
+  const sourceMatchedProduct = findProductMatch(teamCatalog, "", source);
   const contextMatchedProduct = customer.productId
-    ? null
+    ? sourceMatchedProduct
     : await recentProductContextMatch(from, businessAccountId, teamCatalog, source);
 
   if (live) {
@@ -1814,9 +1854,11 @@ async function processInboundMessage({
 
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
   const optOutIntent = detectOptOutIntent(text);
-  const textMatchedProduct = findProduct(teamCatalog, text, {}, "");
+  const explicitTextMatchedProduct = findProductMatch(teamCatalog, text, {});
+  const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, {}, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
-  if (!customer.pendingOrder && !isProductNameOnlyOpening && contextMatchedProduct && Number(customer.inboundCount || 0) <= 1) {
+  const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
+  if (!customer.pendingOrder && !isProductNameOnlyOpening && contextMatchedProduct && (Number(customer.inboundCount || 0) <= 1 || contextStartsNewProductJourney)) {
     const messageSource = {
       ...source,
       productId: contextMatchedProduct.id,
@@ -1837,6 +1879,7 @@ async function processInboundMessage({
     });
     console.log(`Skipping OpenAI for ad-context opening flow to ${from}: ${contextMatchedProduct.id}`);
     const updatedCustomer = await store.updateCustomer(from, () => ({
+      ...newProductJourneyPatch(customer, contextMatchedProduct),
       ...(plan.customerPatch || {}),
       productId: contextMatchedProduct.id,
       complaintCaseId: "",
@@ -1879,6 +1922,7 @@ async function processInboundMessage({
     });
     console.log(`Skipping OpenAI for product-name opening flow to ${from}`);
     const updatedCustomer = await store.updateCustomer(from, () => ({
+      ...newProductJourneyPatch(customer, textMatchedProduct),
       ...(plan.customerPatch || {}),
       complaintCaseId: "",
       complaintStatus: "",
@@ -2083,7 +2127,9 @@ async function processInboundMessage({
     };
   }
 
-  const product = findProduct(teamCatalog, text, source, customer.productId);
+  const product = shouldStartNewProductJourney(customer, explicitTextMatchedProduct)
+    ? explicitTextMatchedProduct
+    : findProduct(teamCatalog, text, source, customer.productId);
   const productNameOpening = isProductNameMessage(product, text);
   const messageSource = productNameOpening ? { ...source, productNameMatch: true } : source;
   const fixedOpeningFlow = usesFixedOpeningFlow(customer, text, messageSource);
@@ -2125,9 +2171,12 @@ async function processInboundMessage({
   if (faqSalesResponse) {
     console.log(`Skipping OpenAI for Package B interest response from ${from}: ${faqSalesResponse}`);
   }
+  const planningCustomer = shouldStartNewProductJourney(customer, product)
+    ? { ...customer, productId: product.id, followupsSent: {}, pendingOrder: null, awaitingPackageBInterest: false }
+    : customer;
   const plan = await buildConversationPlan({
     catalog: teamCatalog,
-    customer,
+    customer: planningCustomer,
     customerMessage: text,
     source: messageSource,
     faqLibrary: teamFaqLibrary,
@@ -2138,7 +2187,10 @@ async function processInboundMessage({
     conversationContext,
   });
 
-  const updatedCustomer = await store.updateCustomer(from, () => plan.customerPatch || {}, businessAccountId);
+  const updatedCustomer = await store.updateCustomer(from, () => ({
+    ...newProductJourneyPatch(customer, product),
+    ...(plan.customerPatch || {}),
+  }), businessAccountId);
   let order = null;
   if (plan.order) {
     order = await store.addOrder({ ...plan.order, businessAccountId });
