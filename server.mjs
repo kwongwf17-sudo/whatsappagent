@@ -2593,12 +2593,10 @@ async function getDueFollowupsForTeams(now = new Date()) {
     const product = teamCatalog.products.find((item) => item.id === customer.productId);
     if (!product) continue;
     const sequence = productFollowupSequence(product);
-    for (const item of sequence) {
-      if (customer.followupsSent?.[item.key]) continue;
-      if (now >= effectiveFollowupDueAt(customer, item, sequence)) {
-        due.push({ customer, product, followup: item.followup, followupKey: item.key });
-      }
-      break;
+    const item = currentFollowupStage(customer, sequence, now);
+    if (!item || customer.followupsSent?.[item.key]) continue;
+    if (isCurrentFollowupSendWindow(customer, item, sequence, now)) {
+      due.push({ customer, product, followup: item.followup, followupKey: item.key });
     }
   }
   return due;
@@ -2655,16 +2653,14 @@ async function dispatchFollowupQueue(now = new Date()) {
     const product = contentByAccount.get(itemAccountId).catalog.products.find((entry) => entry.id === customer.productId);
     const followupSequence = productFollowupSequence(product);
     const sequenceItem = followupSequence.find((entry) => entry.key === item.followupKey);
-    if (sequenceItem) {
-      const effectiveDueAt = effectiveFollowupDueAt(customer, sequenceItem, followupSequence);
-      if (now < effectiveDueAt) {
-        await operations.updateFollowupDispatch(item.id, {
-          status: "queued",
-          availableAt: effectiveDueAt.toISOString(),
-          lastError: "Waiting for the next scheduled follow-up stage.",
-        });
-        continue;
-      }
+    const currentStage = currentFollowupStage(customer, followupSequence, now);
+    if (!sequenceItem || currentStage?.key !== sequenceItem.key || !isCurrentFollowupSendWindow(customer, sequenceItem, followupSequence, now)) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "cancelled",
+        lastError: "Follow-up send window missed or customer moved to another stage.",
+      });
+      result.cancelled.push(sentItem);
+      continue;
     }
     const outsideCustomerServiceWindow = config.transportMode === "cloud" && !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
     const templateName = outsideCustomerServiceWindow ? followupTemplateName(item.followupKey) : "";
@@ -3690,10 +3686,10 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
     const sent = customer.followupsSent || {};
     const hasOrder = (customer.orderIds || []).length > 0;
     const followups = productFollowupSequence(product);
-    const nextItem = followups.find((item) => !sent[item.key]);
+    const nextItem = currentFollowupStage(customer, followups, now);
     let nextFollowup = nextItem?.key || "";
     let nextDueAt = nextItem ? effectiveFollowupDueAt(customer, nextItem, followups) : null;
-    let status = nextDueAt && now >= nextDueAt ? "due" : "scheduled";
+    let status = nextDueAt && isCurrentFollowupSendWindow(customer, nextItem, followups, now) ? "due" : "scheduled";
     const dispatchKey = [
       customer.businessAccountId || config.accountId,
       customer.id,
@@ -3702,6 +3698,8 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
     const queuedItem = nextItem ? queueByDispatchKey.get(dispatchKey) : null;
 
     if (!nextItem) {
+      status = "completed";
+    } else if (sent[nextItem.key]) {
       status = "completed";
     }
     const guardrail = followupGuardrailStatus(customer, now);
@@ -4234,6 +4232,24 @@ function followupDueAt(firstSeenAt, item) {
   return due;
 }
 
+function followupStageScheduledAt(customer, item) {
+  const firstSeen = new Date(customer.firstSeenAt);
+  if (Number.isNaN(firstSeen.getTime())) return null;
+  const firstSeenLocal = followupZonedDateParts(firstSeen);
+  if (
+    item.key === "first_day_followup" &&
+    item.firstFollowup?.first_chat_cutoff_enabled !== false &&
+    firstSeenLocal.hour >= (Number.isFinite(item.firstFollowup?.first_chat_cutoff_hour) ? item.firstFollowup.first_chat_cutoff_hour : 19)
+  ) {
+    return null;
+  }
+  const dueLocal = addFollowupLocalDays(
+    { ...firstSeenLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 },
+    item.dayOffset
+  );
+  return followupZonedLocalToDate(dueLocal);
+}
+
 function previousFollowupSentAt(customer, item, sequence = []) {
   const itemIndex = sequence.findIndex((entry) => entry.key === item.key);
   if (itemIndex <= 0) return null;
@@ -4260,11 +4276,44 @@ function followupDueAfterPreviousSent(previousSentAt, item) {
 }
 
 function effectiveFollowupDueAt(customer, item, sequence = []) {
-  const scheduledDueAt = followupDueAt(customer.firstSeenAt, item);
+  const scheduledDueAt = followupStageScheduledAt(customer, item);
+  if (!scheduledDueAt) return null;
   const previousSentAt = previousFollowupSentAt(customer, item, sequence);
   if (!previousSentAt) return scheduledDueAt;
   const previousGateAt = followupDueAfterPreviousSent(previousSentAt, item);
   return scheduledDueAt > previousGateAt ? scheduledDueAt : previousGateAt;
+}
+
+function localCalendarDayDiff(start, end) {
+  const startDay = followupZonedDateParts(start);
+  const endDay = followupZonedDateParts(end);
+  const startUtc = Date.UTC(startDay.year, startDay.month - 1, startDay.day);
+  const endUtc = Date.UTC(endDay.year, endDay.month - 1, endDay.day);
+  return Math.floor((endUtc - startUtc) / DAY_MS);
+}
+
+function customerAgeDays(customer, now = new Date()) {
+  return localCalendarDayDiff(new Date(customer.firstSeenAt || now), now);
+}
+
+function currentFollowupStage(customer, sequence = [], now = new Date()) {
+  const ageDays = customerAgeDays(customer, now);
+  if (ageDays < 0) return null;
+  return sequence.find((item) => item.dayOffset === ageDays) || null;
+}
+
+function isCurrentFollowupSendWindow(customer, item, sequence = [], now = new Date()) {
+  const dueAt = effectiveFollowupDueAt(customer, item, sequence);
+  if (!dueAt) return false;
+  const nowLocal = followupZonedDateParts(now);
+  const dueLocal = followupZonedDateParts(dueAt);
+  return (
+    now >= dueAt &&
+    nowLocal.year === dueLocal.year &&
+    nowLocal.month === dueLocal.month &&
+    nowLocal.day === dueLocal.day &&
+    nowLocal.hour === item.sendHour
+  );
 }
 
 function isWithinCustomerServiceWindow(customer, at = new Date()) {
