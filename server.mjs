@@ -4232,24 +4232,6 @@ function followupDueAt(firstSeenAt, item) {
   return due;
 }
 
-function followupStageScheduledAt(customer, item) {
-  const firstSeen = new Date(customer.firstSeenAt);
-  if (Number.isNaN(firstSeen.getTime())) return null;
-  const firstSeenLocal = followupZonedDateParts(firstSeen);
-  if (
-    item.key === "first_day_followup" &&
-    item.firstFollowup?.first_chat_cutoff_enabled !== false &&
-    firstSeenLocal.hour >= (Number.isFinite(item.firstFollowup?.first_chat_cutoff_hour) ? item.firstFollowup.first_chat_cutoff_hour : 19)
-  ) {
-    return null;
-  }
-  const dueLocal = addFollowupLocalDays(
-    { ...firstSeenLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 },
-    item.dayOffset
-  );
-  return followupZonedLocalToDate(dueLocal);
-}
-
 function previousFollowupSentAt(customer, item, sequence = []) {
   const itemIndex = sequence.findIndex((entry) => entry.key === item.key);
   if (itemIndex <= 0) return null;
@@ -4276,8 +4258,7 @@ function followupDueAfterPreviousSent(previousSentAt, item) {
 }
 
 function effectiveFollowupDueAt(customer, item, sequence = []) {
-  const scheduledDueAt = followupStageScheduledAt(customer, item);
-  if (!scheduledDueAt) return null;
+  const scheduledDueAt = followupDueAt(customer.firstSeenAt, item);
   const previousSentAt = previousFollowupSentAt(customer, item, sequence);
   if (!previousSentAt) return scheduledDueAt;
   const previousGateAt = followupDueAfterPreviousSent(previousSentAt, item);
@@ -4297,9 +4278,14 @@ function customerAgeDays(customer, now = new Date()) {
 }
 
 function currentFollowupStage(customer, sequence = [], now = new Date()) {
-  const ageDays = customerAgeDays(customer, now);
-  if (ageDays < 0) return null;
-  return sequence.find((item) => item.dayOffset === ageDays) || null;
+  return sequence.find((item) => {
+    if (customer.followupsSent?.[item.key]) return false;
+    const dueAt = effectiveFollowupDueAt(customer, item, sequence);
+    if (!dueAt) return false;
+    const nowLocal = followupZonedDateParts(now);
+    const dueLocal = followupZonedDateParts(dueAt);
+    return nowLocal.year === dueLocal.year && nowLocal.month === dueLocal.month && nowLocal.day === dueLocal.day;
+  }) || null;
 }
 
 function isCurrentFollowupSendWindow(customer, item, sequence = [], now = new Date()) {
