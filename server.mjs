@@ -643,6 +643,7 @@ const server = http.createServer(async (req, res) => {
         source,
         businessAccountId: DEMO_ACCOUNT_ID,
         contentAccountId: adminSession?.accountId || config.accountId,
+        knowledgeAccountId: adminSession?.accountId || config.accountId,
       });
       return sendJson(res, 200, result);
     }
@@ -1749,6 +1750,7 @@ async function processInboundMessage({
   live = false,
   businessAccountId = config.accountId,
   contentAccountId = businessAccountId,
+  knowledgeAccountId = contentAccountId,
 }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
   if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
@@ -2095,7 +2097,7 @@ async function processInboundMessage({
         product,
         catalog: teamCatalog,
         salesReplyLibrary: teamSalesReplyLibrary,
-        businessAccountId,
+        businessAccountId: knowledgeAccountId,
       });
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
   const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || selectedSalesReply
@@ -2115,7 +2117,7 @@ async function processInboundMessage({
         customerMessage: text,
         customerId: from,
         product,
-        businessAccountId,
+        businessAccountId: knowledgeAccountId,
       });
   if (fixedOpeningFlow) {
     console.log(`Skipping OpenAI for fixed opening flow to ${from}`);

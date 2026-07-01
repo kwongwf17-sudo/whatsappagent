@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,6 +50,7 @@ const manualKnowledgeDir = getCliValue("--knowledge-dir");
 const dryRun = hasCliFlag("--dry-run");
 const appendMode = hasCliFlag("--append");
 const apiKey = dryRun ? getEnv("OPENAI_API_KEY", "") : requireEnv("OPENAI_API_KEY");
+const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
 const vectorStoreName = getEnv(
   "OPENAI_VECTOR_STORE_NAME",
   teamAccountId ? `whatsapp_${teamAccountId}_knowledge` : "whatsapp_customer_service_knowledge"
@@ -85,6 +86,7 @@ const knowledgeDir = manualKnowledgeDir ? path.resolve(manualKnowledgeDir) : gen
 try {
   if (!manualKnowledgeDir) {
     await generateVectorKnowledgeFiles(knowledgeDir, teamAccountId);
+    await exportGeneratedKnowledgeFiles(knowledgeDir, teamAccountId);
   }
 
   const filePaths = await listKnowledgeFiles(knowledgeDir);
@@ -121,7 +123,6 @@ try {
 }
 
 async function createAdminAccountStore() {
-  const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
   const backend = getEnv("WHATSAPP_STORE", "json").toLowerCase();
   const adapter = backend === "sqlite"
     ? new SqliteJsonAdapter(dataDir, getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"))
@@ -172,7 +173,6 @@ async function generateVectorKnowledgeFiles(outputDir, accountId = "") {
 }
 
 async function loadVectorKnowledgeContent(accountId = "") {
-  const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
   const defaults = {
     catalog: await readJson(path.join(dataDir, "product_catalog.json")),
     faqLibrary: await readJson(path.join(dataDir, "general_faqs.json")),
@@ -183,6 +183,26 @@ async function loadVectorKnowledgeContent(accountId = "") {
     adapter: createStorageAdapter(dataDir),
   });
   return store.getContent(accountId, defaults);
+}
+
+async function exportGeneratedKnowledgeFiles(sourceDir, accountId = "") {
+  const exportDir = path.resolve(
+    getEnv(
+      "WHATSAPP_KNOWLEDGE_EXPORT_DIR",
+      path.join(dataDir, "knowledge_exports", safeExportSegment(accountId || "default"))
+    )
+  );
+  await rm(exportDir, { recursive: true, force: true });
+  await mkdir(exportDir, { recursive: true });
+  const filePaths = await listKnowledgeFiles(sourceDir);
+  for (const filePath of filePaths) {
+    await writeFile(path.join(exportDir, path.basename(filePath)), await readFile(filePath));
+  }
+  console.log(`Exported generated knowledge files to: ${exportDir}`);
+}
+
+function safeExportSegment(value) {
+  return String(value || "default").replace(/[^a-z0-9_-]+/gi, "_").replace(/^_+|_+$/g, "") || "default";
 }
 
 async function readJson(filePath) {
