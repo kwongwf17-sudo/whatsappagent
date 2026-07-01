@@ -635,12 +635,14 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const source = { ...(body.source || {}) };
       if (body.productId && !source.productId) source.productId = body.productId;
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const result = await processInboundMessage({
         id: `demo_${Date.now()}`,
         from: body.from || "demo_customer_1",
         text: String(body.text || ""),
         source,
         businessAccountId: DEMO_ACCOUNT_ID,
+        contentAccountId: adminSession?.accountId || config.accountId,
       });
       return sendJson(res, 200, result);
     }
@@ -1545,7 +1547,8 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
     }
 
     if (req.method === "GET" && url.pathname === "/demo/chat") {
-      return sendHtml(res, 200, demoChatHtml());
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      return sendHtml(res, 200, await demoChatHtml(adminSession?.accountId || config.accountId));
     }
 
     sendText(res, 404, "Not found");
@@ -1738,7 +1741,15 @@ async function recentProductContextMatch(customerId, businessAccountId, catalog,
   return findProductMatch(catalog, contextText, source);
 }
 
-async function processInboundMessage({ id, from, text, source = {}, live = false, businessAccountId = config.accountId }) {
+async function processInboundMessage({
+  id,
+  from,
+  text,
+  source = {},
+  live = false,
+  businessAccountId = config.accountId,
+  contentAccountId = businessAccountId,
+}) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
   if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
     console.log(`Skipping duplicate inbound message ${id} from ${from}.`);
@@ -1750,7 +1761,7 @@ async function processInboundMessage({ id, from, text, source = {}, live = false
       handoffReason: "Duplicate inbound message skipped.",
     };
   }
-  const content = await getTeamContent(businessAccountId);
+  const content = await getTeamContent(contentAccountId);
   const teamCatalog = content.catalog;
   const teamFaqLibrary = content.faqLibrary;
   const teamSalesReplyLibrary = content.salesReplyLibrary;
@@ -11911,7 +11922,9 @@ function compliancePageHtml() {
 </html>`;
 }
 
-function demoChatHtml() {
+async function demoChatHtml(contentAccountId = config.accountId) {
+  const content = await getTeamContent(contentAccountId);
+  const demoCatalog = content.catalog || catalog;
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -12166,7 +12179,7 @@ function demoChatHtml() {
   </main>
   </div>
   <script>
-    const demoProducts = ${JSON.stringify(catalog.products.map((product) => ({
+    const demoProducts = ${JSON.stringify(demoCatalog.products.map((product) => ({
       id: product.id,
       name: product.name,
       adKeyword: product.ad_keywords?.[0] || product.name,
@@ -12185,7 +12198,7 @@ function demoChatHtml() {
     if (!/^\\d{8,15}$/.test(customerId)) {
       customerId = newDemoCustomerId();
     }
-    let selectedProductId = localStorage.getItem("demoProductId") || ${JSON.stringify(catalog.default_product_id)};
+    let selectedProductId = localStorage.getItem("demoProductId") || ${JSON.stringify(demoCatalog.default_product_id)};
     localStorage.setItem("demoCustomerId", customerId);
     document.querySelector("#customer-id-label").textContent = customerId;
 
