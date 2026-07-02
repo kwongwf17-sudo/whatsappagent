@@ -5872,6 +5872,8 @@ function productFlowEditorData(product, options = {}) {
     shoppingLink: String(product.shopping_link || ""),
     orderOptions: orderOptionsForEditor(product),
     orderClosingMessages: orderClosingMessagesForEditor(product),
+    salesPrompt: String(product.sales_prompt ?? product.package_question ?? ""),
+    salesPromptFrequency: normalizeSalesPromptFrequency(product.sales_prompt_frequency),
     approvedFaqs: approvedProductFaqsForEditor(product),
     extractedKnowledge: productKnowledgeForEditor(product),
     ready: options.skipReady ? false : product.openingFlowEnabled !== false && isProductFlowComplete(product),
@@ -6044,6 +6046,12 @@ function updateProductFlowText(product, body) {
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderClosingMessages")) {
     product.order_closing_messages = normalizeOrderClosingMessages(body.orderClosingMessages);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "salesPrompt")) {
+    product.sales_prompt = String(body.salesPrompt ?? "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "salesPromptFrequency")) {
+    product.sales_prompt_frequency = normalizeSalesPromptFrequency(body.salesPromptFrequency);
   }
   if (Object.prototype.hasOwnProperty.call(body, "skuCode")) {
     product.sku_code = normalizeSkuCode(body.skuCode);
@@ -6564,6 +6572,8 @@ function createCatalogProduct(name) {
     ad_keywords: [name.toLowerCase()],
     packages: [],
     order_options: [],
+    sales_prompt: "",
+    sales_prompt_frequency: 1,
     images: [],
     openingFlowEnabled: false,
     opening_flow_blocks: legacyOpeningFlowBlocks(emptyFlow),
@@ -6591,6 +6601,12 @@ function normalizeShoppingLink(value) {
 
 function normalizeSkuCode(value) {
   return String(value || "").trim().slice(0, 80);
+}
+
+function normalizeSalesPromptFrequency(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  return Math.max(0, Math.min(20, Math.trunc(number)));
 }
 
 function isProductFlowComplete(product) {
@@ -10583,7 +10599,8 @@ function productFlowPageHtml() {
     .editor { margin-top: 12px; padding: 12px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
     .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
     .field.wide { grid-column: 1 / -1; }
-    .field input { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    .field input, .field textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    .field textarea { min-height: 96px; }
     .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 12px; }
     .editor-actions label { display: inline-flex; align-items: center; gap: 7px; margin-right: auto; font-size: 13px; font-weight: 700; }
     .editor-actions input { width: auto; }
@@ -10674,6 +10691,22 @@ function productFlowPageHtml() {
             <button id="add-order-option" type="button">Add Option</button>
           </div>
           <div class="option-list" id="order-options"></div>
+        </div>
+        <div class="knowledge-panel">
+          <div class="knowledge-head">
+            <div>
+              <h3>FAQ Sales Follow-Up</h3>
+              <div class="knowledge-note">Sent after approved FAQ, general FAQ, or vector-store product answers. Set frequency to 1 for every answer, 2 for every second answer, or 0 to disable.</div>
+            </div>
+          </div>
+          <div class="fields">
+            <label class="field wide" for="salesPrompt">Follow-up message after answering customer questions
+              <textarea id="salesPrompt" placeholder="Ada kita rasa minat nak ambil Package B = 2 FREE 2?"></textarea>
+            </label>
+            <label class="field" for="salesPromptFrequency">Message frequency
+              <input id="salesPromptFrequency" type="number" min="0" max="20" step="1" />
+            </label>
+          </div>
         </div>
         <div class="knowledge-panel">
           <div class="knowledge-head">
@@ -11270,6 +11303,10 @@ function productFlowPageHtml() {
       resetProductFaqForm();
       document.querySelector("#skuCode").value = selectedProduct.skuCode || "";
       document.querySelector("#shoppingLink").value = selectedProduct.shoppingLink || "";
+      document.querySelector("#salesPrompt").value = selectedProduct.salesPrompt || "";
+      document.querySelector("#salesPromptFrequency").value = Number.isFinite(Number(selectedProduct.salesPromptFrequency))
+        ? selectedProduct.salesPromptFrequency
+        : 1;
       renderOrderOptions();
       renderApprovedFaqs();
       renderKnowledge();
@@ -11380,7 +11417,9 @@ function productFlowPageHtml() {
       const body = {
         productId: selectedProduct.id,
         skuCode: document.querySelector("#skuCode").value,
-        shoppingLink: selectedProduct.shoppingLink || ""
+        shoppingLink: selectedProduct.shoppingLink || "",
+        salesPrompt: document.querySelector("#salesPrompt").value,
+        salesPromptFrequency: document.querySelector("#salesPromptFrequency").value
       };
       body.orderOptions = readOrderOptions();
       body.openingFlowBlocks = readOpeningFlowBlocks();
