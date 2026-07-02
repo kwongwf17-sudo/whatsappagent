@@ -1158,7 +1158,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/admin/product-flow/knowledge/sync-vector-store") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      if (!config.openaiApiKey) return sendJson(res, 400, { error: "OPENAI_API_KEY is not configured." });
+      if (!(await openAiApiKeyForAccount(adminSession.accountId))) {
+        return sendJson(res, 400, { error: "OpenAI API key is not configured for this team or Railway." });
+      }
       if (knowledgeSyncRuns.has(adminSession.accountId)) {
         return sendJson(res, 409, { error: "Knowledge sync is already running for this team." });
       }
@@ -1344,6 +1346,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         assetUrl: durableUrl,
         originalName,
         dataUrl: body.dataUrl,
+        businessAccountId: adminSession.accountId,
       });
       await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
@@ -1355,7 +1358,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       const content = await getTeamContent(adminSession.accountId);
       const product = findCatalogProduct(body.productId, content.catalog);
       if (!product) return sendJson(res, 404, { error: "Product not found." });
-      const extraction = await extractExistingProductImageKnowledge(product);
+      const extraction = await extractExistingProductImageKnowledge(product, adminSession.accountId);
       await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
     }
@@ -2260,13 +2263,14 @@ async function maybeSelectApprovedSalesReply({
   salesReplyLibrary: activeSalesReplyLibrary,
   businessAccountId = config.accountId,
 }) {
-  if (!config.openaiApiKey) return null;
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return null;
   const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
   if (!vectorStoreId) return null;
   const model = await openAiModelForAccount(businessAccountId);
   try {
     const selected = await selectSalesReplyFromVectorStore({
-      apiKey: config.openaiApiKey,
+      apiKey,
       model,
       vectorStoreId,
       customerMessage,
@@ -2286,11 +2290,12 @@ async function maybeSelectApprovedSalesReply({
 }
 
 async function maybeDetectOrderStatusIntent(customerMessage, businessAccountId = config.accountId) {
-  if (!config.openaiApiKey) return isLikelyOrderStatusQuestion(customerMessage);
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return isLikelyOrderStatusQuestion(customerMessage);
   try {
     const model = await openAiModelForAccount(businessAccountId);
     return await detectOrderStatusIntent({
-      apiKey: config.openaiApiKey,
+      apiKey,
       model,
       customerMessage,
     });
@@ -2301,11 +2306,12 @@ async function maybeDetectOrderStatusIntent(customerMessage, businessAccountId =
 }
 
 async function maybeDetectComplaintIntent(customerMessage, businessAccountId = config.accountId) {
-  if (!config.openaiApiKey) return detectObviousComplaint(customerMessage);
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return detectObviousComplaint(customerMessage);
   try {
     const model = await openAiModelForAccount(businessAccountId);
     return await detectComplaintIntent({
-      apiKey: config.openaiApiKey,
+      apiKey,
       model,
       customerMessage,
     });
@@ -2316,13 +2322,14 @@ async function maybeDetectComplaintIntent(customerMessage, businessAccountId = c
 }
 
 async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
-  if (!config.openaiApiKey) return null;
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return null;
   const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
   if (!vectorStoreId) return null;
   const model = await openAiModelForAccount(businessAccountId);
   try {
     const answer = await createCustomerServiceResponse({
-      apiKey: config.openaiApiKey,
+      apiKey,
       model,
       vectorStoreId,
       businessName: config.businessName,
@@ -5390,6 +5397,11 @@ async function vectorStoreIdForAccount(businessAccountId = config.accountId) {
   return settings.openaiVectorStoreId || config.vectorStoreId;
 }
 
+async function openAiApiKeyForAccount(businessAccountId = config.accountId) {
+  const settings = await adminAccounts.getTeamSettings(businessAccountId);
+  return settings.openaiApiKey || config.openaiApiKey;
+}
+
 async function openAiModelForAccount(businessAccountId = config.accountId) {
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return settings.openaiModel || config.openaiModel;
@@ -6124,12 +6136,13 @@ function persistProductFlowImage(product, slot, { dataUrl, image, originalName =
   };
 }
 
-async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, originalName = "" }) {
+async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, originalName = "", businessAccountId = config.accountId }) {
   ensureProductKnowledge(product);
-  if (!config.openaiApiKey) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) {
     product.extracted_knowledge.lastExtraction = {
       status: "skipped",
-      reason: "OPENAI_API_KEY is not configured.",
+      reason: "OpenAI API key is not configured for this team or Railway.",
       at: new Date().toISOString(),
       sourceSlot: slot.key,
       sourceImageUrl: assetUrl,
@@ -6140,7 +6153,7 @@ async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, o
 
   try {
     const result = await extractProductKnowledgeFromImage({
-      apiKey: config.openaiApiKey,
+      apiKey,
       model: config.extractionModel,
       productName: product.name,
       imageDataUrl: dataUrl,
@@ -6201,7 +6214,7 @@ async function ingestProductImageKnowledge(product, { slot, assetUrl, dataUrl, o
   }
 }
 
-async function extractExistingProductImageKnowledge(product) {
+async function extractExistingProductImageKnowledge(product, businessAccountId = config.accountId) {
   ensureProductKnowledge(product);
   const editorData = productFlowEditorData(product);
   const images = productFlowImagesForExtraction(product, editorData);
@@ -6225,6 +6238,7 @@ async function extractExistingProductImageKnowledge(product) {
         assetUrl: image.url,
         originalName: imageFilename(image.url),
         dataUrl,
+        businessAccountId,
       });
       results.push({ slot: image.key, url: image.url, ...result });
     } catch (error) {
@@ -7245,6 +7259,10 @@ function superAdminSystemHtml() {
           <input id="team-access-token" name="whatsappAccessToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep current" />
           <span class="settings-secret" id="team-access-token-current"></span>
         </label>
+        <label for="team-openai-api-key">OpenAI API Key
+          <input id="team-openai-api-key" name="openaiApiKey" type="password" autocomplete="new-password" placeholder="Leave blank to keep current" />
+          <span class="settings-secret" id="team-openai-api-key-current"></span>
+        </label>
         <label for="team-vector-store-id">Approved Knowledge Vector Store ID
           <input id="team-vector-store-id" name="openaiVectorStoreId" placeholder="vs_..." />
         </label>
@@ -7333,12 +7351,15 @@ function superAdminSystemHtml() {
       document.querySelector("#team-assets-base-url").value = settings.assetsBaseUrl || "";
       document.querySelector("#team-phone-number-id").value = "";
       document.querySelector("#team-access-token").value = "";
+      document.querySelector("#team-openai-api-key").value = "";
       document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
       document.querySelector("#team-openai-model").value = settings.openaiModel || "";
       document.querySelector("#team-phone-number-id-current").textContent =
         settings.whatsappPhoneNumberId ? "Current: " + settings.whatsappPhoneNumberId : "No team-specific phone number ID saved.";
       document.querySelector("#team-access-token-current").textContent =
         settings.whatsappAccessToken ? "Current: " + settings.whatsappAccessToken : "No team-specific access token saved.";
+      document.querySelector("#team-openai-api-key-current").textContent =
+        settings.openaiApiKey ? "Current: " + settings.openaiApiKey : "No team-specific OpenAI API key saved. Railway default will be used.";
     }
     async function saveTeamSettings(event) {
       event.preventDefault();
@@ -7357,8 +7378,10 @@ function superAdminSystemHtml() {
       };
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
+      const openaiApiKey = document.querySelector("#team-openai-api-key").value.trim();
       if (phoneNumberId) settings.whatsappPhoneNumberId = phoneNumberId;
       if (accessToken) settings.whatsappAccessToken = accessToken;
+      if (openaiApiKey) settings.openaiApiKey = openaiApiKey;
       state.textContent = "Saving...";
       try {
         const result = await request("/superadmin/system/team-settings", {

@@ -49,7 +49,6 @@ const teamAccountId = getCliValue("--account-id") || getEnv("TEAM_ACCOUNT_ID", "
 const manualKnowledgeDir = getCliValue("--knowledge-dir");
 const dryRun = hasCliFlag("--dry-run");
 const appendMode = hasCliFlag("--append");
-const apiKey = dryRun ? getEnv("OPENAI_API_KEY", "") : requireEnv("OPENAI_API_KEY");
 const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
 const vectorStoreName = getEnv(
   "OPENAI_VECTOR_STORE_NAME",
@@ -57,6 +56,7 @@ const vectorStoreName = getEnv(
 );
 const adminAccounts = teamAccountId && !dryRun ? await createAdminAccountStore() : null;
 const teamSettings = adminAccounts ? await adminAccounts.getTeamSettings(teamAccountId) : {};
+const apiKey = teamSettings.openaiApiKey || (dryRun ? getEnv("OPENAI_API_KEY", "") : requireEnv("OPENAI_API_KEY"));
 let vectorStoreId = dryRun ? "" : teamSettings.openaiVectorStoreId || process.env.OPENAI_VECTOR_STORE_ID;
 
 if (dryRun) {
