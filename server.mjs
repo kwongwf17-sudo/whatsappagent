@@ -2586,23 +2586,6 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
 }
 
 async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
-  const pauseUntil = followupPauseUntil(now);
-  if (pauseUntil) {
-    return {
-      sent: 0,
-      queued: 0,
-      heldForApprovedTemplate: 0,
-      deleted: 0,
-      skipped: await buildFollowupSkippedSummary(now),
-      checkedAt: now.toISOString(),
-      deletedCustomers: [],
-      customers: [],
-      templateRequired: [],
-      templateRequiredCustomers: [],
-      pausedUntil: pauseUntil.toISOString(),
-      blockedReason: "Follow-up pacing cooldown is active.",
-    };
-  }
   const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
   const due = await getDueFollowupsForTeams(now);
   const operationalDue = respectOperationalControl
@@ -2664,6 +2647,12 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
       productId: item.product.id,
       message: item.followup.message,
     })),
+    ...(dispatched.pausedUntil
+      ? {
+          pausedUntil: dispatched.pausedUntil,
+          blockedReason: "Follow-up pacing cooldown is active.",
+        }
+      : {}),
   };
 }
 
