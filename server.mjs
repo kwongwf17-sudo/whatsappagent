@@ -2454,6 +2454,22 @@ function randomFollowupDelayMs() {
 function followupPauseUntil(now = new Date()) {
   const activeMs = Math.max(1, Number(config.followupActiveWindowMinutes) || 10) * 60 * 1000;
   const pauseMs = Math.max(0, Number(config.followupPauseWindowMinutes) || 0) * 60 * 1000;
+  return followupPauseUntilForWindow(now, activeMs, pauseMs);
+}
+
+function followupPauseUntilForSettings(now = new Date(), settings = {}) {
+  const activeMs = Math.max(
+    1,
+    Number(settings.followupActiveWindowMinutes || 0) || Number(config.followupActiveWindowMinutes) || 10
+  ) * 60 * 1000;
+  const pauseMs = Math.max(
+    0,
+    Number(settings.followupPauseWindowMinutes || 0) || Number(config.followupPauseWindowMinutes) || 0
+  ) * 60 * 1000;
+  return followupPauseUntilForWindow(now, activeMs, pauseMs);
+}
+
+function followupPauseUntilForWindow(now = new Date(), activeMs = 10 * 60 * 1000, pauseMs = 0) {
   if (!pauseMs) return null;
 
   const cycleMs = activeMs + pauseMs;
@@ -2620,6 +2636,7 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
     queued: queued.length,
     queueFailed: dispatched.failed.length,
     queueCancelled: dispatched.cancelled.length,
+    queuePaused: dispatched.paused.length,
     queueHeldForApprovedTemplate: dispatched.heldForApprovedTemplate.length,
     heldForApprovedTemplate: templateRequired.length,
     deleted: deletedCustomers.length,
@@ -2647,9 +2664,9 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
       productId: item.product.id,
       message: item.followup.message,
     })),
-    ...(dispatched.pausedUntil
+    ...(dispatched.paused.length
       ? {
-          pausedUntil: dispatched.pausedUntil,
+          paused: dispatched.paused,
           blockedReason: "Follow-up pacing cooldown is active.",
         }
       : {}),
@@ -2693,17 +2710,37 @@ async function filterOperationalFollowups(due = []) {
 }
 
 async function dispatchFollowupQueue(now = new Date()) {
-  const pauseUntil = followupPauseUntil(now);
-  if (pauseUntil) return { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], pausedUntil: pauseUntil.toISOString() };
-
   const batch = rotateFollowupBatch(await claimFollowupDispatchBatch(now));
   const customers = await store.listCustomers(now);
   const customerById = new Map(customers.map((customer) => [customerKey(customer.businessAccountId || config.accountId, customer.id), customer]));
   const contentByAccount = new Map();
-  const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [] };
+  const accountSettingsById = new Map();
+  const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], paused: [] };
 
   for (const item of batch) {
     const itemAccountId = item.businessAccountId || config.accountId;
+    if (!accountSettingsById.has(itemAccountId)) {
+      try {
+        accountSettingsById.set(itemAccountId, await adminAccounts.getTeamSettings(itemAccountId));
+      } catch {
+        accountSettingsById.set(itemAccountId, {});
+      }
+    }
+    const pauseUntil = followupPauseUntilForSettings(now, accountSettingsById.get(itemAccountId));
+    if (pauseUntil) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "queued",
+        availableAt: pauseUntil.toISOString(),
+        lastError: "Follow-up pacing cooldown is active.",
+      });
+      result.paused.push({
+        customerId: item.customerId,
+        followupKey: item.followupKey,
+        productId: item.productId,
+        pausedUntil: pauseUntil.toISOString(),
+      });
+      continue;
+    }
     const customer = customerById.get(customerKey(itemAccountId, item.customerId));
     const sentItem = {
       customerId: item.customerId,
@@ -3319,6 +3356,8 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
     settings: {
       followupSendsPerMinute: Number(settings.followupSendsPerMinute || 0) || config.followupSendsPerMinute,
       followupIntervalMinutes: Number(settings.followupIntervalMinutes || 0) || config.followupIntervalMinutes,
+      followupActiveWindowMinutes: Number(settings.followupActiveWindowMinutes || 0) || config.followupActiveWindowMinutes,
+      followupPauseWindowMinutes: Number(settings.followupPauseWindowMinutes || 0) || config.followupPauseWindowMinutes,
     },
   };
 }
@@ -3328,6 +3367,8 @@ async function saveFollowupRuntimeSettings(businessAccountId = config.accountId,
   const runtimeSettings = {
     followupSendsPerMinute: settings.followupSendsPerMinute,
     followupIntervalMinutes: settings.followupIntervalMinutes,
+    followupActiveWindowMinutes: settings.followupActiveWindowMinutes,
+    followupPauseWindowMinutes: settings.followupPauseWindowMinutes,
   };
   try {
     return await adminAccounts.updateTeamSettings(businessAccountId, runtimeSettings);
@@ -8044,6 +8085,13 @@ function adminDashboardHtml() {
       <h2>Customer List</h2>
       <div class="filterbar">
         <label for="customer-sku-filter">SKU <select id="customer-sku-filter"></select></label>
+        <label for="customer-phone-search">Phone <input id="customer-phone-search" type="search" placeholder="Search phone number" /></label>
+        <label for="customer-last-message-date">Latest Message Date <input id="customer-last-message-date" type="date" /></label>
+        <label for="customer-last-message-sort">Latest Message <select id="customer-last-message-sort">
+          <option value="desc">Newest first</option>
+          <option value="asc">Oldest first</option>
+        </select></label>
+        <button id="customer-last-message-all" type="button">All Dates</button>
       </div>
       <div class="subtabs" id="customer-label-tabs"></div>
       <div class="table-wrap"></div>
@@ -8124,12 +8172,16 @@ function adminDashboardHtml() {
     let dashboardData = null;
     let activeCustomerLabel = "ALL";
     let activeCustomerSku = "ALL";
+    let activeCustomerPhoneSearch = "";
+    let activeCustomerLastMessageDate = "";
+    let activeCustomerLastMessageSort = "desc";
     let activeFollowupLabel = "ALL";
     let activeDashboardDate = localDateInput(new Date());
     let activeOrderCustomersDate = localDateInput(new Date());
     let activeOrderCustomersSku = "ALL";
     let activeHandoffDate = localDateInput(new Date());
     let activeOrdersDate = localDateInput(new Date());
+    const bulkSelections = new Map();
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
@@ -8176,6 +8228,31 @@ function adminDashboardHtml() {
       return activeCustomerSku === "ALL"
         ? customers
         : customers.filter(customer => (customer.skuCode || "") === activeCustomerSku);
+    }
+
+    function customerPhoneText(customer) {
+      return String(customer.phone || customer.whatsappId || customer.id || "");
+    }
+
+    function digitsOnly(value) {
+      return String(value || "").replace(/\D/g, "");
+    }
+
+    function customerFilterBase() {
+      const search = activeCustomerPhoneSearch.trim().toLowerCase();
+      const searchDigits = digitsOnly(search);
+      return skuFilteredCustomers()
+        .filter(customer => {
+          if (!search) return true;
+          const phone = customerPhoneText(customer).toLowerCase();
+          const phoneDigits = digitsOnly(phone);
+          return phone.includes(search) || (searchDigits && phoneDigits.includes(searchDigits));
+        })
+        .filter(customer => !activeCustomerLastMessageDate || matchesDate(customer.lastMessageAt, activeCustomerLastMessageDate))
+        .sort((a, b) => {
+          const direction = activeCustomerLastMessageSort === "asc" ? 1 : -1;
+          return direction * String(a.lastMessageAt || "").localeCompare(String(b.lastMessageAt || ""));
+        });
     }
 
     function customerMatchesLabel(customer, label) {
@@ -8255,9 +8332,7 @@ function adminDashboardHtml() {
     }
 
     function selectedBulkIds(sectionKey) {
-      return [...document.querySelectorAll('input[data-bulk-row="' + sectionKey + '"]:checked')]
-        .map(input => input.dataset.bulkId)
-        .filter(Boolean);
+      return [...(bulkSelections.get(sectionKey) || new Set())];
     }
 
     function updateBulkCount(sectionKey) {
@@ -8275,17 +8350,36 @@ function adminDashboardHtml() {
         all.addEventListener("change", () => {
           document.querySelectorAll('input[data-bulk-row="' + sectionKey + '"]').forEach(input => {
             input.checked = all.checked;
+            rememberBulkSelection(input);
           });
           updateBulkCount(sectionKey);
         });
       }
       document.querySelectorAll('input[data-bulk-row="' + sectionKey + '"]').forEach(input => {
-        input.addEventListener("change", () => updateBulkCount(sectionKey));
+        input.checked = (bulkSelections.get(sectionKey) || new Set()).has(input.dataset.bulkId);
+        input.addEventListener("change", () => {
+          rememberBulkSelection(input);
+          updateBulkCount(sectionKey);
+        });
       });
       document.querySelectorAll('button[data-bulk-section="' + sectionKey + '"]').forEach(button => {
         button.addEventListener("click", () => runBulkAction(sectionKey, button.dataset.bulkAction));
       });
       updateBulkCount(sectionKey);
+    }
+
+    function rememberBulkSelection(input) {
+      const sectionKey = input.dataset.bulkRow;
+      const id = input.dataset.bulkId;
+      if (!sectionKey || !id) return;
+      if (!bulkSelections.has(sectionKey)) bulkSelections.set(sectionKey, new Set());
+      const selected = bulkSelections.get(sectionKey);
+      if (input.checked) selected.add(id);
+      else selected.delete(id);
+    }
+
+    function clearBulkSelection(sectionKey) {
+      bulkSelections.set(sectionKey, new Set());
     }
 
     async function runBulkAction(sectionKey, actionKey) {
@@ -8322,6 +8416,7 @@ function adminDashboardHtml() {
             await request("/admin/no-reply/resolve", { customerId: parts[0] || "", inboundMessageId: parts[1] || "" });
           }
         }
+        clearBulkSelection(sectionKey);
         await loadDashboard();
       } catch (error) {
         alert(error.message || "Bulk action failed.");
@@ -8363,7 +8458,7 @@ function adminDashboardHtml() {
       updateDashboardTabs(stats);
 
       renderCustomerSkuFilter();
-      renderCustomerLabelTabs(skuFilteredCustomers());
+      renderCustomerLabelTabs(customerFilterBase());
       renderCustomers();
       renderHandoff();
       renderComplaintSettings();
@@ -8805,12 +8900,12 @@ function adminDashboardHtml() {
     }
 
     function renderCustomers() {
-      const customers = skuFilteredCustomers();
+      const customers = customerFilterBase();
       const filtered = activeCustomerLabel === "ALL"
         ? customers
         : customers.filter(customer => customerMatchesLabel(customer, activeCustomerLabel));
       sections.customers.innerHTML = bulkTable("customers", filtered, [
-        { label: 'WhatsApp ID', key: 'whatsappId' },
+        { label: 'Phone', key: 'phone', render: r => esc(customerPhoneText(r)) },
         { label: 'Product', key: 'product' },
         { label: 'SKU', key: 'skuCode' },
         { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
@@ -8923,7 +9018,30 @@ function adminDashboardHtml() {
     document.querySelector("#customer-sku-filter").addEventListener("change", event => {
       activeCustomerSku = event.target.value || "ALL";
       activeCustomerLabel = "ALL";
-      renderCustomerLabelTabs(skuFilteredCustomers());
+      renderCustomerLabelTabs(customerFilterBase());
+      renderCustomers();
+    });
+    document.querySelector("#customer-phone-search").addEventListener("input", event => {
+      activeCustomerPhoneSearch = event.target.value || "";
+      activeCustomerLabel = "ALL";
+      renderCustomerLabelTabs(customerFilterBase());
+      renderCustomers();
+    });
+    document.querySelector("#customer-last-message-date").addEventListener("change", event => {
+      activeCustomerLastMessageDate = event.target.value || "";
+      activeCustomerLabel = "ALL";
+      renderCustomerLabelTabs(customerFilterBase());
+      renderCustomers();
+    });
+    document.querySelector("#customer-last-message-all").addEventListener("click", () => {
+      activeCustomerLastMessageDate = "";
+      document.querySelector("#customer-last-message-date").value = "";
+      activeCustomerLabel = "ALL";
+      renderCustomerLabelTabs(customerFilterBase());
+      renderCustomers();
+    });
+    document.querySelector("#customer-last-message-sort").addEventListener("change", event => {
+      activeCustomerLastMessageSort = event.target.value || "desc";
       renderCustomers();
     });
     document.querySelector("#order-customers-sku-filter").addEventListener("change", event => {
@@ -10341,6 +10459,12 @@ function followupSettingsPageHtml() {
         <label>Follow-Up Worker Interval Minutes
           <input id="followup-interval-minutes" type="number" min="1" max="1440" />
         </label>
+        <label>Active Send Window Minutes
+          <input id="followup-active-window-minutes" type="number" min="1" max="1440" />
+        </label>
+        <label>Pause Window Minutes
+          <input id="followup-pause-window-minutes" type="number" min="0" max="1440" />
+        </label>
         <label>
           <span><input id="first-cutoff-enabled" type="checkbox" /> Enable first follow-up cutoff</span>
           <span class="muted">When enabled, customers who first message at/after the cutoff hour skip the first follow-up until the next day.</span>
@@ -10373,7 +10497,9 @@ function followupSettingsPageHtml() {
     })))};
     const defaultFollowupSettings = {
       followupSendsPerMinute: ${JSON.stringify(Math.max(config.followupSendsPerMinute, 1))},
-      followupIntervalMinutes: ${JSON.stringify(Math.max(config.followupIntervalMinutes, 1))}
+      followupIntervalMinutes: ${JSON.stringify(Math.max(config.followupIntervalMinutes, 1))},
+      followupActiveWindowMinutes: ${JSON.stringify(Math.max(config.followupActiveWindowMinutes, 1))},
+      followupPauseWindowMinutes: ${JSON.stringify(Math.max(config.followupPauseWindowMinutes, 0))}
     };
     let data = null;
     const mediaInput = document.createElement("input");
@@ -10421,6 +10547,8 @@ function followupSettingsPageHtml() {
       const settings = data.settings || defaultFollowupSettings;
       document.querySelector("#followup-sends-per-minute").value = settings.followupSendsPerMinute || "";
       document.querySelector("#followup-interval-minutes").value = settings.followupIntervalMinutes || "";
+      document.querySelector("#followup-active-window-minutes").value = settings.followupActiveWindowMinutes || "";
+      document.querySelector("#followup-pause-window-minutes").value = settings.followupPauseWindowMinutes ?? "";
       const stages = Array.isArray(data.followupMessages) && data.followupMessages.length
         ? data.followupMessages
         : defaultFollowupStages;
@@ -10539,7 +10667,9 @@ function followupSettingsPageHtml() {
         data = await request("/admin/followup-settings/save", {
           settings: {
             followupSendsPerMinute: document.querySelector("#followup-sends-per-minute").value,
-            followupIntervalMinutes: document.querySelector("#followup-interval-minutes").value
+            followupIntervalMinutes: document.querySelector("#followup-interval-minutes").value,
+            followupActiveWindowMinutes: document.querySelector("#followup-active-window-minutes").value,
+            followupPauseWindowMinutes: document.querySelector("#followup-pause-window-minutes").value
           },
           followups
         });
