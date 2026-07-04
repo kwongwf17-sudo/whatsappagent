@@ -1487,6 +1487,12 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         awaitingPackageBInterest: false,
         handoffStatus: "human_required",
         handoffReason: "Customer submitted complete order details.",
+        complaintCaseId: "",
+        complaintStatus: "",
+        complaintCategory: "",
+        complaintAt: "",
+        followupBlocked: true,
+        followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
       await store.appendAuditLog({
         action: "manual_order_submitted",
@@ -3716,12 +3722,12 @@ function formatDashboardMessage(message) {
 
 function conversationStatus(customer, customerOrders) {
   if (customer.optedOut) return "opted out";
-  if (customer.complaintStatus === "open") return "complaint - human required";
   if (customerOrders.length > 0 && customer.handoffReason === "Customer submitted complete order details.") {
     return orderStatusDisplay(customerOrders.at(-1).status);
   }
-  if (customer.handoffStatus === "human_required") return "human required";
   if (customerOrders.length > 0) return orderStatusDisplay(customerOrders.at(-1).status);
+  if (customer.complaintStatus === "open") return "complaint - human required";
+  if (customer.handoffStatus === "human_required") return "human required";
   if (Number(customer.inboundCount || 0) <= 1) return "new lead";
   return "engaged";
 }
@@ -3752,11 +3758,11 @@ function guardrailDisplay(customer, now = new Date()) {
 
 function followupGuardrailStatus(customer, now = new Date()) {
   if (customer.optedOut) return { blocked: true, reason: "opted_out" };
+  if ((customer.orderIds || []).length > 0) return { blocked: true, reason: "order_submitted" };
   if (customer.complaintStatus === "open" || customer.followupBlockedReason === "complaint_handoff") {
     return { blocked: true, reason: "complaint_handoff" };
   }
   if (customer.followupBlocked) return { blocked: true, reason: "followup_blocked" };
-  if ((customer.orderIds || []).length > 0) return { blocked: true, reason: "order_submitted" };
   if (!isWithinCustomerServiceWindow(customer, now)) return { blocked: false, reason: "outside_24_hour_window" };
   return { blocked: false, reason: "ok" };
 }
