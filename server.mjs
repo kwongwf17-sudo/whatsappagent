@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildConversationPlan,
   classifyFaqSalesPromptResponse,
+  extractOrderDetails,
   findApprovedFaqLocalMatch,
   findProduct,
   findProductMatch,
@@ -112,6 +113,7 @@ const config = {
   openingFlowInitialDelayMs: Number(getEnv("OPENING_FLOW_INITIAL_DELAY_MS", "5000")),
   statusReplyDelayMs: Number(getEnv("STATUS_REPLY_DELAY_MS", "5000")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
+  orderDetailBufferMs: Number(getEnv("ORDER_DETAIL_BUFFER_MS", "60000")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   noReplyAlertMinutes: Number(getEnv("NO_REPLY_ALERT_MINUTES", "2")),
@@ -193,6 +195,7 @@ await adminAccounts.ensureInitialAccount({
 await operations.ensureState({ version: config.appVersion });
 let catalogWriteQueue = Promise.resolve();
 const processedMessageIds = new Map();
+const pendingOrderDetailBuffers = new Map();
 const deliveredOutboundMessages = new Map();
 const submittedOutboundMessages = new Map();
 const outboundDeliveryWaiters = new Map();
@@ -1793,9 +1796,11 @@ async function processInboundMessage({
   businessAccountId = config.accountId,
   contentAccountId = businessAccountId,
   knowledgeAccountId = contentAccountId,
+  skipOrderDetailBuffer = false,
+  skipInboundRecord = false,
 }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
-  if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
+  if (!skipInboundRecord && id && await store.hasOutboxMessageId(id, businessAccountId)) {
     console.log(`Skipping duplicate inbound message ${id} from ${from}.`);
     return {
       customer: await store.getOrCreateCustomer(from, { businessAccountId }),
@@ -1809,29 +1814,47 @@ async function processInboundMessage({
   const teamCatalog = content.catalog;
   const teamFaqLibrary = content.faqLibrary;
   const teamSalesReplyLibrary = content.salesReplyLibrary;
-  await store.appendOutbox({
-    ...(id ? { id } : {}),
-    direction: "inbound",
-    from,
-    to: "agent",
-    businessAccountId,
-    channel: "customer",
-    type: "text",
-    body: text,
-  });
-  const customer = await store.getOrCreateCustomer(from, {
-    lastInboundMessageId: id,
-    lastMessageAt: new Date().toISOString(),
-    lastInboundAt: new Date().toISOString(),
-    recordInbound: true,
-    businessAccountId,
-    source,
-  });
+  if (!skipInboundRecord) {
+    await store.appendOutbox({
+      ...(id ? { id } : {}),
+      direction: "inbound",
+      from,
+      to: "agent",
+      businessAccountId,
+      channel: "customer",
+      type: "text",
+      body: text,
+    });
+  }
+  const nowIso = new Date().toISOString();
+  const customer = skipInboundRecord
+    ? await store.getOrCreateCustomer(from, { businessAccountId })
+    : await store.getOrCreateCustomer(from, {
+        lastInboundMessageId: id,
+        lastMessageAt: nowIso,
+        lastInboundAt: nowIso,
+        recordInbound: true,
+        businessAccountId,
+        source,
+      });
   const conversationContext = await recentConversationContext(from, businessAccountId);
   const sourceMatchedProduct = findProductMatch(teamCatalog, "", source);
   const contextMatchedProduct = customer.productId
     ? sourceMatchedProduct
     : await recentProductContextMatch(from, businessAccountId, teamCatalog, source);
+  const bufferProduct = findProduct(teamCatalog, text, source, customer.productId);
+  if (!skipOrderDetailBuffer && shouldBufferIncompleteOrderDetails(customer, text, bufferProduct)) {
+    return bufferIncompleteOrderDetails({
+      id,
+      from,
+      text,
+      source,
+      live,
+      businessAccountId,
+      contentAccountId,
+      knowledgeAccountId,
+    }, customer, bufferProduct);
+  }
 
   if (live) {
     const blocked = await liveAutomationBlock(businessAccountId);
@@ -4750,6 +4773,53 @@ function cleanupProcessedMessages() {
   for (const [messageId, timestamp] of processedMessageIds) {
     if (timestamp < cutoff) processedMessageIds.delete(messageId);
   }
+}
+
+function orderDetailBufferKey(businessAccountId, customerId) {
+  return `${businessAccountId || config.accountId}::${customerId}`;
+}
+
+function shouldBufferIncompleteOrderDetails(customer, text, product) {
+  if (customer?.pendingOrder) return false;
+  const delayMs = Math.max(0, Number(config.orderDetailBufferMs) || 0);
+  if (!delayMs) return false;
+  const body = String(text || "").trim();
+  if (!body) return false;
+  if (/[?？]\s*$/.test(body)) return false;
+  if (/^(ada|berapa|can|boleh|do|does|is|are|kenapa|apa|macam mana|how|why|what)\b/i.test(body)) return false;
+  const draft = extractOrderDetails(body, product);
+  return Boolean(draft.hasAnyDetails && !draft.isComplete);
+}
+
+function bufferIncompleteOrderDetails(args, customer, product) {
+  const delayMs = Math.max(0, Number(config.orderDetailBufferMs) || 0);
+  const key = orderDetailBufferKey(args.businessAccountId, args.from);
+  const existing = pendingOrderDetailBuffers.get(key);
+  if (existing?.timer) clearTimeout(existing.timer);
+  const messages = [...(existing?.messages || []), String(args.text || "").trim()].filter(Boolean);
+  const sources = [...(existing?.sources || []), args.source || {}];
+  const timer = setTimeout(() => {
+    pendingOrderDetailBuffers.delete(key);
+    const combinedText = messages.join("\n");
+    const combinedSource = sources.reduce((merged, source) => ({ ...merged, ...source }), {});
+    void processInboundMessage({
+      ...args,
+      id: "",
+      text: combinedText,
+      source: combinedSource,
+      skipOrderDetailBuffer: true,
+      skipInboundRecord: true,
+    }).catch((error) => recordSystemError("order_detail_buffer_flush", error, `${args.from}: ${combinedText}`, args.businessAccountId));
+  }, delayMs);
+  pendingOrderDetailBuffers.set(key, { timer, messages, sources, productId: product?.id || "" });
+  console.log(`Buffering partial order details from ${args.from} for ${delayMs}ms (${messages.length} fragment(s)).`);
+  return {
+    customer,
+    order: null,
+    messages: [],
+    handoffRequired: false,
+    handoffReason: "Partial order details buffered.",
+  };
 }
 
 function clampMessages(messages = []) {
