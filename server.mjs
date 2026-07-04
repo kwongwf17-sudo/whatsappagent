@@ -1793,6 +1793,40 @@ function newProductJourneyPatch(customer = {}, product = null, now = new Date())
   };
 }
 
+function customerContactPatch(customerId, source = {}) {
+  const phone = phoneFromCustomerSource(customerId, source);
+  return phone ? { phone } : {};
+}
+
+function phoneFromCustomerSource(customerId, source = {}) {
+  return (
+    cleanCustomerPhone(source.phone) ||
+    cleanCustomerPhone(source.phoneNumber) ||
+    cleanCustomerPhone(source.senderPhone) ||
+    phoneFromJid(source.remoteJid) ||
+    phoneFromJid(source.senderJid) ||
+    phoneFromJid(source.participant) ||
+    cleanCustomerPhone(customerId)
+  );
+}
+
+function phoneFromJid(value) {
+  const text = String(value || "").trim();
+  if (!text || text.endsWith("@lid")) return "";
+  if (!/@/.test(text)) return cleanCustomerPhone(text);
+  const [user, server] = text.split("@");
+  if (!["s.whatsapp.net", "c.us"].includes(server)) return "";
+  return cleanCustomerPhone(user);
+}
+
+function cleanCustomerPhone(value) {
+  const text = String(value || "").trim();
+  if (!text || text.includes("@lid")) return "";
+  const digits = text.replace(/\D/g, "");
+  if (digits.length < 5 || digits.length > 18) return "";
+  return digits;
+}
+
 async function processInboundMessage({
   id,
   from,
@@ -1806,10 +1840,11 @@ async function processInboundMessage({
   skipInboundRecord = false,
 }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
+  const contactPatch = customerContactPatch(from, source);
   if (!skipInboundRecord && id && await store.hasOutboxMessageId(id, businessAccountId)) {
     console.log(`Skipping duplicate inbound message ${id} from ${from}.`);
     return {
-      customer: await store.getOrCreateCustomer(from, { businessAccountId }),
+      customer: await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch }),
       order: null,
       messages: [],
       handoffRequired: false,
@@ -1834,7 +1869,7 @@ async function processInboundMessage({
   }
   const nowIso = new Date().toISOString();
   const customer = skipInboundRecord
-    ? await store.getOrCreateCustomer(from, { businessAccountId })
+    ? await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch })
     : await store.getOrCreateCustomer(from, {
         lastInboundMessageId: id,
         lastMessageAt: nowIso,
@@ -1842,6 +1877,7 @@ async function processInboundMessage({
         recordInbound: true,
         businessAccountId,
         source,
+        ...contactPatch,
       });
   const conversationContext = await recentConversationContext(from, businessAccountId);
   const sourceMatchedProduct = findProductMatch(teamCatalog, "", source);
@@ -2256,6 +2292,7 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
   if (!from || !body) return;
   console.log(`Manual WhatsApp business message to ${from}: ${body}`);
   const now = new Date().toISOString();
+  const contactPatch = customerContactPatch(from, source);
   await store.getOrCreateCustomer(from, {
     lastMessageAt: now,
     businessAccountId,
@@ -2264,6 +2301,7 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
       ...(source || {}),
       manualBusinessMessage: true,
     },
+    ...contactPatch,
   });
   await store.appendOutbox({
     id,
@@ -3437,9 +3475,13 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       .slice()
       .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))
       .at(-1);
-  const handoffPhone = (customerId, order = null) => {
+  const customerPhone = (customerId, order = null) => {
+    const customer = customerById.get(customerId);
     const latestOrder = order || latestOrderForCustomer(customerId);
-    return latestOrder?.phone || customerById.get(customerId)?.phone || customerId;
+    return latestOrder?.phone || customer?.phone || phoneFromCustomerSource(customerId, customer?.source || {}) || customerId;
+  };
+  const handoffPhone = (customerId, order = null) => {
+    return customerPhone(customerId, order);
   };
   const guardrails = buildGuardrailSummary(customers, now);
   const noReplyAlerts = buildNoReplyRows(
@@ -3461,7 +3503,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       id: customer.id,
       name: latestOrder.name || "",
       whatsappId: customer.id,
-      phone: latestOrder.phone || customer.id,
+      phone: customerPhone(customer.id, latestOrder),
       address: latestOrder.address || "",
       productId: customer.productId || "",
       product: productById.get(customer.productId)?.name || customer.productId || "",
