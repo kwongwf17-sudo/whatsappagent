@@ -42,6 +42,7 @@ import {
   isLikelyOrderStatusQuestion,
   ORDER_STATUS_OPTIONS,
   orderStatusDisplay,
+  renderOrderStatusReply,
 } from "./lib/order_tracking.mjs";
 import {
   complaintCategoryDisplay,
@@ -794,8 +795,9 @@ const server = http.createServer(async (req, res) => {
           return sendJson(res, 400, { error: "Only Order Submitted orders can be marked as Reached Warehouse." });
         }
         const order = await store.updateOrderStatus(orderId, "reached_warehouse", adminSession.accountId);
-        const message = reachedWarehouseCustomerMessage(order);
         const outboundAccountId = order.businessAccountId || adminSession.accountId;
+        const statusReplies = await store.getOrderStatusReplies(outboundAccountId);
+        const message = reachedWarehouseCustomerMessage(order, statusReplies.reached_warehouse);
         await delayBeforeStatusReply(order.customerId, "reached warehouse status reply");
         await sendOutbound(order.customerId, [textMessage(message)], {
           businessAccountId: outboundAccountId,
@@ -4026,10 +4028,10 @@ function formatOrderRecord(order, productById) {
   ].join("\n");
 }
 
-function reachedWarehouseCustomerMessage(order) {
-  const quantity = Number(order.quantity || 1) || 1;
-  const productName = String(order.productName || order.productId || "barang").trim().toLowerCase();
-  return `Salam kita, dlm 1-3 ari runner will hantar brg ‘${quantity} unit ${productName}’ utk kita ya 🥰\nKita ingat reply Runner text, Runner TOMU LOGISTIC. 🥰`;
+function reachedWarehouseCustomerMessage(order, template = "") {
+  const text = String(template || "").trim() ||
+    "Salam kita, dlm 1-3 ari runner will hantar brg '{quantity} unit {product}' utk kita ya \uD83E\uDD70\nKita ingat reply Runner text, Runner TOMU LOGISTIC. \uD83E\uDD70";
+  return renderOrderStatusReply(text, order);
 }
 
 function formatOrderAdminRow(order) {
@@ -8027,12 +8029,17 @@ function adminDashboardHtml() {
       font-size: 13px;
       font-weight: 800;
     }
-    .profile-form input {
+    .profile-form input, .profile-form textarea {
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 9px 10px;
       font: inherit;
       background: #fff;
+    }
+    .profile-form textarea {
+      min-height: 110px;
+      resize: vertical;
+      line-height: 1.38;
     }
     .profile-form input[type="color"] {
       width: 88px;
@@ -8224,6 +8231,19 @@ function adminDashboardHtml() {
         <div class="profile-actions">
           <button type="submit">Save Profile</button>
           <span id="profile-state"></span>
+        </div>
+      </form>
+      <form class="profile-form" id="order-status-replies-form">
+        <label for="order-status-pending">Order Submitted status reply
+          <textarea id="order-status-pending"></textarea>
+        </label>
+        <label for="order-status-warehouse">Reached Warehouse button message
+          <textarea id="order-status-warehouse"></textarea>
+        </label>
+        <span class="muted">Available placeholders: {quantity}, {product}, {productName}, {unitText}</span>
+        <div class="profile-actions">
+          <button type="submit">Save Order Status Messages</button>
+          <span id="order-status-replies-state"></span>
         </div>
       </form>
       <form class="profile-form" method="post" action="/admin/logout">
@@ -8507,12 +8527,19 @@ function adminDashboardHtml() {
       document.querySelector("#profile-color").value = accentColor;
     }
 
+    function renderOrderStatusReplies() {
+      const replies = dashboardData ? dashboardData.orderStatusReplies || {} : {};
+      document.querySelector("#order-status-pending").value = replies.pending_admin_order || "";
+      document.querySelector("#order-status-warehouse").value = replies.reached_warehouse || "";
+    }
+
     async function loadDashboard() {
       const selectedDate = dashboardDate();
       const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
       const data = await response.json();
       dashboardData = data;
       applyDashboardProfile(data.profile);
+      renderOrderStatusReplies();
       document.querySelector("#today-date").textContent = new Date().toLocaleDateString(undefined, {
         weekday: "short",
         year: "numeric",
@@ -8669,6 +8696,25 @@ function adminDashboardHtml() {
         });
         dashboardData.profile = result.profile;
         applyDashboardProfile(result.profile);
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
+
+    async function saveOrderStatusReplies(event) {
+      event.preventDefault();
+      const state = document.querySelector("#order-status-replies-state");
+      state.textContent = "Saving...";
+      try {
+        const result = await request("/admin/order-status-replies", {
+          replies: {
+            pending_admin_order: document.querySelector("#order-status-pending").value,
+            reached_warehouse: document.querySelector("#order-status-warehouse").value,
+          }
+        });
+        dashboardData.orderStatusReplies = result.replies || {};
+        renderOrderStatusReplies();
         state.textContent = "Saved";
       } catch (error) {
         state.textContent = error.message;
@@ -9132,6 +9178,7 @@ function adminDashboardHtml() {
 
     document.querySelector("#complaint-settings-form").addEventListener("submit", saveComplaintSettings);
     document.querySelector("#profile-form").addEventListener("submit", saveProfile);
+    document.querySelector("#order-status-replies-form").addEventListener("submit", saveOrderStatusReplies);
     document.querySelector('#refresh').addEventListener('click', loadDashboard);
     document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
     document.querySelectorAll('.tab').forEach(button => {
