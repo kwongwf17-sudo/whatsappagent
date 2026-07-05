@@ -159,6 +159,14 @@ const DEFAULT_ORDER_CLOSING_MESSAGES = [
   "Terima kasih❤️",
 ];
 
+const DEFAULT_ORDER_FORM = {
+  intro: "Can you help me fill up this details for hold promo? \uD83E\uDD70",
+  nameLabel: "Full name",
+  addressLabel: "Full address",
+  phoneLabel: "Phone number",
+  optionLabel: "Order option",
+};
+
 const catalog = JSON.parse(await readSeedFile(config.catalogPath, "product_catalog.json"));
 const faqLibrary = await loadFaqLibrary();
 const salesReplyLibrary = await loadSalesReplyLibrary();
@@ -6031,6 +6039,7 @@ function productFlowEditorData(product, options = {}) {
     skuCode: String(product.sku_code || ""),
     shoppingLink: String(product.shopping_link || ""),
     orderOptions: orderOptionsForEditor(product),
+    orderForm: orderFormForEditor(product),
     orderClosingMessages: orderClosingMessagesForEditor(product),
     salesPrompt: String(product.sales_prompt ?? product.package_question ?? ""),
     salesPromptFrequency: normalizeSalesPromptFrequency(product.sales_prompt_frequency),
@@ -6157,6 +6166,26 @@ function orderClosingMessagesForEditor(product) {
   return [...DEFAULT_ORDER_CLOSING_MESSAGES];
 }
 
+function orderFormForEditor(product) {
+  return normalizeOrderForm(product?.order_form);
+}
+
+function normalizeOrderForm(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    intro: cleanOrderFormValue(source.intro, DEFAULT_ORDER_FORM.intro),
+    nameLabel: cleanOrderFormValue(source.nameLabel || source.name_label, DEFAULT_ORDER_FORM.nameLabel),
+    addressLabel: cleanOrderFormValue(source.addressLabel || source.address_label, DEFAULT_ORDER_FORM.addressLabel),
+    phoneLabel: cleanOrderFormValue(source.phoneLabel || source.phone_label, DEFAULT_ORDER_FORM.phoneLabel),
+    optionLabel: cleanOrderFormValue(source.optionLabel || source.option_label, DEFAULT_ORDER_FORM.optionLabel),
+  };
+}
+
+function cleanOrderFormValue(value, fallback) {
+  const text = String(value || "").trim();
+  return text || fallback;
+}
+
 function normalizeOrderClosingMessages(messages) {
   return (Array.isArray(messages) ? messages : [])
     .map((message) => String(message || "").trim())
@@ -6206,6 +6235,9 @@ function updateProductFlowText(product, body) {
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderClosingMessages")) {
     product.order_closing_messages = normalizeOrderClosingMessages(body.orderClosingMessages);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "orderForm")) {
+    product.order_form = normalizeOrderForm(body.orderForm);
   }
   if (Object.prototype.hasOwnProperty.call(body, "salesPrompt")) {
     product.sales_prompt = String(body.salesPrompt ?? "").trim();
@@ -6734,6 +6766,7 @@ function createCatalogProduct(name) {
     ad_keywords: [name.toLowerCase()],
     packages: [],
     order_options: [],
+    order_form: normalizeOrderForm(),
     sales_prompt: "",
     sales_prompt_frequency: 1,
     images: [],
@@ -10955,6 +10988,31 @@ function productFlowPageHtml() {
         <div class="knowledge-panel">
           <div class="knowledge-head">
             <div>
+              <h3>Order Form Fields</h3>
+              <div class="knowledge-note">Edit the message and field labels shown when the customer wants to order. The parser still treats these as name, address, phone, and order option.</div>
+            </div>
+          </div>
+          <div class="fields">
+            <label class="field wide" for="orderFormIntro">Order form intro message
+              <textarea id="orderFormIntro" placeholder="Can you help me fill up this details for hold promo?"></textarea>
+            </label>
+            <label class="field" for="orderFormNameLabel">Name field label
+              <input id="orderFormNameLabel" placeholder="Full name" />
+            </label>
+            <label class="field" for="orderFormAddressLabel">Address field label
+              <input id="orderFormAddressLabel" placeholder="Full address" />
+            </label>
+            <label class="field" for="orderFormPhoneLabel">Phone field label
+              <input id="orderFormPhoneLabel" placeholder="Phone number" />
+            </label>
+            <label class="field" for="orderFormOptionLabel">Order option field label
+              <input id="orderFormOptionLabel" placeholder="Order option" />
+            </label>
+          </div>
+        </div>
+        <div class="knowledge-panel">
+          <div class="knowledge-head">
+            <div>
               <h3>FAQ Sales Follow-Up</h3>
               <div class="knowledge-note">Sent after approved FAQ, general FAQ, or vector-store product answers. Set frequency to 1 for every answer, 2 for every second answer, or 0 to disable.</div>
             </div>
@@ -11126,6 +11184,25 @@ function productFlowPageHtml() {
           renderOrderOptions();
         });
       });
+    }
+
+    function renderOrderForm() {
+      const form = selectedProduct.orderForm || {};
+      document.querySelector("#orderFormIntro").value = form.intro || "";
+      document.querySelector("#orderFormNameLabel").value = form.nameLabel || "";
+      document.querySelector("#orderFormAddressLabel").value = form.addressLabel || "";
+      document.querySelector("#orderFormPhoneLabel").value = form.phoneLabel || "";
+      document.querySelector("#orderFormOptionLabel").value = form.optionLabel || "";
+    }
+
+    function readOrderForm() {
+      return {
+        intro: document.querySelector("#orderFormIntro").value,
+        nameLabel: document.querySelector("#orderFormNameLabel").value,
+        addressLabel: document.querySelector("#orderFormAddressLabel").value,
+        phoneLabel: document.querySelector("#orderFormPhoneLabel").value,
+        optionLabel: document.querySelector("#orderFormOptionLabel").value
+      };
     }
 
     function blockHtml(block, index) {
@@ -11568,6 +11645,7 @@ function productFlowPageHtml() {
         ? selectedProduct.salesPromptFrequency
         : 1;
       renderOrderOptions();
+      renderOrderForm();
       renderApprovedFaqs();
       renderKnowledge();
       renderOpeningFlowBlocks();
@@ -11682,6 +11760,7 @@ function productFlowPageHtml() {
         salesPromptFrequency: document.querySelector("#salesPromptFrequency").value
       };
       body.orderOptions = readOrderOptions();
+      body.orderForm = readOrderForm();
       body.openingFlowBlocks = readOpeningFlowBlocks();
       body.orderClosingMessages = readOrderClosingMessages();
       try {
