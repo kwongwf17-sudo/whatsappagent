@@ -1166,6 +1166,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         products: content.catalog.products.map(productFlowEditorData),
         vectorStoreId: settings.openaiVectorStoreId || config.vectorStoreId || "",
+        orderStatusReplies: await store.getOrderStatusReplies(adminSession.accountId),
       });
     }
 
@@ -8233,19 +8234,6 @@ function adminDashboardHtml() {
           <span id="profile-state"></span>
         </div>
       </form>
-      <form class="profile-form" id="order-status-replies-form">
-        <label for="order-status-pending">Order Submitted status reply
-          <textarea id="order-status-pending"></textarea>
-        </label>
-        <label for="order-status-warehouse">Reached Warehouse button message
-          <textarea id="order-status-warehouse"></textarea>
-        </label>
-        <span class="muted">Available placeholders: {quantity}, {product}, {productName}, {unitText}</span>
-        <div class="profile-actions">
-          <button type="submit">Save Order Status Messages</button>
-          <span id="order-status-replies-state"></span>
-        </div>
-      </form>
       <form class="profile-form" method="post" action="/admin/logout">
         <div class="profile-actions">
           <button type="submit">Logout</button>
@@ -8527,19 +8515,12 @@ function adminDashboardHtml() {
       document.querySelector("#profile-color").value = accentColor;
     }
 
-    function renderOrderStatusReplies() {
-      const replies = dashboardData ? dashboardData.orderStatusReplies || {} : {};
-      document.querySelector("#order-status-pending").value = replies.pending_admin_order || "";
-      document.querySelector("#order-status-warehouse").value = replies.reached_warehouse || "";
-    }
-
     async function loadDashboard() {
       const selectedDate = dashboardDate();
       const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
       const data = await response.json();
       dashboardData = data;
       applyDashboardProfile(data.profile);
-      renderOrderStatusReplies();
       document.querySelector("#today-date").textContent = new Date().toLocaleDateString(undefined, {
         weekday: "short",
         year: "numeric",
@@ -8696,25 +8677,6 @@ function adminDashboardHtml() {
         });
         dashboardData.profile = result.profile;
         applyDashboardProfile(result.profile);
-        state.textContent = "Saved";
-      } catch (error) {
-        state.textContent = error.message;
-      }
-    }
-
-    async function saveOrderStatusReplies(event) {
-      event.preventDefault();
-      const state = document.querySelector("#order-status-replies-state");
-      state.textContent = "Saving...";
-      try {
-        const result = await request("/admin/order-status-replies", {
-          replies: {
-            pending_admin_order: document.querySelector("#order-status-pending").value,
-            reached_warehouse: document.querySelector("#order-status-warehouse").value,
-          }
-        });
-        dashboardData.orderStatusReplies = result.replies || {};
-        renderOrderStatusReplies();
         state.textContent = "Saved";
       } catch (error) {
         state.textContent = error.message;
@@ -9178,7 +9140,6 @@ function adminDashboardHtml() {
 
     document.querySelector("#complaint-settings-form").addEventListener("submit", saveComplaintSettings);
     document.querySelector("#profile-form").addEventListener("submit", saveProfile);
-    document.querySelector("#order-status-replies-form").addEventListener("submit", saveOrderStatusReplies);
     document.querySelector('#refresh').addEventListener('click', loadDashboard);
     document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
     document.querySelectorAll('.tab').forEach(button => {
@@ -10920,6 +10881,8 @@ function productFlowPageHtml() {
     .closing-card-actions { display: flex; flex-wrap: wrap; gap: 6px; }
     .closing-card-body { padding: 12px; }
     .closing-card-body textarea { min-height: 92px; }
+    .status-message-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 12px; }
+    #order-status-replies-state { color: var(--muted); font-size: 13px; }
     .empty-options { padding: 12px; border: 1px dashed #d2d2d7; border-radius: 8px; color: var(--muted); background: #fff; }
     .knowledge-panel { padding: 14px; border-top: 1px solid #e5e5ea; background: #fff; }
     .knowledge-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
@@ -11022,6 +10985,26 @@ function productFlowPageHtml() {
     <section>
       <h2>WhatsApp Opening Flow</h2>
       <form id="flow-form" novalidate>
+        <div class="knowledge-panel">
+          <div class="knowledge-head">
+            <div>
+              <h3>Order Status Messages</h3>
+              <div class="knowledge-note">Edit messages for order status replies and the Reached Warehouse button. Available placeholders: {quantity}, {product}, {productName}, {unitText}</div>
+            </div>
+          </div>
+          <div class="fields">
+            <label class="field wide" for="orderStatusPending">Order Submitted status reply
+              <textarea id="orderStatusPending"></textarea>
+            </label>
+            <label class="field wide" for="orderStatusWarehouse">Reached Warehouse button message
+              <textarea id="orderStatusWarehouse"></textarea>
+            </label>
+          </div>
+          <div class="status-message-actions">
+            <button id="save-order-status-replies" type="button">Save Order Status Messages</button>
+            <span id="order-status-replies-state"></span>
+          </div>
+        </div>
         <div class="order-options-panel">
           <div class="order-options-head">
             <div>
@@ -11174,6 +11157,7 @@ function productFlowPageHtml() {
     let products = [];
     let selectedProduct = null;
     let vectorStoreId = "";
+    let orderStatusReplies = {};
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
@@ -11191,6 +11175,42 @@ function productFlowPageHtml() {
       const ready = selectedProduct && selectedProduct.ready;
       badge.textContent = ready ? "Ready" : "Setup";
       badge.classList.toggle("ready", Boolean(ready));
+    }
+
+    function renderOrderStatusReplies() {
+      document.querySelector("#orderStatusPending").value = orderStatusReplies.pending_admin_order || "";
+      document.querySelector("#orderStatusWarehouse").value = orderStatusReplies.reached_warehouse || "";
+    }
+
+    async function saveOrderStatusReplies() {
+      const button = document.querySelector("#save-order-status-replies");
+      const state = document.querySelector("#order-status-replies-state");
+      button.disabled = true;
+      state.textContent = "Saving...";
+      try {
+        const response = await fetch("/admin/order-status-replies", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            replies: {
+              pending_admin_order: document.querySelector("#orderStatusPending").value,
+              reached_warehouse: document.querySelector("#orderStatusWarehouse").value
+            }
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          state.textContent = data.error || "Save failed";
+          return;
+        }
+        orderStatusReplies = data.replies || {};
+        renderOrderStatusReplies();
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message || "Save failed";
+      } finally {
+        button.disabled = false;
+      }
     }
 
     function updateSelectedOptionLabel() {
@@ -11706,6 +11726,8 @@ function productFlowPageHtml() {
       const data = await response.json();
       products = data.products || [];
       vectorStoreId = data.vectorStoreId || "";
+      orderStatusReplies = data.orderStatusReplies || {};
+      renderOrderStatusReplies();
       document.querySelector("#vector-sync-status").textContent = vectorStoreId
         ? "Vector store: " + vectorStoreId
         : "No vector store synced yet";
@@ -11954,6 +11976,7 @@ function productFlowPageHtml() {
     document.querySelector("#save-product-faq").addEventListener("click", saveProductFaq);
     document.querySelector("#extract-existing-images").addEventListener("click", extractExistingKnowledge);
     document.querySelector("#clean-pending-facts").addEventListener("click", cleanPendingFacts);
+    document.querySelector("#save-order-status-replies").addEventListener("click", saveOrderStatusReplies);
     document.querySelector("#sync-vector-store").addEventListener("click", syncVectorStore);
     document.querySelector("#add-order-option").addEventListener("click", () => {
       if (!selectedProduct) return;
