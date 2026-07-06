@@ -23,6 +23,7 @@ import {
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
   createCustomerServiceResponse,
+  createComplaintHandoffReply,
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
@@ -918,27 +919,6 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, status: webTransportManager.getStatus(adminSession.accountId) });
       } catch (error) {
         return sendJson(res, 500, { error: error.message, status: webTransportManager.getStatus(adminSession.accountId) });
-      }
-    }
-
-    if (req.method === "GET" && url.pathname === "/admin/complaint-settings") {
-      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      return sendJson(res, 200, await store.getComplaintSettings(adminSession.accountId));
-    }
-
-    if (req.method === "POST" && url.pathname === "/admin/complaint-settings") {
-      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      const body = await readJsonBody(req);
-      try {
-        const settings = await store.saveComplaintSettings(adminSession.accountId, body);
-        await store.appendAuditLog({
-          actor: `admin:${adminSession.accountId}`,
-          action: "complaint_acknowledgement_updated",
-          result: adminSession.accountId,
-        });
-        return sendJson(res, 200, settings);
-      } catch (error) {
-        return sendJson(res, 400, { error: error.message });
       }
     }
 
@@ -2106,8 +2086,12 @@ async function processInboundMessage({
       customerMessage: text,
       inboundMessageId: id,
     });
-    const settings = await store.getComplaintSettings(businessAccountId);
-    const outbound = [textMessage(settings.acknowledgement)];
+    const complaintReply = complaintIntent.reply || await maybeCreateComplaintHandoffReply({
+      customerMessage: text,
+      category: complaintIntent.category,
+      businessAccountId,
+    });
+    const outbound = complaintReply ? [textMessage(complaintReply)] : [];
     const categoryLabel = complaintCategoryDisplay(complaint.category);
     const updatedCustomer = await store.updateCustomer(from, () => ({
       productId: product.id,
@@ -2130,10 +2114,12 @@ async function processInboundMessage({
       businessAccountId,
     });
     if (businessAccountId !== DEMO_ACCOUNT_ID) await notifyAdmin(`Complaint handoff for ${from} (${categoryLabel}): ${text}`);
-    await sendOutbound(from, outbound, {
-      businessAccountId,
-      purpose: "complaint_acknowledgement",
-    });
+    if (outbound.length) {
+      await sendOutbound(from, outbound, {
+        businessAccountId,
+        purpose: "complaint_acknowledgement",
+      });
+    }
     return {
       customer: updatedCustomer,
       order: null,
@@ -2399,6 +2385,23 @@ async function maybeDetectComplaintIntent(customerMessage, businessAccountId = c
   }
 }
 
+async function maybeCreateComplaintHandoffReply({ customerMessage, category, businessAccountId = config.accountId }) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return "";
+  try {
+    const model = await openAiModelForAccount(businessAccountId);
+    return await createComplaintHandoffReply({
+      apiKey,
+      model,
+      customerMessage,
+      category,
+    });
+  } catch (error) {
+    await recordSystemError("complaint_handoff_reply", error, "Unable to create complaint handoff reply.", businessAccountId);
+    return "";
+  }
+}
+
 async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
   const apiKey = await openAiApiKeyForAccount(businessAccountId);
   if (!apiKey) return null;
@@ -2419,7 +2422,7 @@ async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customer
       maxResults: 8,
     });
     const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
-    if (!answer || answer.handoffRequired || !safeReply) {
+    if (!answer || !safeReply) {
       await recordSystemError(
         "approved_knowledge_rag",
         new Error("Approved knowledge RAG no answer"),
@@ -3165,11 +3168,6 @@ async function generateTestCustomers(count = 100, now = new Date()) {
     if (scenario === "unknown_handoff") {
       const replyAt = addMinutes(flowEndAt, 7);
       await appendSimInbound(customerId, replyAt, "Boleh guna kalau ada skin allergy teruk?");
-      await appendSimOutbound(
-        customerId,
-        addSeconds(replyAt, 5),
-        "Terima kasih kita. Saya akan minta team check dan reply kita sekejap lagi."
-      );
       await appendSimAdmin(
         addSeconds(replyAt, 8),
         `Human handoff requested for ${customerId}: No matching sales response, FAQ, or RAG answer.`
@@ -3443,7 +3441,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allFollowupQueue,
     orderStatusReplies,
     allComplaintCases,
-    complaintSettings,
   ] = await Promise.all([
     store.listCustomers(analyticsDate, businessAccountId),
     store.listDeletedCustomers(businessAccountId),
@@ -3454,7 +3451,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
-    store.getComplaintSettings(businessAccountId),
   ]);
   const belongsToBusiness = (item) => (item.businessAccountId || config.accountId) === businessAccountId;
   const belongsToDashboard = (item) =>
@@ -3588,7 +3584,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
     followupMessages: teamFollowupMessages({ catalog: teamCatalog }),
-    complaintSettings,
     guardrails,
     products: teamCatalog.products.map((product) => ({
       id: product.id,
@@ -8056,25 +8051,6 @@ function adminDashboardHtml() {
       color: var(--muted);
       font-size: 13px;
     }
-    .handoff-settings {
-      padding: 14px;
-      border-top: 1px solid #e5e5ea;
-      background: var(--surface-soft);
-    }
-    .handoff-settings h3 { margin: 0 0 9px; font-size: 14px; }
-    .handoff-settings textarea {
-      display: block;
-      width: min(760px, 100%);
-      min-height: 76px;
-      margin-bottom: 10px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 9px 10px;
-      font: inherit;
-      line-height: 1.38;
-      background: #fff;
-    }
     .followup-settings {
       padding: 14px;
       border-bottom: 1px solid #e5e5ea;
@@ -8118,7 +8094,6 @@ function adminDashboardHtml() {
       padding: 7px 9px;
       font: inherit;
     }
-    #complaint-settings-state { margin-left: 9px; color: var(--muted); font-size: 12px; }
     #followup-settings-state { color: var(--muted); font-size: 12px; }
     @media (max-width: 800px) {
       .dashboard-header-row { align-items: stretch; flex-direction: column; }
@@ -8196,12 +8171,6 @@ function adminDashboardHtml() {
         <button id="handoff-all" type="button">All Dates</button>
       </div>
       <div class="table-wrap"></div>
-      <form class="handoff-settings" id="complaint-settings-form">
-        <h3>Complaint Acknowledgement</h3>
-        <textarea id="complaint-acknowledgement" name="acknowledgement"></textarea>
-        <button type="submit">Save Message</button>
-        <span id="complaint-settings-state"></span>
-      </form>
     </section>
     <section id="orders" class="panel">
       <h2>Orders Table</h2>
@@ -8544,7 +8513,6 @@ function adminDashboardHtml() {
       renderCustomerLabelTabs(customerFilterBase());
       renderCustomers();
       renderHandoff();
-      renderComplaintSettings();
       renderOrderCustomerSkuFilter();
       renderOrderCustomers();
       renderOrders();
@@ -8597,26 +8565,6 @@ function adminDashboardHtml() {
         await request("/admin/handoff/complaint/resolve", { caseId: button.dataset.complaintResolve });
         loadDashboard();
       }));
-    }
-
-    function renderComplaintSettings() {
-      const settings = dashboardData ? dashboardData.complaintSettings || {} : {};
-      document.querySelector("#complaint-acknowledgement").value = settings.acknowledgement || "";
-    }
-
-    async function saveComplaintSettings(event) {
-      event.preventDefault();
-      const state = document.querySelector("#complaint-settings-state");
-      state.textContent = "Saving...";
-      try {
-        const settings = await request("/admin/complaint-settings", {
-          acknowledgement: document.querySelector("#complaint-acknowledgement").value
-        });
-        dashboardData.complaintSettings = settings;
-        state.textContent = "Saved";
-      } catch (error) {
-      state.textContent = error.message;
-      }
     }
 
     function renderFollowupSettings() {
@@ -9138,7 +9086,6 @@ function adminDashboardHtml() {
       document.querySelectorAll('.panel').forEach(panel => panel.classList.toggle('active', panel.id === tabId));
     }
 
-    document.querySelector("#complaint-settings-form").addEventListener("submit", saveComplaintSettings);
     document.querySelector("#profile-form").addEventListener("submit", saveProfile);
     document.querySelector('#refresh').addEventListener('click', loadDashboard);
     document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
