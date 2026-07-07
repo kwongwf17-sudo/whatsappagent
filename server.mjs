@@ -1580,6 +1580,16 @@ if (!config.skipHttpServer && webTransportManager) {
           await handleManualBusinessMessage(message);
           return;
         }
+        if (!message.text && message.mediaType) {
+          await recordInboundMediaNoReply({
+            id: message.id,
+            from: message.from,
+            mediaType: message.mediaType,
+            source: message.source || {},
+            businessAccountId: message.businessAccountId || config.accountId,
+          });
+          return;
+        }
         await processInboundMessage(message);
       },
     }))
@@ -1677,19 +1687,13 @@ async function handleWebhookPayload(rawBody) {
       const businessAccountId = await businessAccountIdForPhoneNumber(message.phoneNumberId);
       const text = getMessageText(message);
       if (!text) {
-        const blocked = await liveAutomationBlock(businessAccountId);
-        if (blocked) {
-          await store.appendAuditLog({
-            action: "live_reply_suppressed",
-            customerId: message.from,
-            businessAccountId,
-            result: blocked.code,
-          });
-          continue;
-        }
-        await sendOutbound(message.from, [
-          textMessage("Thanks for your message. I can help fastest with text questions, or our team can review this shortly."),
-        ], { businessAccountId });
+        await recordInboundMediaNoReply({
+          id: message.id,
+          from: message.from,
+          mediaType: inboundWebhookMediaType(message),
+          source: extractMessageSource(message),
+          businessAccountId,
+        });
         continue;
       }
 
@@ -1816,6 +1820,68 @@ function cleanCustomerPhone(value) {
   const digits = text.replace(/\D/g, "");
   if (digits.length < 5 || digits.length > 18) return "";
   return digits;
+}
+
+function normalizeInboundMediaType(mediaType = "") {
+  const type = String(mediaType || "").toLowerCase();
+  if (type === "voice" || type === "audio") return "audio";
+  if (type === "image") return "image";
+  if (type === "video") return "video";
+  return "media";
+}
+
+function inboundMediaPlaceholder(mediaType = "media") {
+  if (mediaType === "audio") return "[Customer sent a voice message]";
+  if (mediaType === "image") return "[Customer sent an image]";
+  if (mediaType === "video") return "[Customer sent a video]";
+  return "[Customer sent a media message]";
+}
+
+async function recordInboundMediaNoReply({
+  id = "",
+  from,
+  mediaType = "media",
+  source = {},
+  businessAccountId = config.accountId,
+}) {
+  const normalizedMediaType = normalizeInboundMediaType(mediaType);
+  const contactPatch = customerContactPatch(from, source);
+  if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
+    console.log(`Skipping duplicate inbound ${normalizedMediaType} message ${id} from ${from}.`);
+    return {
+      customer: await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch }),
+      messages: [],
+    };
+  }
+  console.log(`Incoming WhatsApp ${normalizedMediaType} message from ${from}; recorded for no-reply review.`);
+  await store.appendOutbox({
+    ...(id ? { id } : {}),
+    direction: "inbound",
+    from,
+    to: "agent",
+    businessAccountId,
+    channel: "customer",
+    type: normalizedMediaType,
+    body: inboundMediaPlaceholder(normalizedMediaType),
+  });
+  const nowIso = new Date().toISOString();
+  const customer = await store.getOrCreateCustomer(from, {
+    lastInboundMessageId: id,
+    lastMessageAt: nowIso,
+    lastInboundAt: nowIso,
+    recordInbound: true,
+    businessAccountId,
+    source,
+    ...contactPatch,
+  });
+  await store.appendAuditLog({
+    actor: "ai_agent",
+    action: "media_message_no_reply",
+    customerId: from,
+    businessAccountId,
+    result: normalizedMediaType,
+  });
+  return { customer, messages: [] };
 }
 
 async function processInboundMessage({
@@ -4824,6 +4890,14 @@ function getMessageText(message) {
     return (message.button?.text || message.button?.payload || "").trim();
   }
   return "";
+}
+
+function inboundWebhookMediaType(message = {}) {
+  const type = String(message.type || "").toLowerCase();
+  if (type === "audio" || type === "voice") return "audio";
+  if (type === "image") return "image";
+  if (type === "video") return "video";
+  return type || "media";
 }
 
 function isValidSignature(headers, rawBody) {
