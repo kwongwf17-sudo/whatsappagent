@@ -286,6 +286,7 @@ function renderSalesReplyRecord(reply) {
     "Scope: general",
     `Sales Reply ID: ${reply.id || ""}`,
     reply.sales_intent ? `Sales intent: ${reply.sales_intent}` : "",
+    reply.repeat_action ? `Repeat action: ${reply.repeat_action}` : "",
     reply.objection_type ? `Objection type: ${reply.objection_type}` : "",
     reply.intent ? `Intent: ${reply.intent}` : "",
     ...(reply.example_messages || []).map((message) => `Customer sales example: ${message}`),

@@ -12,8 +12,7 @@
       ],
       "approved_reply": "Boleh kita, harga ani memang promo sudah ya. Kalau kita ready, saya boleh bantu lock harga promo ani dulu.",
       "followup_prompt": "",
-      "cooldown_hours": 24,
-      "max_sends_per_customer": 1,
+      "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
       "productId": ""
@@ -30,8 +29,7 @@
       ],
       "approved_reply": "Boleh kita, no worries. Kalau ada apa-apa soalan sebelum decide, boleh tanya saja ya.",
       "followup_prompt": "",
-      "cooldown_hours": 24,
-      "max_sends_per_customer": 1,
+      "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
       "productId": ""
@@ -48,8 +46,7 @@
       ],
       "approved_reply": "Faham kita. Kalau tunggu payday, no worries ya. Bila kita ready nanti, boleh message kami semula.",
       "followup_prompt": "",
-      "cooldown_hours": 24,
-      "max_sends_per_customer": 1,
+      "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
       "productId": ""
@@ -66,8 +63,7 @@
       ],
       "approved_reply": "Faham kita. Harga ani memang ikut promo/package yang ada sekarang ya, supaya kita dapat value yang lebih berbaloi.",
       "followup_prompt": "",
-      "cooldown_hours": 24,
-      "max_sends_per_customer": 1,
+      "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
       "productId": ""
@@ -84,8 +80,7 @@
       ],
       "approved_reply": "Baik kita, no worries. Kalau berminat nanti, boleh message kami semula ya.",
       "followup_prompt": "",
-      "cooldown_hours": 24,
-      "max_sends_per_customer": 1,
+      "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
       "productId": ""

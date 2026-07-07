@@ -24,6 +24,7 @@ import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
   createCustomerServiceResponse,
   createComplaintHandoffReply,
+  createSalesIntentRepeatReply,
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
@@ -343,8 +344,12 @@ const SALES_INTENT_OPTIONS = [
   { key: "not_interested", label: "Not interested" },
 ];
 const SALES_INTENT_LABELS = new Map(SALES_INTENT_OPTIONS.map((item) => [item.key, item.label]));
-const DEFAULT_SALES_REPLY_COOLDOWN_HOURS = 24;
-const DEFAULT_SALES_REPLY_MAX_SENDS = 1;
+const SALES_REPEAT_ACTION_OPTIONS = [
+  { key: "openai_acknowledge", label: "OpenAI acknowledge" },
+  { key: "opt_out", label: "Opt out customer" },
+  { key: "handoff", label: "Handoff to admin" },
+];
+const SALES_REPEAT_ACTION_LABELS = new Map(SALES_REPEAT_ACTION_OPTIONS.map((item) => [item.key, item.label]));
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -2297,7 +2302,7 @@ async function processInboundMessage({
     ? null
     : findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext });
   const approvedFaqMatch = null;
-  const salesReplyMatch = selectedSalesReply
+      const salesReplyMatch = selectedSalesReply
     ? {
         salesReplyId: selectedSalesReply.id,
         salesIntent: selectedSalesReply.sales_intent || selectedSalesReply.objection_type || "",
@@ -2305,8 +2310,7 @@ async function processInboundMessage({
         intent: selectedSalesReply.intent || "",
         approvedReply: selectedSalesReply.approved_reply,
         followupPrompt: selectedSalesReply.followup_prompt || "",
-        cooldownHours: selectedSalesReply.cooldown_hours,
-        maxSendsPerCustomer: selectedSalesReply.max_sends_per_customer,
+        repeatAction: selectedSalesReply.repeat_action,
       }
     : null;
   const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || selectedSalesReply
@@ -2339,9 +2343,52 @@ async function processInboundMessage({
     conversationContext,
   });
 
+  let repeatPatch = {};
+  let repeatMessages = null;
+  let repeatHandoffRequired = false;
+  let repeatHandoffReason = "";
+  if (plan.repeatedSalesReply) {
+    const repeatAction = normalizeSalesRepeatAction(plan.repeatedSalesReply.action);
+    const repeatReply = await maybeCreateSalesIntentRepeatReply({
+      customerMessage: text,
+      salesIntent: plan.repeatedSalesReply.salesIntent,
+      approvedReply: plan.repeatedSalesReply.approvedReply,
+      repeatAction,
+      productName: product.name,
+      businessAccountId: knowledgeAccountId,
+    });
+    if (repeatAction === "opt_out") {
+      repeatPatch = {
+        optedOut: true,
+        optedOutAt: new Date().toISOString(),
+        followupBlocked: true,
+        followupBlockedReason: "repeated_sales_intent_opt_out",
+        handoffStatus: "",
+        handoffReason: "",
+      };
+      repeatMessages = repeatReply ? [textMessage(repeatReply)] : [];
+    } else if (repeatAction === "handoff") {
+      repeatPatch = {
+        followupBlockedReason: "repeated_sales_intent_handoff",
+        handoffStatus: "human_required",
+        handoffReason: "Repeated sales intent needs admin review.",
+      };
+      repeatMessages = repeatReply ? [textMessage(repeatReply)] : [];
+      repeatHandoffRequired = true;
+      repeatHandoffReason = "Repeated sales intent needs admin review.";
+    } else {
+      repeatPatch = {
+        handoffStatus: "",
+        handoffReason: "",
+      };
+      repeatMessages = repeatReply ? [textMessage(repeatReply)] : [];
+    }
+  }
+
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
     ...(plan.customerPatch || {}),
+    ...repeatPatch,
   }), businessAccountId);
   let order = null;
   if (plan.order) {
@@ -2352,11 +2399,11 @@ async function processInboundMessage({
     await notifyAdmin(plan.adminMessage);
   }
 
-  if (plan.handoffRequired && !plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(`Human handoff requested for ${from}: ${plan.handoffReason || "No reason supplied."}`);
+  if ((plan.handoffRequired || repeatHandoffRequired) && !plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || plan.handoffReason || "No reason supplied."}`);
   }
 
-  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : plan.messages);
+  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? plan.messages));
   if (!order && fixedOpeningFlow) {
     await delayBeforeNewCustomerOpeningFlow(customer, "fixed opening flow");
   }
@@ -2366,8 +2413,8 @@ async function processInboundMessage({
     customer: updatedCustomer,
     order,
     messages: outbound,
-    handoffRequired: Boolean(plan.handoffRequired),
-    handoffReason: plan.handoffReason || "",
+    handoffRequired: Boolean(plan.handoffRequired || repeatHandoffRequired),
+    handoffReason: repeatHandoffReason || plan.handoffReason || "",
   };
 }
 
@@ -2489,6 +2536,33 @@ async function maybeCreateComplaintHandoffReply({ customerMessage, category, bus
     });
   } catch (error) {
     await recordSystemError("complaint_handoff_reply", error, "Unable to create complaint handoff reply.", businessAccountId);
+    return "";
+  }
+}
+
+async function maybeCreateSalesIntentRepeatReply({
+  customerMessage,
+  salesIntent,
+  approvedReply,
+  repeatAction = "openai_acknowledge",
+  productName = "",
+  businessAccountId = config.accountId,
+}) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return "";
+  try {
+    const model = await openAiModelForAccount(businessAccountId);
+    return await createSalesIntentRepeatReply({
+      apiKey,
+      model,
+      customerMessage,
+      salesIntent,
+      approvedReply,
+      repeatAction,
+      productName,
+    });
+  } catch (error) {
+    await recordSystemError("sales_intent_repeat_reply", error, "Unable to create repeated-sales-intent reply.", businessAccountId);
     return "";
   }
 }
@@ -5973,8 +6047,7 @@ function saveSalesReply(body, content = defaultTeamContent) {
   const intent = salesIntentDescription(salesIntent);
   const approvedReply = String(body.approvedReply || "").trim();
   const followupPrompt = String(body.followupPrompt || "").trim();
-  const cooldownHours = normalizeNonNegativeNumber(body.cooldownHours, DEFAULT_SALES_REPLY_COOLDOWN_HOURS);
-  const maxSendsPerCustomer = normalizeNonNegativeInteger(body.maxSendsPerCustomer, DEFAULT_SALES_REPLY_MAX_SENDS);
+  const repeatAction = normalizeSalesRepeatAction(body.repeatAction);
   const exampleMessages = Array.isArray(body.exampleMessages)
     ? body.exampleMessages.map((message) => String(message).trim()).filter(Boolean)
     : String(body.exampleMessages || "").split(/\r?\n/).map((message) => message.trim()).filter(Boolean);
@@ -6005,8 +6078,7 @@ function saveSalesReply(body, content = defaultTeamContent) {
     example_messages: exampleMessages,
     approved_reply: approvedReply,
     followup_prompt: followupPrompt,
-    cooldown_hours: cooldownHours,
-    max_sends_per_customer: maxSendsPerCustomer,
+    repeat_action: repeatAction,
     scope: storageScope,
     productId: "",
     active: body.active !== false,
@@ -6015,6 +6087,11 @@ function saveSalesReply(body, content = defaultTeamContent) {
   if (index >= 0) records[index] = saved;
   else records.push(saved);
   return { ...saved, scope, productId };
+}
+
+function normalizeSalesRepeatAction(value) {
+  const action = String(value || "openai_acknowledge").trim();
+  return SALES_REPEAT_ACTION_LABELS.has(action) ? action : "openai_acknowledge";
 }
 
 function normalizeSalesIntent(value) {
@@ -6035,16 +6112,6 @@ function salesIntentDescription(salesIntent) {
   if (salesIntent === "too_expensive") return "Customer says the product, package, or delivery is too expensive.";
   if (salesIntent === "not_interested") return "Customer politely says not interested, not now, or next time.";
   return "";
-}
-
-function normalizeNonNegativeNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? number : fallback;
-}
-
-function normalizeNonNegativeInteger(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : fallback;
 }
 
 function deleteSalesReply(body, content = defaultTeamContent) {
@@ -9624,8 +9691,7 @@ function replyLibraryPageHtml() {
           <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
           <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
           <label class="field wide" for="sales-followup">Optional Follow-Up Prompt <textarea id="sales-followup"></textarea></label>
-          <label class="field" for="sales-cooldown">Cooldown Hours <input id="sales-cooldown" type="number" min="0" step="1" value="${DEFAULT_SALES_REPLY_COOLDOWN_HOURS}" /></label>
-          <label class="field" for="sales-max-sends">Max Sends Per Customer/Product <input id="sales-max-sends" type="number" min="0" step="1" value="${DEFAULT_SALES_REPLY_MAX_SENDS}" /></label>
+          <label class="field wide" for="sales-repeat-action">Same Intent Again <select id="sales-repeat-action"></select></label>
         </div>
         <div class="editor-actions">
           <label for="sales-active"><input id="sales-active" type="checkbox" checked /> Active</label>
@@ -9640,11 +9706,17 @@ function replyLibraryPageHtml() {
     let faqLibrary = { general: [] };
     let salesLibrary = { general: [] };
     const salesIntentOptions = ${JSON.stringify(SALES_INTENT_OPTIONS)};
+    const salesRepeatActionOptions = ${JSON.stringify(SALES_REPEAT_ACTION_OPTIONS)};
     function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]); }
     function salesIntentKey(reply) { return reply.sales_intent || reply.intent_key || String(reply.objection_type || "").toLowerCase().replace(/[\\s-]+/g, "_"); }
     function salesIntentLabel(key) { return (salesIntentOptions.find(item => item.key === key) || {}).label || key || ""; }
     function renderSalesIntentOptions(selected) {
       return '<option value="">Select sales intent</option>' + salesIntentOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
+    }
+    function salesRepeatActionKey(reply) { return reply.repeat_action || "openai_acknowledge"; }
+    function salesRepeatActionLabel(key) { return (salesRepeatActionOptions.find(item => item.key === key) || {}).label || key || ""; }
+    function renderSalesRepeatActionOptions(selected) {
+      return salesRepeatActionOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
     }
     function renderFaqRows(records) {
       if (!records.length) return '<div class="empty">No general FAQs yet.</div>';
@@ -9656,11 +9728,11 @@ function replyLibraryPageHtml() {
     }
     function renderSalesRows(records) {
       if (!records.length) return '<div class="empty">No general sales replies yet.</div>';
-      return '<table><thead><tr><th>Sales Intent</th><th>Examples</th><th>Approved Reply</th><th>Cooldown</th><th>Max Sends</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(reply => {
+      return '<table><thead><tr><th>Sales Intent</th><th>Examples</th><th>Approved Reply</th><th>Same Intent Again</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(reply => {
         const examples = (reply.example_messages || []).map(esc).join('<br>');
         const status = reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
         const intentKey = salesIntentKey(reply);
-        return '<tr><td>' + esc(salesIntentLabel(intentKey)) + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td>' + esc(reply.cooldown_hours ?? ${DEFAULT_SALES_REPLY_COOLDOWN_HOURS}) + 'h</td><td>' + esc(reply.max_sends_per_customer ?? ${DEFAULT_SALES_REPLY_MAX_SENDS}) + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(salesIntentLabel(intentKey) || reply.id) + '">Delete</button></td></tr>';
+        return '<tr><td>' + esc(salesIntentLabel(intentKey)) + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td>' + esc(salesRepeatActionLabel(salesRepeatActionKey(reply))) + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(salesIntentLabel(intentKey) || reply.id) + '">Delete</button></td></tr>';
       }).join('') + '</tbody></table>';
     }
     function renderFaq() {
@@ -9682,11 +9754,11 @@ function replyLibraryPageHtml() {
       document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic").value = faq.topic || ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = "";
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-followup").value = ""; document.querySelector("#sales-cooldown").value = "${DEFAULT_SALES_REPLY_COOLDOWN_HOURS}"; document.querySelector("#sales-max-sends").value = "${DEFAULT_SALES_REPLY_MAX_SENDS}"; document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-followup").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-followup").value = reply.followup_prompt || ""; document.querySelector("#sales-cooldown").value = reply.cooldown_hours ?? "${DEFAULT_SALES_REPLY_COOLDOWN_HOURS}"; document.querySelector("#sales-max-sends").value = reply.max_sends_per_customer ?? "${DEFAULT_SALES_REPLY_MAX_SENDS}"; document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-followup").value = reply.followup_prompt || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = "";
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -9704,7 +9776,7 @@ function replyLibraryPageHtml() {
     async function saveSales(event) {
       event.preventDefault(); const button = document.querySelector("#save-sales"); const state = document.querySelector("#sales-state"); button.disabled = true; state.textContent = "Saving...";
       try {
-        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent: document.querySelector("#sales-intent-key").value, exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, followupPrompt: document.querySelector("#sales-followup").value, cooldownHours: document.querySelector("#sales-cooldown").value, maxSendsPerCustomer: document.querySelector("#sales-max-sends").value, active: document.querySelector("#sales-active").checked }) });
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent: document.querySelector("#sales-intent-key").value, exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, followupPrompt: document.querySelector("#sales-followup").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
