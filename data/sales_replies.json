@@ -1,30 +1,94 @@
 {
-    "sales_replies":  [
-                          {
-                              "id":  "sales_fear-concern",
-                              "objection_type":  "fear_concern",
-                              "intent":  "Customers feel unsure",
-                              "example_messages":  [
-                                                       "Produk ni effective?"
-                                                   ],
-                              "approved_reply":  "Effective ya. Bnyk customers bagi good feedback.",
-                              "followup_prompt":  "",
-                              "active":  true,
-                              "scope":  "business",
-                              "productId":  ""
-                          },
-                          {
-                              "id":  "blackhead_remover_sales_tanya_dulu",
-                              "objection_type":  "Tanya dulu",
-                              "intent":  "Customer gives this sales response or hesitation: Tanya dulu",
-                              "example_messages":  [
-                                                       "Tanya dulu"
-                                                   ],
-                              "approved_reply":  "Buleh tau apa yg kita fikir? Ada rasa nak tunggu payday?",
-                              "followup_prompt":  "",
-                              "active":  true,
-                              "scope":  "business",
-                              "productId":  ""
-                          }
-                      ]
+  "sales_replies": [
+    {
+      "id": "sales_price_objection_negotiation",
+      "sales_intent": "price_objection_negotiation",
+      "objection_type": "Price objection / negotiation",
+      "intent": "Customer is negotiating price, asking for discount, or objecting to price.",
+      "example_messages": [
+        "Boleh kurang lagi?",
+        "Ada discount?",
+        "Mahal sikit"
+      ],
+      "approved_reply": "Boleh kita, harga ani memang promo sudah ya. Kalau kita ready, saya boleh bantu lock harga promo ani dulu.",
+      "followup_prompt": "",
+      "cooldown_hours": 24,
+      "max_sends_per_customer": 1,
+      "active": true,
+      "scope": "business",
+      "productId": ""
+    },
+    {
+      "id": "sales_thinking_first",
+      "sales_intent": "thinking_first",
+      "objection_type": "Thinking first",
+      "intent": "Customer wants to think first, ask someone first, or decide later.",
+      "example_messages": [
+        "Fikir dulu",
+        "Tanya dulu",
+        "Nanti dulu"
+      ],
+      "approved_reply": "Boleh kita, no worries. Kalau ada apa-apa soalan sebelum decide, boleh tanya saja ya.",
+      "followup_prompt": "",
+      "cooldown_hours": 24,
+      "max_sends_per_customer": 1,
+      "active": true,
+      "scope": "business",
+      "productId": ""
+    },
+    {
+      "id": "sales_payday_only_pay",
+      "sales_intent": "payday_only_pay",
+      "objection_type": "Payday / only pay later",
+      "intent": "Customer is interested but wants to wait for payday, salary, budget, or pay later.",
+      "example_messages": [
+        "Payday dulu",
+        "Gaji dulu",
+        "Budget belum cukup"
+      ],
+      "approved_reply": "Faham kita. Kalau tunggu payday, no worries ya. Bila kita ready nanti, boleh message kami semula.",
+      "followup_prompt": "",
+      "cooldown_hours": 24,
+      "max_sends_per_customer": 1,
+      "active": true,
+      "scope": "business",
+      "productId": ""
+    },
+    {
+      "id": "sales_too_expensive",
+      "sales_intent": "too_expensive",
+      "objection_type": "Too expensive",
+      "intent": "Customer says the product, package, or delivery is too expensive.",
+      "example_messages": [
+        "Mahal",
+        "Too expensive",
+        "Harga mahal"
+      ],
+      "approved_reply": "Faham kita. Harga ani memang ikut promo/package yang ada sekarang ya, supaya kita dapat value yang lebih berbaloi.",
+      "followup_prompt": "",
+      "cooldown_hours": 24,
+      "max_sends_per_customer": 1,
+      "active": true,
+      "scope": "business",
+      "productId": ""
+    },
+    {
+      "id": "sales_not_interested",
+      "sales_intent": "not_interested",
+      "objection_type": "Not interested",
+      "intent": "Customer politely says not interested, not now, or next time.",
+      "example_messages": [
+        "Next time saja",
+        "Nda minat dulu",
+        "Not interested"
+      ],
+      "approved_reply": "Baik kita, no worries. Kalau berminat nanti, boleh message kami semula ya.",
+      "followup_prompt": "",
+      "cooldown_hours": 24,
+      "max_sends_per_customer": 1,
+      "active": true,
+      "scope": "business",
+      "productId": ""
+    }
+  ]
 }

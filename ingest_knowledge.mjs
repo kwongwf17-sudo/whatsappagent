@@ -285,6 +285,7 @@ function renderSalesReplyRecord(reply) {
     `### Sales Reply: ${reply.id || reply.objection_type || "unnamed"}`,
     "Scope: general",
     `Sales Reply ID: ${reply.id || ""}`,
+    reply.sales_intent ? `Sales intent: ${reply.sales_intent}` : "",
     reply.objection_type ? `Objection type: ${reply.objection_type}` : "",
     reply.intent ? `Intent: ${reply.intent}` : "",
     ...(reply.example_messages || []).map((message) => `Customer sales example: ${message}`),
@@ -300,6 +301,7 @@ function renderBruneiMalaySalesSearchText(reply, approvedReply) {
   return [
     ...(reply.brunei_malay_example_messages || []),
     ...(reply.example_messages || []),
+    reply.sales_intent || "",
     reply.brunei_malay_objection_type || "",
     reply.objection_type || "",
     reply.brunei_malay_intent || "",
