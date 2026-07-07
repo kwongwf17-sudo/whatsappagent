@@ -340,6 +340,12 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/admin")) {
+      res.writeHead(303, { Location: "/admin/dashboard" });
+      res.end();
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/admin/login") {
       return sendHtml(res, 200, loginHtml(url.searchParams.get("next") || "/admin/dashboard", "", config.accountId));
     }
