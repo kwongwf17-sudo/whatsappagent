@@ -75,6 +75,12 @@ Postgres uses the same document-store adapter interface as JSON/SQLite, so exist
 
 For multi-team deployments, product catalogs, uploaded product images, approved FAQs, approved sales replies, and team vector store IDs are stored per business account. Super Admin owns Team Settings and WhatsApp credentials; normal Business Admins manage only their team content and orders.
 
+## Production and Staging
+
+When customers are already live, use separate Railway services for production and staging. Production should deploy from `master`; staging should deploy from `staging` with its own database and test/demo WhatsApp setup.
+
+See `docs/SAFE_DEVELOPMENT_WORKFLOW.md` before testing risky changes.
+
 ## Follow-Up Worker
 
 In production, run the web server and follow-up worker separately:
