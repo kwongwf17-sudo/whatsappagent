@@ -291,7 +291,6 @@ function renderSalesReplyRecord(reply) {
     reply.intent ? `Intent: ${reply.intent}` : "",
     ...(reply.example_messages || []).map((message) => `Customer sales example: ${message}`),
     `Approved sales reply: ${approvedReply}`,
-    reply.followup_prompt ? `Approved follow-up prompt: ${reply.followup_prompt}` : "",
     bruneiMalayReply ? `Brunei Malay approved sales reply: ${bruneiMalayReply}` : "",
     bruneiMalaySearchText ? `Brunei Malay sales search text: ${bruneiMalaySearchText}` : "",
     "",

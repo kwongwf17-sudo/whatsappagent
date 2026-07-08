@@ -117,6 +117,7 @@ const config = {
   statusReplyDelayMs: Number(getEnv("STATUS_REPLY_DELAY_MS", "5000")),
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
   orderDetailBufferMs: Number(getEnv("ORDER_DETAIL_BUFFER_MS", "60000")),
+  messageMergeBufferMs: Number(getEnv("MESSAGE_MERGE_BUFFER_MS", "10000")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   noReplyAlertMinutes: Number(getEnv("NO_REPLY_ALERT_MINUTES", "2")),
@@ -207,6 +208,7 @@ await operations.ensureState({ version: config.appVersion });
 let catalogWriteQueue = Promise.resolve();
 const processedMessageIds = new Map();
 const pendingOrderDetailBuffers = new Map();
+const pendingMessageMergeBuffers = new Map();
 const deliveredOutboundMessages = new Map();
 const submittedOutboundMessages = new Map();
 const outboundDeliveryWaiters = new Map();
@@ -342,6 +344,7 @@ const SALES_INTENT_OPTIONS = [
   { key: "payday_only_pay", label: "Payday / only pay later" },
   { key: "too_expensive", label: "Too expensive" },
   { key: "not_interested", label: "Not interested" },
+  { key: "another_date_purchase", label: "Another date purchase" },
 ];
 const SALES_INTENT_LABELS = new Map(SALES_INTENT_OPTIONS.map((item) => [item.key, item.label]));
 const SALES_REPEAT_ACTION_OPTIONS = [
@@ -746,6 +749,7 @@ const server = http.createServer(async (req, res) => {
         const body = await readJsonBody(req);
         const content = await getTeamContent(adminSession.accountId);
         const saved = updateTeamFollowupMessages(content, body.followups || body.stages || []);
+        const anotherDatePurchaseFollowup = updateAnotherDatePurchaseFollowup(content, body.anotherDatePurchaseFollowup || {});
         await saveTeamContent(adminSession.accountId, content);
         await saveFollowupRuntimeSettings(adminSession.accountId, body.settings);
         await store.appendAuditLog({
@@ -754,7 +758,7 @@ const server = http.createServer(async (req, res) => {
           result: `${saved.updatedProducts} product(s)`,
           businessAccountId: adminSession.accountId,
         });
-        return sendJson(res, 200, { ...(await buildFollowupSettingsData(adminSession.accountId, content)), saved });
+        return sendJson(res, 200, { ...(await buildFollowupSettingsData(adminSession.accountId, content)), saved: { ...saved, anotherDatePurchaseFollowup } });
       } catch (error) {
         await recordSystemError("followup_settings_save", error, "", adminSession?.accountId || config.accountId);
         return sendJson(res, 500, { error: error.message || "Unable to save follow-up settings." });
@@ -1452,6 +1456,29 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       return sendJson(res, 200, { deleted: Boolean(deleted), customer: deleted });
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/customer/opt-out") {
+      const body = await readJsonBody(req);
+      const customerId = String(body.customerId || "");
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      if (!customerId) return sendJson(res, 400, { error: "Missing customerId." });
+      const updated = await store.updateCustomer(customerId, () => ({
+        optedOut: true,
+        optedOutAt: new Date().toISOString(),
+        followupBlocked: true,
+        followupBlockedReason: "manual_admin_opt_out",
+        handoffStatus: "",
+        handoffReason: "",
+      }), adminSession.accountId);
+      await store.appendAuditLog({
+        actor: `business_admin:${adminSession.accountId}`,
+        action: "customer_opt_out",
+        customerId,
+        result: "opted_out",
+        businessAccountId: adminSession.accountId,
+      });
+      return sendJson(res, 200, { customer: updated });
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/customer/mark-order-submitted") {
       const body = await readJsonBody(req);
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
@@ -1503,6 +1530,10 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         complaintStatus: "",
         complaintCategory: "",
         complaintAt: "",
+        status: "order_submitted",
+        salesStatus: "",
+        anotherDatePurchaseDate: "",
+        anotherDatePurchaseText: "",
         followupBlocked: true,
         followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
@@ -1915,6 +1946,7 @@ async function processInboundMessage({
   contentAccountId = businessAccountId,
   knowledgeAccountId = contentAccountId,
   skipOrderDetailBuffer = false,
+  skipMessageMergeBuffer = false,
   skipInboundRecord = false,
 }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
@@ -1957,6 +1989,20 @@ async function processInboundMessage({
         source,
         ...contactPatch,
       });
+
+  if (!skipInboundRecord && !skipMessageMergeBuffer && businessAccountId !== DEMO_ACCOUNT_ID && shouldBufferMergedCustomerMessage(text)) {
+    return bufferMergedCustomerMessage({
+      id,
+      from,
+      text,
+      source,
+      live,
+      businessAccountId,
+      contentAccountId,
+      knowledgeAccountId,
+    }, customer);
+  }
+
   const conversationContext = await recentConversationContext(from, businessAccountId);
   const sourceMatchedProduct = findProductMatch(teamCatalog, "", source);
   const contextMatchedProduct = customer.productId
@@ -2309,7 +2355,6 @@ async function processInboundMessage({
         objectionType: selectedSalesReply.objection_type || "",
         intent: selectedSalesReply.intent || "",
         approvedReply: selectedSalesReply.approved_reply,
-        followupPrompt: selectedSalesReply.followup_prompt || "",
         repeatAction: selectedSalesReply.repeat_action,
       }
     : null;
@@ -2385,9 +2430,14 @@ async function processInboundMessage({
     }
   }
 
+  const anotherDatePatch = plan.customerPatch?.salesStatus === "another_date_purchase" || plan.customerPatch?.status === "another_date_purchase"
+    ? anotherDatePurchaseCustomerPatch(text)
+    : {};
+
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
     ...(plan.customerPatch || {}),
+    ...anotherDatePatch,
     ...repeatPatch,
   }), businessAccountId);
   let order = null;
@@ -2895,14 +2945,20 @@ async function getDueFollowupsForTeams(now = new Date()) {
   const contentByAccount = new Map();
   const due = [];
   for (const customer of customers) {
-    if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) continue;
     const accountId = customer.businessAccountId || config.accountId;
     if (!contentByAccount.has(accountId)) {
       contentByAccount.set(accountId, await getTeamContent(accountId));
     }
-    const teamCatalog = contentByAccount.get(accountId).catalog;
+    const teamContent = contentByAccount.get(accountId);
+    const teamCatalog = teamContent.catalog;
     const product = teamCatalog.products.find((item) => item.id === customer.productId);
     if (!product) continue;
+    const anotherDateItem = anotherDatePurchaseFollowupItem(customer, product, teamContent, now);
+    if (anotherDateItem) {
+      due.push(anotherDateItem);
+      continue;
+    }
+    if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) continue;
     const sequence = productFollowupSequence(product);
     const item = currentFollowupStage(customer, sequence, now);
     if (!item || customer.followupsSent?.[item.key]) continue;
@@ -2966,7 +3022,8 @@ async function dispatchFollowupQueue(now = new Date()) {
       productId: item.productId,
       message: item.message,
     };
-    if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) {
+    const specialAnotherDateFollowup = item.followupKey === "another_date_purchase_followup";
+    if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || (customer.followupBlocked && !specialAnotherDateFollowup)) {
       await operations.updateFollowupDispatch(item.id, {
         status: "cancelled",
         lastError: !customer ? "Customer no longer exists." : "Customer ordered or opted out before send.",
@@ -2981,7 +3038,41 @@ async function dispatchFollowupQueue(now = new Date()) {
     if (!contentByAccount.has(itemAccountId)) {
       contentByAccount.set(itemAccountId, await getTeamContent(itemAccountId));
     }
-    const product = contentByAccount.get(itemAccountId).catalog.products.find((entry) => entry.id === customer.productId);
+    const teamContent = contentByAccount.get(itemAccountId);
+    const product = teamContent.catalog.products.find((entry) => entry.id === customer.productId);
+    if (specialAnotherDateFollowup) {
+      const specialItem = anotherDatePurchaseFollowupItem(customer, product, teamContent, now);
+      if (!specialItem || customer.followupsSent?.[item.followupKey]) {
+        await operations.updateFollowupDispatch(item.id, {
+          status: "cancelled",
+          lastError: "Another-date purchase follow-up is no longer due.",
+        });
+        result.cancelled.push(sentItem);
+        continue;
+      }
+      try {
+        await wait(randomFollowupDelayMs());
+        const outboundMessages = followupOutboundMessages({ message: item.message, messages: item.messages });
+        await sendOutbound(item.customerId, Array.isArray(outboundMessages) ? outboundMessages : [outboundMessages], {
+          businessAccountId: itemAccountId,
+          purpose: "another_date_purchase_followup",
+          followupKey: item.followupKey,
+          skipFailureRecord: true,
+        });
+        await store.markFollowupSent(item.customerId, item.followupKey, now, itemAccountId);
+        await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
+        result.sent.push(sentItem);
+      } catch (error) {
+        const retryAt = new Date(now.getTime() + Math.max(config.followupRetryMinutes, 1) * 60 * 1000);
+        await operations.updateFollowupDispatch(item.id, {
+          status: "retry_pending",
+          availableAt: retryAt.toISOString(),
+          lastError: error.message,
+        });
+        result.failed.push(sentItem);
+      }
+      continue;
+    }
     const followupSequence = productFollowupSequence(product);
     const sequenceItem = followupSequence.find((entry) => entry.key === item.followupKey);
     const currentStage = currentFollowupStage(customer, followupSequence, now);
@@ -3565,6 +3656,7 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
   return {
     profile: normalizeDashboardProfile((await operations.getState()).dashboardProfile),
     followupMessages: teamFollowupMessages(teamContent),
+    anotherDatePurchaseFollowup: teamAnotherDatePurchaseFollowup(teamContent),
     settings: {
       followupSendsPerMinute: Number(settings.followupSendsPerMinute || 0) || config.followupSendsPerMinute,
       followupIntervalMinutes: Number(settings.followupIntervalMinutes || 0) || config.followupIntervalMinutes,
@@ -3691,8 +3783,17 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       guardrail: guardrailDisplay(customer, now),
       optedOut: Boolean(customer.optedOut),
       orderCount: customerOrders.length,
+      anotherDatePurchaseDate: customer.anotherDatePurchaseDate || customer.plannedPurchaseDate || "",
+      anotherDatePurchaseText: customer.anotherDatePurchaseText || "",
     };
   });
+  const anotherDatePurchaseCustomers = customerRows
+    .filter((customer) => customer.status === "another date purchase" && !customer.orderCount)
+    .map((customer) => ({
+      ...customer,
+      plannedDate: customer.anotherDatePurchaseDate || "",
+      note: customer.anotherDatePurchaseText || "",
+    }));
 
   const handoffQueue = [
     ...complaintCases
@@ -3763,6 +3864,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       })),
     })),
     customers: customerRows,
+    anotherDatePurchaseCustomers,
     noReplyAlerts,
     handoffQueue,
     orders: orders.map((order) => ({
@@ -3969,6 +4071,7 @@ function conversationStatus(customer, customerOrders) {
     return orderStatusDisplay(customerOrders.at(-1).status);
   }
   if (customerOrders.length > 0) return orderStatusDisplay(customerOrders.at(-1).status);
+  if (customer.salesStatus === "another_date_purchase" || customer.status === "another_date_purchase") return "another date purchase";
   if (customer.complaintStatus === "open") return "complaint - human required";
   if (customer.handoffStatus === "human_required") return "human required";
   if (Number(customer.inboundCount || 0) <= 1) return "new lead";
@@ -3996,6 +4099,7 @@ function guardrailDisplay(customer, now = new Date()) {
   if (status.reason === "complaint_handoff") return "complaint: human required";
   if (status.reason === "outside_24_hour_window") return "template follow-up required";
   if (status.reason === "order_submitted") return "order submitted";
+  if (customer.followupBlockedReason === "another_date_purchase") return "another date purchase";
   return status.reason;
 }
 
@@ -4532,6 +4636,108 @@ function followupOutboundMessages(followup = {}) {
   });
 }
 
+function defaultAnotherDatePurchaseFollowupSettings() {
+  return {
+    enabled: true,
+    fallbackDayOfMonth: 20,
+    sendHour: 20,
+    message: "Hi kita, just follow up pasal kita pernah mention kan beli nanti. Masih mau saya bantu arrange order hari ani?",
+    messages: [
+      {
+        id: "text_another_date_purchase_followup",
+        type: "text",
+        body: "Hi kita, just follow up pasal kita pernah mention kan beli nanti. Masih mau saya bantu arrange order hari ani?",
+      },
+    ],
+  };
+}
+
+function normalizeAnotherDatePurchaseFollowupSettings(input = {}) {
+  const fallback = defaultAnotherDatePurchaseFollowupSettings();
+  const messages = normalizeFollowupMessageBlocks(input.messages, input.message || fallback.message);
+  return {
+    enabled: input.enabled !== false,
+    fallbackDayOfMonth: clampNumber(input.fallbackDayOfMonth ?? input.fallback_day_of_month, 1, 31, fallback.fallbackDayOfMonth),
+    sendHour: clampNumber(input.sendHour ?? input.send_hour, 0, 23, fallback.sendHour),
+    message: followupTextSummary(messages, input.message || fallback.message),
+    messages,
+  };
+}
+
+function teamAnotherDatePurchaseFollowup(content = defaultTeamContent) {
+  return normalizeAnotherDatePurchaseFollowupSettings(content?.followupSettings?.anotherDatePurchase || {});
+}
+
+function updateAnotherDatePurchaseFollowup(content = defaultTeamContent, input = {}) {
+  content.followupSettings = content.followupSettings && typeof content.followupSettings === "object"
+    ? content.followupSettings
+    : {};
+  content.followupSettings.anotherDatePurchase = normalizeAnotherDatePurchaseFollowupSettings(input);
+  return content.followupSettings.anotherDatePurchase;
+}
+
+function anotherDatePurchaseFollowupItem(customer, product, content, now = new Date()) {
+  if (customer?.salesStatus !== "another_date_purchase" && customer?.status !== "another_date_purchase") return null;
+  if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupsSent?.another_date_purchase_followup) return null;
+  const settings = teamAnotherDatePurchaseFollowup(content);
+  if (!settings.enabled || !settings.messages.length) return null;
+  const dueAt = anotherDatePurchaseDueAt(customer, settings, now);
+  if (!dueAt || !isSameFollowupLocalDay(dueAt, now) || followupZonedDateParts(now).hour !== settings.sendHour || now < dueAt) return null;
+  return {
+    customer,
+    product,
+    followup: {
+      message: settings.message,
+      messages: settings.messages,
+    },
+    followupKey: "another_date_purchase_followup",
+  };
+}
+
+function anotherDatePurchaseDueAt(customer, settings, now = new Date()) {
+  const plannedDate = validDateOrNull(customer.anotherDatePurchaseDate || customer.plannedPurchaseDate);
+  if (plannedDate) {
+    const parts = followupZonedDateParts(plannedDate);
+    return followupZonedLocalToDate({ ...parts, hour: settings.sendHour, minute: 0, second: 0, millisecond: 0 });
+  }
+  const basis = validDateOrNull(customer.anotherDatePurchaseAt || customer.lastSalesReplyAt || customer.firstSeenAt) || now;
+  return nextFallbackDayOfMonthDueAt(basis, settings.fallbackDayOfMonth, settings.sendHour);
+}
+
+function nextFallbackDayOfMonthDueAt(basis, dayOfMonth, sendHour) {
+  const basisParts = followupZonedDateParts(basis);
+  let parts = {
+    year: basisParts.year,
+    month: basisParts.month,
+    day: clampNumber(dayOfMonth, 1, 31, 20),
+    hour: sendHour,
+    minute: 0,
+    second: 0,
+    millisecond: 0,
+  };
+  let due = followupZonedLocalToDate(parts);
+  if (due < basis) {
+    parts = {
+      ...parts,
+      month: parts.month + 1,
+    };
+    due = followupZonedLocalToDate(parts);
+  }
+  return due;
+}
+
+function validDateOrNull(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function isSameFollowupLocalDay(left, right) {
+  const a = followupZonedDateParts(left);
+  const b = followupZonedDateParts(right);
+  return a.year === b.year && a.month === b.month && a.day === b.day;
+}
+
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -5036,6 +5242,117 @@ function orderDetailBufferKey(businessAccountId, customerId) {
   return `${businessAccountId || config.accountId}::${customerId}`;
 }
 
+function shouldBufferMergedCustomerMessage(text) {
+  const delayMs = Math.max(0, Number(config.messageMergeBufferMs) || 0);
+  return delayMs > 0 && Boolean(String(text || "").trim());
+}
+
+function bufferMergedCustomerMessage(args, customer) {
+  const delayMs = Math.max(0, Number(config.messageMergeBufferMs) || 0);
+  const key = orderDetailBufferKey(args.businessAccountId, args.from);
+  const existing = pendingMessageMergeBuffers.get(key);
+  if (existing?.timer) clearTimeout(existing.timer);
+  const messages = [...(existing?.messages || []), String(args.text || "").trim()].filter(Boolean);
+  const sources = [...(existing?.sources || []), args.source || {}];
+  const timer = setTimeout(() => {
+    pendingMessageMergeBuffers.delete(key);
+    const combinedText = messages.join("\n");
+    const combinedSource = sources.reduce((merged, source) => ({ ...merged, ...source }), {});
+    void processInboundMessage({
+      ...args,
+      id: "",
+      text: combinedText,
+      source: combinedSource,
+      skipMessageMergeBuffer: true,
+      skipInboundRecord: true,
+    }).catch((error) => recordSystemError("message_merge_buffer_flush", error, `${args.from}: ${combinedText}`, args.businessAccountId));
+  }, delayMs);
+  pendingMessageMergeBuffers.set(key, { timer, messages, sources });
+  console.log(`Buffering customer message merge from ${args.from} for ${delayMs}ms (${messages.length} fragment(s)).`);
+  return {
+    customer,
+    order: null,
+    messages: [],
+    handoffRequired: false,
+    handoffReason: "Customer message merge buffered.",
+  };
+}
+
+function anotherDatePurchaseCustomerPatch(text, now = new Date()) {
+  const plannedDate = extractPlannedPurchaseDate(text, now);
+  return {
+    anotherDatePurchaseAt: now.toISOString(),
+    anotherDatePurchaseText: String(text || "").trim(),
+    anotherDatePurchaseDate: plannedDate ? plannedDate.toISOString() : "",
+    plannedPurchaseDate: plannedDate ? plannedDate.toISOString() : "",
+  };
+}
+
+function extractPlannedPurchaseDate(text, now = new Date()) {
+  const body = String(text || "").toLowerCase();
+  const numeric = body.match(/\b([0-3]?\d)\s*[\/.-]\s*([01]?\d)(?:\s*[\/.-]\s*(\d{2,4}))?\b/);
+  if (numeric) {
+    return localPlannedDate(Number(numeric[1]), Number(numeric[2]), numeric[3] ? normalizeYear(Number(numeric[3])) : null, now);
+  }
+  const monthNames = {
+    jan: 1, january: 1, januari: 1,
+    feb: 2, february: 2, februari: 2,
+    mar: 3, march: 3, mac: 3,
+    apr: 4, april: 4,
+    may: 5, mei: 5,
+    jun: 6, june: 6, juni: 6,
+    jul: 7, july: 7, julai: 7,
+    aug: 8, august: 8, ogos: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10, oktober: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12, disember: 12,
+  };
+  const monthMatch = body.match(/\b([0-3]?\d)\s*(jan(?:uary|uari)?|feb(?:ruary|ruari)?|mar(?:ch)?|mac|apr(?:il)?|may|mei|jun(?:e|i)?|jul(?:y|ai)?|aug(?:ust)?|ogos|sep(?:t|tember)?|oct(?:ober)?|oktober|nov(?:ember)?|dec(?:ember)?|disember)\b/);
+  if (monthMatch) {
+    const month = monthNames[monthMatch[2]];
+    return localPlannedDate(Number(monthMatch[1]), month, null, now);
+  }
+  if (/\b(tomorrow|esok|bisuk)\b/.test(body)) {
+    return localDateAtSendHour(addFollowupLocalDays(followupZonedDateParts(now), 1), 20);
+  }
+  if (/\b(next\s*week|minggu\s*depan)\b/.test(body)) {
+    return localDateAtSendHour(addFollowupLocalDays(followupZonedDateParts(now), 7), 20);
+  }
+  if (/\b(next\s*month|bulan\s*depan)\b/.test(body)) {
+    const parts = followupZonedDateParts(now);
+    return localDateAtSendHour({ ...parts, month: parts.month + 1 }, 20);
+  }
+  return null;
+}
+
+function localPlannedDate(day, month, year, now = new Date()) {
+  if (!Number.isFinite(day) || !Number.isFinite(month) || day < 1 || day > 31 || month < 1 || month > 12) return null;
+  const nowParts = followupZonedDateParts(now);
+  let candidate = localDateAtSendHour({ year: year || nowParts.year, month, day }, 20);
+  if (!year && candidate < now) {
+    candidate = localDateAtSendHour({ year: nowParts.year + 1, month, day }, 20);
+  }
+  return candidate;
+}
+
+function localDateAtSendHour(parts, sendHour) {
+  return followupZonedLocalToDate({
+    year: parts.year,
+    month: parts.month,
+    day: parts.day,
+    hour: sendHour,
+    minute: 0,
+    second: 0,
+    millisecond: 0,
+  });
+}
+
+function normalizeYear(year) {
+  if (!Number.isFinite(year)) return null;
+  return year < 100 ? 2000 + year : year;
+}
+
 function shouldBufferIncompleteOrderDetails(customer, text, product) {
   if (customer?.pendingOrder) return false;
   const delayMs = Math.max(0, Number(config.orderDetailBufferMs) || 0);
@@ -5065,6 +5382,7 @@ function bufferIncompleteOrderDetails(args, customer, product) {
       text: combinedText,
       source: combinedSource,
       skipOrderDetailBuffer: true,
+      skipMessageMergeBuffer: true,
       skipInboundRecord: true,
     }).catch((error) => recordSystemError("order_detail_buffer_flush", error, `${args.from}: ${combinedText}`, args.businessAccountId));
   }, delayMs);
@@ -6046,7 +6364,6 @@ function saveSalesReply(body, content = defaultTeamContent) {
   const objectionType = SALES_INTENT_LABELS.get(salesIntent) || salesIntent;
   const intent = salesIntentDescription(salesIntent);
   const approvedReply = String(body.approvedReply || "").trim();
-  const followupPrompt = String(body.followupPrompt || "").trim();
   const repeatAction = normalizeSalesRepeatAction(body.repeatAction);
   const exampleMessages = Array.isArray(body.exampleMessages)
     ? body.exampleMessages.map((message) => String(message).trim()).filter(Boolean)
@@ -6077,7 +6394,6 @@ function saveSalesReply(body, content = defaultTeamContent) {
     intent,
     example_messages: exampleMessages,
     approved_reply: approvedReply,
-    followup_prompt: followupPrompt,
     repeat_action: repeatAction,
     scope: storageScope,
     productId: "",
@@ -6102,6 +6418,7 @@ function normalizeSalesIntent(value) {
   if (/(payday|gaji|salary|pay_later|bayar)/i.test(raw)) return "payday_only_pay";
   if (/(expensive|mahal|too_much)/i.test(raw)) return "too_expensive";
   if (/(not_interested|no_interest|nda_minat|inda_minat|not_now|next_time)/i.test(raw)) return "not_interested";
+  if (/(another_date|specific_date|tarikh|date|bulan|hari|next_month|minggu_depan)/i.test(raw)) return "another_date_purchase";
   return "";
 }
 
@@ -6111,6 +6428,7 @@ function salesIntentDescription(salesIntent) {
   if (salesIntent === "payday_only_pay") return "Customer is interested but wants to wait for payday, salary, budget, or pay later.";
   if (salesIntent === "too_expensive") return "Customer says the product, package, or delivery is too expensive.";
   if (salesIntent === "not_interested") return "Customer politely says not interested, not now, or next time.";
+  if (salesIntent === "another_date_purchase") return "Customer plans to buy on another date, payday date, next month, or a future buying time.";
   return "";
 }
 
@@ -6143,7 +6461,6 @@ function legacyStandardSalesReply(product, reply, index) {
     intent: `Customer gives this sales response or hesitation: ${label}`,
     example_messages: examples,
     approved_reply: reply.reply || "",
-    followup_prompt: "",
     active: reply.active !== false,
     legacy_standard_reply: true,
   };
@@ -8334,6 +8651,7 @@ function adminDashboardHtml() {
     <div class="tabs" role="tablist" aria-label="Dashboard sections">
       <button class="tab active" type="button" data-tab="customers">Customers</button>
       <button class="tab" type="button" data-tab="order-customers">Customer List</button>
+      <button class="tab" type="button" data-tab="another-date-purchase">Another Date Purchase</button>
       <button class="tab" type="button" data-tab="handoff">Handoff</button>
       <button class="tab" type="button" data-tab="orders">Orders</button>
       <button class="tab" type="button" data-tab="followups">Follow-ups</button>
@@ -8363,6 +8681,11 @@ function adminDashboardHtml() {
         <button id="order-customers-all" type="button">All Dates</button>
         <span class="muted" id="order-customers-count"></span>
       </div>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="another-date-purchase" class="panel">
+      <h2>Another Date Purchase</h2>
+      <p class="note">Customers who said they plan to buy on another date. These customers are paused from normal follow-ups and use the special another-date follow-up setting.</p>
       <div class="table-wrap"></div>
     </section>
     <section id="handoff" class="panel">
@@ -8416,6 +8739,7 @@ function adminDashboardHtml() {
     const sections = {
       customers: document.querySelector("#customers .table-wrap"),
       orderCustomers: document.querySelector("#order-customers .table-wrap"),
+      anotherDatePurchase: document.querySelector("#another-date-purchase .table-wrap"),
       handoff: document.querySelector("#handoff .table-wrap"),
       orders: document.querySelector("#orders .table-wrap"),
       followups: document.querySelector("#followups .table-wrap"),
@@ -8539,6 +8863,7 @@ function adminDashboardHtml() {
         complaints: handoffRows.filter(row => row.type === "complaint").length,
         orders: rowsForDate(data.orders || [], "createdAt", selectedDate).length,
         orderCustomers: new Set(rowsForDate(data.orderCustomers || [], "createdAt", selectedDate).map(row => row.customerId).filter(Boolean)).size,
+        anotherDatePurchase: (data.anotherDatePurchaseCustomers || []).length,
         followupsDue: followupRows.filter(row => /^due\b/i.test(row.status || "")).length,
         followupsQueued: followupRows.filter(row => row.queueStatus).length,
         deleted: rowsForDate(data.deletedCustomers || [], "deletedAt", selectedDate).length,
@@ -8645,6 +8970,11 @@ function adminDashboardHtml() {
             const parts = String(item).split("::");
             await request("/admin/customer/delete", { customerId: parts[1] || parts[0] || "", reason: "Bulk deletion from dashboard" });
           }
+        } else if (actionKey === "opt-out-customers") {
+          for (const item of ids) {
+            const parts = String(item).split("::");
+            await request("/admin/customer/opt-out", { customerId: parts[1] || parts[0] || "" });
+          }
         } else if (actionKey === "ack-handoff") {
           for (const item of ids) {
             const parts = String(item).split("::");
@@ -8716,6 +9046,7 @@ function adminDashboardHtml() {
       renderHandoff();
       renderOrderCustomerSkuFilter();
       renderOrderCustomers();
+      renderAnotherDatePurchaseCustomers();
       renderOrders();
 
       renderFollowupLabelTabs(dashboardFollowups());
@@ -8982,6 +9313,28 @@ function adminDashboardHtml() {
       bindDashboardCustomerDeleteButtons();
     }
 
+    function renderAnotherDatePurchaseCustomers() {
+      const rows = dashboardData ? dashboardData.anotherDatePurchaseCustomers || [] : [];
+      sections.anotherDatePurchase.innerHTML = bulkTable("another-date-purchase", rows, [
+        { label: 'Phone', key: 'phone', render: r => esc(customerPhoneText(r)) },
+        { label: 'Product', key: 'product' },
+        { label: 'SKU', key: 'skuCode' },
+        { label: 'Planned Date', key: 'plannedDate', render: r => r.plannedDate ? fmtTime(r.plannedDate) : '<span class="muted">Fallback date</span>' },
+        { label: 'Customer Message', key: 'note' },
+        { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
+        { label: 'Order', key: 'whatsappId', render: r => '<button type="button" data-manual-order-customer="' + esc(r.whatsappId) + '">Mark Order Submitted</button>' },
+        { label: 'Opt Out', key: 'whatsappId', render: r => '<button type="button" data-opt-out-dashboard-customer="' + esc(r.whatsappId) + '">Opt Out</button>' },
+        { label: 'Delete', key: 'whatsappId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.whatsappId) + '">Delete</button>' }
+      ], [
+        { key: "opt-out-customers", label: "Opt Out Selected" },
+        { key: "delete-customers", label: "Delete Selected", danger: true }
+      ], r => r.whatsappId);
+      bindBulkSelection("another-date-purchase");
+      bindManualOrderButtons();
+      bindDashboardCustomerOptOutButtons();
+      bindDashboardCustomerDeleteButtons();
+    }
+
     function renderOrders() {
       const rows = dashboardData ? dashboardData.orders : [];
       const filtered = rows.filter(row => matchesDate(row.createdAt, activeOrdersDate));
@@ -9045,6 +9398,7 @@ function adminDashboardHtml() {
     function updateDashboardTabs(stats) {
       setTabLabel("customers", "Customers", [{ value: stats.newCustomers }]);
       setTabLabel("order-customers", "Customer List", [{ value: stats.orderCustomers }]);
+      setTabLabel("another-date-purchase", "Another Date Purchase", [{ value: stats.anotherDatePurchase }]);
       setTabLabel("handoff", "Handoff", [
         { value: stats.handoff, title: "Handoff" },
         { value: stats.complaints, title: "Complaints", soft: true }
@@ -9145,11 +9499,34 @@ function adminDashboardHtml() {
         { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
         { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
         { label: 'Order', key: 'whatsappId', render: r => '<button type="button" data-manual-order-customer="' + esc(r.whatsappId) + '">Mark Order Submitted</button>' },
+        { label: 'Opt Out', key: 'whatsappId', render: r => '<button type="button" data-opt-out-dashboard-customer="' + esc(r.whatsappId) + '">Opt Out</button>' },
         { label: 'Delete', key: 'whatsappId', render: r => '<button class="danger" type="button" data-delete-dashboard-customer="' + esc(r.whatsappId) + '">Delete</button>' }
-      ], [{ key: "delete-customers", label: "Delete Selected", danger: true }], r => r.whatsappId);
+      ], [
+        { key: "opt-out-customers", label: "Opt Out Selected" },
+        { key: "delete-customers", label: "Delete Selected", danger: true }
+      ], r => r.whatsappId);
       bindBulkSelection("customers");
       bindManualOrderButtons();
+      bindDashboardCustomerOptOutButtons();
       bindDashboardCustomerDeleteButtons();
+    }
+
+    function bindDashboardCustomerOptOutButtons() {
+      document.querySelectorAll("button[data-opt-out-dashboard-customer]").forEach(button => {
+        button.addEventListener("click", async () => {
+          const customerId = button.dataset.optOutDashboardCustomer;
+          if (!confirm("Opt out customer " + customerId + "? This blocks future follow-up messages.")) return;
+          button.disabled = true;
+          button.textContent = "Opting out...";
+          try {
+            await request("/admin/customer/opt-out", { customerId });
+            await loadDashboard();
+          } catch (error) {
+            button.disabled = false;
+            button.textContent = error.message;
+          }
+        });
+      });
     }
 
     function bindDashboardCustomerDeleteButtons() {
@@ -9690,7 +10067,6 @@ function replyLibraryPageHtml() {
           <label class="field wide" for="sales-intent-key">Sales Intent <select id="sales-intent-key" required></select></label>
           <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
           <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
-          <label class="field wide" for="sales-followup">Optional Follow-Up Prompt <textarea id="sales-followup"></textarea></label>
           <label class="field wide" for="sales-repeat-action">Same Intent Again <select id="sales-repeat-action"></select></label>
         </div>
         <div class="editor-actions">
@@ -9754,11 +10130,11 @@ function replyLibraryPageHtml() {
       document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic").value = faq.topic || ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = "";
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-followup").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-followup").value = reply.followup_prompt || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = "";
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -9776,7 +10152,7 @@ function replyLibraryPageHtml() {
     async function saveSales(event) {
       event.preventDefault(); const button = document.querySelector("#save-sales"); const state = document.querySelector("#sales-state"); button.disabled = true; state.textContent = "Saving...";
       try {
-        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent: document.querySelector("#sales-intent-key").value, exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, followupPrompt: document.querySelector("#sales-followup").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent: document.querySelector("#sales-intent-key").value, exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
@@ -9950,9 +10326,6 @@ function faqLibraryPageHtml() {
           </label>
           <label class="field wide" for="sales-reply-approved">Approved Sales Reply
             <textarea class="reply" id="sales-reply-approved" required></textarea>
-          </label>
-          <label class="field wide" for="sales-reply-followup">Optional Follow-Up Prompt
-            <textarea id="sales-reply-followup" placeholder="Mau saya hold promo untuk kita dulu?"></textarea>
           </label>
         </div>
         <div class="editor-actions">
@@ -10147,14 +10520,14 @@ function faqLibraryPageHtml() {
 
     function renderSalesRows(records, scope, productId) {
       if (!records.length) return '<div class="empty">No sales replies yet.</div>';
-      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Follow-Up</th><th>Status</th><th></th></tr></thead><tbody>' +
+      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Status</th><th></th></tr></thead><tbody>' +
         records.map(function(reply) {
           const examples = (reply.example_messages || []).map(esc).join('<br>');
           const status = reply.legacy_standard_reply
             ? '<span class="pill off">Legacy</span>'
             : reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
           return '<tr><td>' + esc(reply.objection_type) + '</td><td>' + esc(reply.intent || "") + '</td><td>' + examples +
-            '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td class="reply">' + esc(reply.followup_prompt || "") +
+            '</td><td class="reply">' + esc(reply.approved_reply) +
             '</td><td>' + status + '</td><td><button type="button" class="sales-edit-reply" data-scope="' + esc(scope) +
             '" data-product="' + esc(productId || "") + '" data-id="' + esc(reply.id) + '">Edit</button> ' +
             '<button type="button" class="sales-delete-reply" data-scope="' + esc(scope) + '" data-product="' +
@@ -10207,7 +10580,6 @@ function faqLibraryPageHtml() {
       document.querySelector("#sales-reply-intent").value = "";
       document.querySelector("#sales-reply-examples").value = "";
       document.querySelector("#sales-reply-approved").value = "";
-      document.querySelector("#sales-reply-followup").value = "";
       document.querySelector("#sales-reply-active").checked = true;
       setSalesScope(scope);
       document.querySelector("#sales-editor-title").textContent = scope === "product" ? "New Product Sales Reply" : "New General Sales Reply";
@@ -10229,7 +10601,6 @@ function faqLibraryPageHtml() {
       document.querySelector("#sales-reply-intent").value = reply.intent || "";
       document.querySelector("#sales-reply-examples").value = (reply.example_messages || []).join("\\n");
       document.querySelector("#sales-reply-approved").value = reply.approved_reply || "";
-      document.querySelector("#sales-reply-followup").value = reply.followup_prompt || "";
       document.querySelector("#sales-reply-active").checked = reply.active !== false;
       document.querySelector("#sales-editor-title").textContent = "Edit " + (scope === "product" ? "Product" : "General") + " Sales Reply";
       document.querySelector("#sales-save-state").textContent = "";
@@ -10257,7 +10628,6 @@ function faqLibraryPageHtml() {
         intent: document.querySelector("#sales-reply-intent").value,
         exampleMessages: document.querySelector("#sales-reply-examples").value.split(/\\r?\\n/),
         approvedReply: document.querySelector("#sales-reply-approved").value,
-        followupPrompt: document.querySelector("#sales-reply-followup").value,
         active: document.querySelector("#sales-reply-active").checked
       };
       try {
@@ -10431,9 +10801,6 @@ function salesRepliesPageHtml() {
           <label class="field wide" for="reply-approved">Approved Sales Reply
             <textarea class="reply" id="reply-approved" required></textarea>
           </label>
-          <label class="field wide" for="reply-followup">Optional Follow-Up Prompt
-            <textarea id="reply-followup" placeholder="Mau saya hold promo untuk kita dulu?"></textarea>
-          </label>
         </div>
         <div class="editor-actions">
           <label for="reply-active"><input id="reply-active" type="checkbox" checked /> Active</label>
@@ -10460,14 +10827,14 @@ function salesRepliesPageHtml() {
 
     function renderRows(records, scope, productId) {
       if (!records.length) return '<div class="empty">No sales replies yet.</div>';
-      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Follow-Up</th><th>Status</th><th></th></tr></thead><tbody>' +
+      return '<table><thead><tr><th>Objection</th><th>Intent</th><th>Examples</th><th>Approved Reply</th><th>Status</th><th></th></tr></thead><tbody>' +
         records.map(function(reply) {
           const examples = (reply.example_messages || []).map(esc).join('<br>');
           const status = reply.legacy_standard_reply
             ? '<span class="pill off">Legacy</span>'
             : reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
           return '<tr><td>' + esc(reply.objection_type) + '</td><td>' + esc(reply.intent || "") + '</td><td>' + examples +
-            '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td class="reply">' + esc(reply.followup_prompt || "") +
+            '</td><td class="reply">' + esc(reply.approved_reply) +
             '</td><td>' + status + '</td><td><button type="button" class="edit-reply" data-scope="' + esc(scope) +
             '" data-product="' + esc(productId || "") + '" data-id="' + esc(reply.id) + '">Edit</button> ' +
             '<button type="button" class="delete-reply" data-scope="' + esc(scope) + '" data-product="' +
@@ -10520,7 +10887,6 @@ function salesRepliesPageHtml() {
       document.querySelector("#reply-intent").value = "";
       document.querySelector("#reply-examples").value = "";
       document.querySelector("#reply-approved").value = "";
-      document.querySelector("#reply-followup").value = "";
       document.querySelector("#reply-active").checked = true;
       setScope(scope);
       document.querySelector("#editor-title").textContent = scope === "product" ? "New Product Sales Reply" : "New General Sales Reply";
@@ -10543,7 +10909,6 @@ function salesRepliesPageHtml() {
       document.querySelector("#reply-intent").value = reply.intent || "";
       document.querySelector("#reply-examples").value = (reply.example_messages || []).join("\\n");
       document.querySelector("#reply-approved").value = reply.approved_reply || "";
-      document.querySelector("#reply-followup").value = reply.followup_prompt || "";
       document.querySelector("#reply-active").checked = reply.active !== false;
       document.querySelector("#editor-title").textContent = "Edit " + (scope === "product" ? "Product" : "General") + " Sales Reply";
       document.querySelector("#save-state").textContent = "";
@@ -10572,7 +10937,6 @@ function salesRepliesPageHtml() {
         intent: document.querySelector("#reply-intent").value,
         exampleMessages: document.querySelector("#reply-examples").value.split(/\\r?\\n/),
         approvedReply: document.querySelector("#reply-approved").value,
-        followupPrompt: document.querySelector("#reply-followup").value,
         active: document.querySelector("#reply-active").checked
       };
       try {
@@ -10659,6 +11023,7 @@ function followupSettingsPageHtml() {
     h2 { margin:0; padding:12px 14px; font-size:16px; background:#fbfbfd; border-bottom:1px solid #e5e5ea; }
     section > .muted { margin:12px 14px; font-size:13px; }
     .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end; padding:14px; }
+    .settings-grid .wide { grid-column:1 / -1; }
     label { display:grid; gap:7px; font-size:13px; font-weight:700; }
     input, textarea, select { width:100%; border:1px solid #d2d2d7; border-radius:8px; padding:9px 10px; font:inherit; background:#fff; }
     input[type="checkbox"] { width:auto; }
@@ -10723,6 +11088,26 @@ function followupSettingsPageHtml() {
       <h2>Follow-Up Messages</h2>
       <p class="muted">Each stage can contain as many text, image, or video blocks as you need. Empty stages are disabled.</p>
       <div class="stage-grid" id="followup-stage-grid"></div>
+    </section>
+    <section>
+      <h2>Another Date Purchase Follow-Up</h2>
+      <p class="muted">For customers who say they will buy on another date. If no date is mentioned, this sends on the fallback day of month.</p>
+      <div class="settings-grid">
+        <label>
+          <span><input id="another-date-enabled" type="checkbox" /> Enable another-date purchase follow-up</span>
+        </label>
+        <label>Fallback Day of Month
+          <input id="another-date-fallback-day" type="number" min="1" max="31" />
+        </label>
+        <label>Send Hour
+          <input id="another-date-send-hour" type="number" min="0" max="23" />
+        </label>
+        <label class="wide">Message Content
+          <textarea id="another-date-message"></textarea>
+        </label>
+      </div>
+    </section>
+    <section>
       <div class="block-actions" style="margin-top:14px;">
         <button class="primary" id="save-followups" type="button">Save Follow-Up Settings</button>
         <span class="state" id="save-state"></span>
@@ -10746,6 +11131,7 @@ function followupSettingsPageHtml() {
       followupActiveWindowMinutes: ${JSON.stringify(Math.max(config.followupActiveWindowMinutes, 1))},
       followupPauseWindowMinutes: ${JSON.stringify(Math.max(config.followupPauseWindowMinutes, 0))}
     };
+    const defaultAnotherDatePurchaseFollowup = ${JSON.stringify(defaultAnotherDatePurchaseFollowupSettings())};
     let data = null;
     const mediaInput = document.createElement("input");
     mediaInput.type = "file";
@@ -10797,6 +11183,11 @@ function followupSettingsPageHtml() {
       const stages = Array.isArray(data.followupMessages) && data.followupMessages.length
         ? data.followupMessages
         : defaultFollowupStages;
+      const anotherDate = data.anotherDatePurchaseFollowup || defaultAnotherDatePurchaseFollowup;
+      document.querySelector("#another-date-enabled").checked = anotherDate.enabled !== false;
+      document.querySelector("#another-date-fallback-day").value = anotherDate.fallbackDayOfMonth || 20;
+      document.querySelector("#another-date-send-hour").value = anotherDate.sendHour ?? 20;
+      document.querySelector("#another-date-message").value = anotherDate.message || "";
       const first = stages.find(stage => stage.key === "first_day_followup") || {};
       document.querySelector("#first-cutoff-enabled").checked = first.firstChatCutoffEnabled !== false;
       document.querySelector("#first-cutoff-hour").value = first.firstChatCutoffHour ?? 19;
@@ -10916,7 +11307,14 @@ function followupSettingsPageHtml() {
             followupActiveWindowMinutes: document.querySelector("#followup-active-window-minutes").value,
             followupPauseWindowMinutes: document.querySelector("#followup-pause-window-minutes").value
           },
-          followups
+          followups,
+          anotherDatePurchaseFollowup: {
+            enabled: document.querySelector("#another-date-enabled").checked,
+            fallbackDayOfMonth: document.querySelector("#another-date-fallback-day").value,
+            sendHour: document.querySelector("#another-date-send-hour").value,
+            message: document.querySelector("#another-date-message").value,
+            messages: [{ id: "text_another_date_purchase_followup", type: "text", body: document.querySelector("#another-date-message").value }]
+          }
         });
         render();
         state.textContent = "Saved";
@@ -10937,7 +11335,7 @@ function followupSettingsPageHtml() {
         render();
         state.textContent = "";
       } catch (error) {
-        data = { settings: defaultFollowupSettings, followupMessages: defaultFollowupStages };
+        data = { settings: defaultFollowupSettings, followupMessages: defaultFollowupStages, anotherDatePurchaseFollowup: defaultAnotherDatePurchaseFollowup };
         render();
         state.textContent = "Could not load saved settings: " + (error.message || error);
       }

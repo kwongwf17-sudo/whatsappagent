@@ -11,7 +11,6 @@
         "Mahal sikit"
       ],
       "approved_reply": "Boleh kita, harga ani memang promo sudah ya. Kalau kita ready, saya boleh bantu lock harga promo ani dulu.",
-      "followup_prompt": "",
       "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
@@ -28,7 +27,6 @@
         "Nanti dulu"
       ],
       "approved_reply": "Boleh kita, no worries. Kalau ada apa-apa soalan sebelum decide, boleh tanya saja ya.",
-      "followup_prompt": "",
       "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
@@ -45,7 +43,6 @@
         "Budget belum cukup"
       ],
       "approved_reply": "Faham kita. Kalau tunggu payday, no worries ya. Bila kita ready nanti, boleh message kami semula.",
-      "followup_prompt": "",
       "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
@@ -62,7 +59,6 @@
         "Harga mahal"
       ],
       "approved_reply": "Faham kita. Harga ani memang ikut promo/package yang ada sekarang ya, supaya kita dapat value yang lebih berbaloi.",
-      "followup_prompt": "",
       "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
@@ -79,7 +75,22 @@
         "Not interested"
       ],
       "approved_reply": "Baik kita, no worries. Kalau berminat nanti, boleh message kami semula ya.",
-      "followup_prompt": "",
+      "repeat_action": "openai_acknowledge",
+      "active": true,
+      "scope": "business",
+      "productId": ""
+    },
+    {
+      "id": "sales_another_date_purchase",
+      "sales_intent": "another_date_purchase",
+      "objection_type": "Another date purchase",
+      "intent": "Customer plans to buy on another date, payday date, next month, or a future buying time.",
+      "example_messages": [
+        "25/7 baru beli",
+        "Tunggu gaji 25/7",
+        "Next month saya order"
+      ],
+      "approved_reply": "Noted kita. Saya save dulu niat kita untuk beli nanti ya. Nanti bila sampai masanya, saya follow up semula.",
       "repeat_action": "openai_acknowledge",
       "active": true,
       "scope": "business",
