@@ -6739,7 +6739,7 @@ function productFlowEditorData(product, options = {}) {
     orderOptions: orderOptionsForEditor(product),
     orderForm: orderFormForEditor(product),
     orderClosingMessages: orderClosingMessagesForEditor(product),
-    salesPrompt: String(product.sales_prompt ?? product.package_question ?? ""),
+    salesPrompt: String(product.sales_prompt ?? ""),
     salesPromptFrequency: normalizeSalesPromptFrequency(product.sales_prompt_frequency),
     approvedFaqs: approvedProductFaqsForEditor(product),
     extractedKnowledge: productKnowledgeForEditor(product),
@@ -6907,7 +6907,6 @@ function updateProductFlowText(product, body) {
   );
   const hasBlockUpdate = Object.prototype.hasOwnProperty.call(body, "openingFlowBlocks");
   if (hasFlowTextUpdate) {
-    product.package_question = String(body.packageQuestion ?? current.packageQuestion ?? "");
     const next = {
       ...current,
       ...Object.fromEntries(
