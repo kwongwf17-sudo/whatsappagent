@@ -165,11 +165,6 @@ async function generateVectorKnowledgeFiles(outputDir, accountId = "") {
     renderProductImageKnowledge(content.catalog),
     "utf8"
   );
-  await writeFile(
-    path.join(outputDir, "sales-replies.md"),
-    renderSalesReplyKnowledge(content.salesReplyLibrary),
-    "utf8"
-  );
 }
 
 async function loadVectorKnowledgeContent(accountId = "") {
@@ -261,56 +256,6 @@ function renderProductImageKnowledge(catalog = {}) {
     "",
     ...sections,
   ].join("\n");
-}
-
-function renderSalesReplyKnowledge(salesReplyLibrary = {}) {
-  const replies = (salesReplyLibrary.sales_replies || [])
-    .filter((reply) => reply && reply.active !== false && (reply.scope || "business") !== "product");
-  return [
-    "# Vector Store Knowledge: Approved Sales Replies",
-    "",
-    "Use these records only to select an approved sales reply for customer objections, hesitation, concerns, or sales-related responses.",
-    "Never use this file to answer factual FAQ or product knowledge questions.",
-    "The application sends the saved approved reply; the model must return only the matching SALES_REPLY_ID.",
-    "",
-    ...replies.map(renderSalesReplyRecord),
-  ].join("\n");
-}
-
-function renderSalesReplyRecord(reply) {
-  const approvedReply = reply.approved_reply || "";
-  const bruneiMalayReply = reply.brunei_malay_approved_reply || approvedReply;
-  const bruneiMalaySearchText = renderBruneiMalaySalesSearchText(reply, bruneiMalayReply);
-  return [
-    `### Sales Reply: ${reply.id || reply.objection_type || "unnamed"}`,
-    "Scope: general",
-    `Sales Reply ID: ${reply.id || ""}`,
-    reply.sales_intent ? `Sales intent: ${reply.sales_intent}` : "",
-    reply.repeat_action ? `Repeat action: ${reply.repeat_action}` : "",
-    reply.objection_type ? `Objection type: ${reply.objection_type}` : "",
-    reply.intent ? `Intent: ${reply.intent}` : "",
-    ...(reply.example_messages || []).map((message) => `Customer sales example: ${message}`),
-    `Approved sales reply: ${approvedReply}`,
-    bruneiMalayReply ? `Brunei Malay approved sales reply: ${bruneiMalayReply}` : "",
-    bruneiMalaySearchText ? `Brunei Malay sales search text: ${bruneiMalaySearchText}` : "",
-    "",
-  ].filter(Boolean).join("\n");
-}
-
-function renderBruneiMalaySalesSearchText(reply, approvedReply) {
-  return [
-    ...(reply.brunei_malay_example_messages || []),
-    ...(reply.example_messages || []),
-    reply.sales_intent || "",
-    reply.brunei_malay_objection_type || "",
-    reply.objection_type || "",
-    reply.brunei_malay_intent || "",
-    reply.intent || "",
-    approvedReply || "",
-  ]
-    .map((item) => String(item || "").trim())
-    .filter(Boolean)
-    .join(" | ");
 }
 
 function renderFaqRecord(faq, { scope, product = {} } = {}) {

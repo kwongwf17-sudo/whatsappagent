@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildConversationPlan,
   classifyFaqSalesPromptResponse,
+  approvedFaqRecordsForProduct,
   extractOrderDetails,
   findApprovedFaqLocalMatch,
   findProduct,
@@ -15,6 +16,7 @@ import {
   isGeneralBusinessQuestion,
   isProductNameMessage,
   findSalesReplyExactMatch,
+  normalizeCustomerMessage,
   salesReplyRecordsForProduct,
   formatStockArrivalMessage,
   textMessage,
@@ -22,13 +24,16 @@ import {
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
+  classifyCustomerMessageRoute,
   createCustomerServiceResponse,
   createComplaintHandoffReply,
   createSalesIntentRepeatReply,
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
-  selectSalesReplyFromVectorStore,
+  rerankKnowledgeRecords,
+  searchVectorStore,
+  selectSalesReply,
 } from "./lib/openai.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
@@ -50,7 +55,6 @@ import {
   complaintCategoryDisplay,
   detectObviousComplaint,
 } from "./lib/complaints.mjs";
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 await loadEnvFile(path.join(__dirname, ".env"));
@@ -120,7 +124,6 @@ const config = {
   messageMergeBufferMs: Number(getEnv("MESSAGE_MERGE_BUFFER_MS", "10000")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
-  noReplyAlertMinutes: Number(getEnv("NO_REPLY_ALERT_MINUTES", "2")),
   adminPassword: getEnv("ADMIN_PASSWORD", "admin123"),
   adminSessionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "demo_session_secret")),
   superAdminPassword: usableSecretEnv("SUPER_ADMIN_PASSWORD"),
@@ -1115,51 +1118,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    if (req.method === "POST" && url.pathname === "/admin/no-reply/handoff") {
-      const body = await readJsonBody(req);
-      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      const customerId = String(body.customerId || "");
-      const customer = (await store.listCustomers()).find(
-        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
-      );
-      if (!customer) return sendJson(res, 404, { error: "Customer not found." });
-      const updated = await store.updateCustomer(customerId, () => ({
-        handoffStatus: "human_required",
-        handoffReason: "Customer message has no AI reply. Manual reply required.",
-      }), adminSession.accountId);
-      await store.appendAuditLog({
-        actor: `admin:${adminSession.accountId}`,
-        action: "no_reply_sent_to_handoff",
-        customerId,
-        result: "manual_reply_required",
-      });
-      return sendJson(res, 200, { customer: updated });
-    }
-
-    if (req.method === "POST" && url.pathname === "/admin/no-reply/resolve") {
-      const body = await readJsonBody(req);
-      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      const customerId = String(body.customerId || "");
-      const inboundMessageId = String(body.inboundMessageId || "");
-      const customer = (await store.listCustomers()).find(
-        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
-      );
-      if (!customer || !inboundMessageId) return sendJson(res, 404, { error: "No-reply item not found." });
-      const review = await operations.resolveNoReply({
-        businessAccountId: adminSession.accountId,
-        customerId,
-        inboundMessageId,
-        actor: `admin:${adminSession.accountId}`,
-      });
-      await store.appendAuditLog({
-        actor: `admin:${adminSession.accountId}`,
-        action: "no_reply_resolved",
-        customerId,
-        result: inboundMessageId,
-      });
-      return sendJson(res, 200, { review });
-    }
-
     if (req.method === "GET" && url.pathname === "/admin/product-flow") {
       return sendHtml(res, 200, productFlowPageHtml());
     }
@@ -1633,7 +1591,7 @@ if (!config.skipHttpServer && webTransportManager) {
           return;
         }
         if (!message.text && message.mediaType) {
-          await recordInboundMediaNoReply({
+          await recordInboundMediaHandoff({
             id: message.id,
             from: message.from,
             mediaType: message.mediaType,
@@ -1739,7 +1697,7 @@ async function handleWebhookPayload(rawBody) {
       const businessAccountId = await businessAccountIdForPhoneNumber(message.phoneNumberId);
       const text = getMessageText(message);
       if (!text) {
-        await recordInboundMediaNoReply({
+        await recordInboundMediaHandoff({
           id: message.id,
           from: message.from,
           mediaType: inboundWebhookMediaType(message),
@@ -1889,7 +1847,7 @@ function inboundMediaPlaceholder(mediaType = "media") {
   return "[Customer sent a media message]";
 }
 
-async function recordInboundMediaNoReply({
+async function recordInboundMediaHandoff({
   id = "",
   from,
   mediaType = "media",
@@ -1905,7 +1863,7 @@ async function recordInboundMediaNoReply({
       messages: [],
     };
   }
-  console.log(`Incoming WhatsApp ${normalizedMediaType} message from ${from}; recorded for no-reply review.`);
+  console.log(`Incoming WhatsApp ${normalizedMediaType} message from ${from}; routed to handoff.`);
   await store.appendOutbox({
     ...(id ? { id } : {}),
     direction: "inbound",
@@ -1925,10 +1883,12 @@ async function recordInboundMediaNoReply({
     businessAccountId,
     source,
     ...contactPatch,
+    handoffStatus: "human_required",
+    handoffReason: `Customer sent ${normalizedMediaType}; manual reply required.`,
   });
   await store.appendAuditLog({
     actor: "ai_agent",
-    action: "media_message_no_reply",
+    action: "media_message_handoff",
     customerId: from,
     businessAccountId,
     result: normalizedMediaType,
@@ -2009,7 +1969,17 @@ async function processInboundMessage({
     ? sourceMatchedProduct
     : await recentProductContextMatch(from, businessAccountId, teamCatalog, source);
   const bufferProduct = findProduct(teamCatalog, text, source, customer.productId);
-  if (!skipOrderDetailBuffer && shouldBufferIncompleteOrderDetails(customer, text, bufferProduct)) {
+  const explicitTextMatchedProduct = findProductMatch(teamCatalog, text, {});
+  const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, {}, "");
+  const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
+  const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
+  const shouldPrioritizeOpeningFlow =
+    !customer.pendingOrder &&
+    (
+      isProductNameOnlyOpening ||
+      (contextMatchedProduct && (Number(customer.inboundCount || 0) <= 1 || contextStartsNewProductJourney))
+    );
+  if (!shouldPrioritizeOpeningFlow && !skipOrderDetailBuffer && shouldBufferIncompleteOrderDetails(customer, text, bufferProduct)) {
     return bufferIncompleteOrderDetails({
       id,
       from,
@@ -2046,10 +2016,6 @@ async function processInboundMessage({
 
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
   const optOutIntent = detectOptOutIntent(text);
-  const explicitTextMatchedProduct = findProductMatch(teamCatalog, text, {});
-  const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, {}, "");
-  const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
-  const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
   if (!customer.pendingOrder && !isProductNameOnlyOpening && contextMatchedProduct && (Number(customer.inboundCount || 0) <= 1 || contextStartsNewProductJourney)) {
     const messageSource = {
       ...source,
@@ -2074,6 +2040,9 @@ async function processInboundMessage({
       ...newProductJourneyPatch(customer, contextMatchedProduct),
       ...(plan.customerPatch || {}),
       productId: contextMatchedProduct.id,
+      conversationState: "opening_flow_sent",
+      openingFlowSentAt: new Date().toISOString(),
+      openingFlowProductId: contextMatchedProduct.id,
       complaintCaseId: "",
       complaintStatus: "",
       complaintCategory: "",
@@ -2116,6 +2085,9 @@ async function processInboundMessage({
     const updatedCustomer = await store.updateCustomer(from, () => ({
       ...newProductJourneyPatch(customer, textMatchedProduct),
       ...(plan.customerPatch || {}),
+      conversationState: "opening_flow_sent",
+      openingFlowSentAt: new Date().toISOString(),
+      openingFlowProductId: textMatchedProduct.id,
       complaintCaseId: "",
       complaintStatus: "",
       complaintCategory: "",
@@ -2201,15 +2173,30 @@ async function processInboundMessage({
     };
   }
 
+  const routedProduct = shouldStartNewProductJourney(customer, explicitTextMatchedProduct)
+    ? explicitTextMatchedProduct
+    : findProduct(teamCatalog, text, source, customer.productId);
+  const routeClassification = await maybeClassifyCustomerMessageRoute({
+    customerMessage: text,
+    customerId: from,
+    product: routedProduct,
+    catalog: teamCatalog,
+    faqLibrary: teamFaqLibrary,
+    salesReplyLibrary: teamSalesReplyLibrary,
+    conversationContext,
+    businessAccountId: knowledgeAccountId,
+  });
+
   const initialAdOpening =
     Boolean(source.sourceUrl || source.adId || source.referralHeadline) ||
     /\b(berminat|interested|saya berminat|mau info|nak info)\b/i.test(text);
   const obviousComplaint = detectObviousComplaint(text);
+  const classifiedComplaint = routeClassification?.messageType === "complaint" && routeClassification.confidence !== "low";
   const complaintIntent = faqSalesResponse || (initialAdOpening && !obviousComplaint)
     ? null
-    : obviousComplaint || await maybeDetectComplaintIntent(text, businessAccountId);
+    : obviousComplaint || (classifiedComplaint ? await maybeDetectComplaintIntent(text, businessAccountId) : null) || (routeAllowsFallback(routeClassification) ? await maybeDetectComplaintIntent(text, businessAccountId) : null);
   if (complaintIntent) {
-    const product = findProduct(teamCatalog, text, source, customer.productId);
+    const product = routedProduct;
     const complaint = await store.addComplaintCase({
       businessAccountId,
       customerId: from,
@@ -2294,7 +2281,8 @@ async function processInboundMessage({
     };
   }
 
-  if (!faqSalesResponse && !initialAdOpening && await maybeDetectOrderStatusIntent(text, businessAccountId)) {
+  const classifiedOrderStatus = routeClassification?.messageType === "order_status" && routeClassification.confidence !== "low";
+  if (!faqSalesResponse && !initialAdOpening && (classifiedOrderStatus || (routeAllowsFallback(routeClassification) && await maybeDetectOrderStatusIntent(text, businessAccountId)))) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
     const statusReplies = await store.getOrderStatusReplies(businessAccountId);
     const outbound = [textMessage(customerOrderStatusReply(latestOrder, statusReplies))];
@@ -2325,19 +2313,23 @@ async function processInboundMessage({
     };
   }
 
-  const product = shouldStartNewProductJourney(customer, explicitTextMatchedProduct)
-    ? explicitTextMatchedProduct
-    : findProduct(teamCatalog, text, source, customer.productId);
+  const product = routedProduct;
   const productNameOpening = isProductNameMessage(product, text);
   const messageSource = productNameOpening ? { ...source, productNameMatch: true } : source;
   const fixedOpeningFlow = usesFixedOpeningFlow(customer, text, messageSource);
+  const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
+  const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
+  const classifiedKnowledgeRoute =
+    routeClassification?.confidence !== "low" &&
+    ["general_faq", "product_question"].includes(routeClassification?.messageType);
   const exactSalesReply = fixedOpeningFlow || faqSalesResponse
     ? null
-    : findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary });
-  const vectorSalesReply = fixedOpeningFlow || faqSalesResponse || exactSalesReply
+    : (allowSalesReplyRoute ? findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary }) : null);
+  const vectorSalesReply = fixedOpeningFlow || faqSalesResponse || exactSalesReply || !allowSalesReplyRoute
     ? null
     : await maybeSelectApprovedSalesReply({
         customerMessage: text,
+        routeClassification,
         product,
         catalog: teamCatalog,
         salesReplyLibrary: teamSalesReplyLibrary,
@@ -2346,9 +2338,15 @@ async function processInboundMessage({
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
   const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || selectedSalesReply
     ? null
-    : findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext });
-  const approvedFaqMatch = null;
-      const salesReplyMatch = selectedSalesReply
+    : (allowKnowledgeRoute && !classifiedKnowledgeRoute ? findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext }) : null);
+  const approvedFaqMatch = exactApprovedFaq
+    ? {
+        faqId: exactApprovedFaq.id,
+        topic: exactApprovedFaq.topic || "",
+        approvedReply: exactApprovedFaq.approved_reply || exactApprovedFaq.answer || "",
+      }
+    : null;
+  const salesReplyMatch = selectedSalesReply
     ? {
         salesReplyId: selectedSalesReply.id,
         salesIntent: selectedSalesReply.sales_intent || selectedSalesReply.objection_type || "",
@@ -2358,11 +2356,14 @@ async function processInboundMessage({
         repeatAction: selectedSalesReply.repeat_action,
       }
     : null;
-  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || selectedSalesReply
+  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || selectedSalesReply || !allowKnowledgeRoute
     ? null
     : await maybeCreateApprovedKnowledgeRagAnswer({
         customerMessage: text,
         customerId: from,
+        routeClassification,
+        catalog: teamCatalog,
+        faqLibrary: teamFaqLibrary,
         product,
         businessAccountId: knowledgeAccountId,
       });
@@ -2385,6 +2386,7 @@ async function processInboundMessage({
     approvedFaqMatch,
     salesReplyMatch,
     ragAnswer,
+    routeClassification,
     conversationContext,
   });
 
@@ -2439,6 +2441,13 @@ async function processInboundMessage({
     ...(plan.customerPatch || {}),
     ...anotherDatePatch,
     ...repeatPatch,
+    ...(fixedOpeningFlow
+      ? {
+          conversationState: "opening_flow_sent",
+          openingFlowSentAt: new Date().toISOString(),
+          openingFlowProductId: product?.id || "",
+        }
+      : {}),
   }), businessAccountId);
   let order = null;
   if (plan.order) {
@@ -2513,30 +2522,29 @@ async function maybeSelectApprovedSalesReply({
 }) {
   const apiKey = await openAiApiKeyForAccount(businessAccountId);
   if (!apiKey) return null;
-  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
-  if (!vectorStoreId) return null;
   const model = await openAiModelForAccount(businessAccountId);
+  const records = salesReplyRecordsForProduct(activeCatalog, product, {
+    salesReplyLibrary: activeSalesReplyLibrary,
+  }).filter((reply) =>
+    reply.active !== false &&
+    SALES_INTENT_LABELS.has(String(reply.sales_intent || "").trim())
+  );
+  if (!records.length) return null;
   try {
-    const selected = await selectSalesReplyFromVectorStore({
+    const selected = await selectSalesReply({
       apiKey,
       model,
-      vectorStoreId,
       customerMessage,
-      productName: product.name,
+      normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
+      productName: product?.name || "",
+      salesReplyRecords: records,
     });
     if (!selected?.salesReplyId) return null;
-    const records = salesReplyRecordsForProduct(activeCatalog, product, {
-      salesReplyLibrary: activeSalesReplyLibrary,
-    });
-    const record = records.find((reply) =>
-      reply.id === selected.salesReplyId &&
-      reply.active !== false &&
-      SALES_INTENT_LABELS.has(String(reply.sales_intent || "").trim())
-    );
+    const record = records.find((reply) => reply.id === selected.salesReplyId);
     if (!record) return null;
     return record;
   } catch (error) {
-    await recordSystemError("sales_reply_vector_selection", error, `Customer message: ${customerMessage}`, businessAccountId);
+    await recordSystemError("sales_reply_intent_selection", error, `Customer message: ${customerMessage}`, businessAccountId);
     return null;
   }
 }
@@ -2617,13 +2625,132 @@ async function maybeCreateSalesIntentRepeatReply({
   }
 }
 
-async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customerId, product, businessAccountId = config.accountId }) {
+async function maybeClassifyCustomerMessageRoute({
+  customerMessage,
+  customerId,
+  product,
+  catalog: activeCatalog,
+  faqLibrary: activeFaqLibrary,
+  salesReplyLibrary: activeSalesReplyLibrary,
+  conversationContext = [],
+  businessAccountId = config.accountId,
+}) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return null;
+  try {
+    const model = await openAiModelForAccount(businessAccountId);
+    const faqTopics = faqTopicOptionsForClassifier(activeCatalog, product, activeFaqLibrary);
+    const salesIntents = salesIntentOptionsForClassifier(activeCatalog, product, activeSalesReplyLibrary);
+    const route = await classifyCustomerMessageRoute({
+      apiKey,
+      model,
+      customerMessage,
+      normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
+      productName: product?.name || "",
+      conversationContext,
+      faqTopics,
+      salesIntents,
+    });
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "message_route_classified",
+      customerId,
+      result: `${route.messageType}:${route.primaryIntent || "none"}:${route.confidence}`,
+      businessAccountId,
+    });
+    return route;
+  } catch (error) {
+    await recordSystemError("message_route_classifier", error, `Customer message: ${customerMessage}`, businessAccountId);
+    return null;
+  }
+}
+
+function routeAllowsFallback(route) {
+  return !route || route.confidence === "low" || route.messageType === "unknown";
+}
+
+function routeAllowsSalesReply(route) {
+  return routeAllowsFallback(route) || route.messageType === "sales_reply";
+}
+
+function routeAllowsKnowledgeAnswer(route) {
+  return routeAllowsFallback(route) || ["general_faq", "product_question"].includes(route.messageType);
+}
+
+function faqTopicOptionsForClassifier(activeCatalog, product, activeFaqLibrary) {
+  return approvedFaqRecordsForProduct(activeCatalog, product, {
+    faqLibrary: activeFaqLibrary,
+    includeGeneral: true,
+  })
+    .filter((faq) => faq.active !== false)
+    .map((faq) => ({
+      id: stableFaqTopicId(faq),
+      label: faq.topic || faq.brunei_malay_topic || faq.id || "",
+      scope: faq.scope || "",
+    }));
+}
+
+function salesIntentOptionsForClassifier(activeCatalog, product, activeSalesReplyLibrary) {
+  const seen = new Set();
+  return salesReplyRecordsForProduct(activeCatalog, product, {
+    salesReplyLibrary: activeSalesReplyLibrary,
+  })
+    .filter((reply) => reply.active !== false && String(reply.sales_intent || "").trim())
+    .map((reply) => ({
+      id: String(reply.sales_intent || "").trim(),
+      label: reply.objection_type || reply.intent || reply.sales_intent || "",
+    }))
+    .filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+}
+
+function stableFaqTopicId(faq) {
+  return String(faq?.topic_key || faq?.topicKey || faq?.id || "").trim();
+}
+
+async function maybeCreateApprovedKnowledgeRagAnswer({
+  customerMessage,
+  customerId,
+  routeClassification = null,
+  catalog: activeCatalog,
+  faqLibrary: activeFaqLibrary,
+  product,
+  businessAccountId = config.accountId,
+}) {
   const apiKey = await openAiApiKeyForAccount(businessAccountId);
   if (!apiKey) return null;
   const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
   if (!vectorStoreId) return null;
   const model = await openAiModelForAccount(businessAccountId);
   try {
+    const retrievalQuery = buildKnowledgeRetrievalQuery(customerMessage, product, routeClassification);
+    const topKnowledgeRecords = await retrieveAndRerankVectorStoreKnowledge({
+      apiKey,
+      model,
+      vectorStoreId,
+      customerMessage,
+      retrievalQuery,
+      routeClassification,
+      product,
+      businessAccountId,
+    });
+    if (!topKnowledgeRecords.length) {
+      await recordSystemError(
+        "approved_knowledge_rag",
+        new Error("Vector-store search returned no approved knowledge"),
+        JSON.stringify({
+          productId: product?.id || "",
+          productName: product?.name || "",
+          customerMessage: String(customerMessage || "").slice(0, 500),
+          retrievalQuery,
+        }),
+        businessAccountId
+      );
+      return null;
+    }
     const answer = await createCustomerServiceResponse({
       apiKey,
       model,
@@ -2632,9 +2759,13 @@ async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customer
       supportLanguage: config.supportLanguage,
       customerId,
       customerMessage,
+      normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
+      retrievalQuery,
+      rerankedKnowledgeContext: formatRerankedKnowledgeContext(topKnowledgeRecords.slice(0, 1)),
       productName: product?.name || "",
       productId: product?.id || "",
-      maxResults: 8,
+      maxResults: 0,
+      useFileSearch: false,
     });
     const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
     if (!answer || !safeReply) {
@@ -2657,11 +2788,75 @@ async function maybeCreateApprovedKnowledgeRagAnswer({ customerMessage, customer
       ...answer,
       reply: safeReply,
       allowProductSpecific: true,
+      rerankedKnowledgeIds: topKnowledgeRecords.map((record) => record.id).filter(Boolean),
     };
   } catch (error) {
     await recordSystemError("approved_knowledge_rag", error, `Product: ${product?.id || ""}`, businessAccountId);
     return null;
   }
+}
+
+async function retrieveAndRerankVectorStoreKnowledge({
+  apiKey,
+  model,
+  vectorStoreId,
+  customerMessage,
+  retrievalQuery,
+  routeClassification,
+  product,
+  businessAccountId,
+}) {
+  const candidates = boostKnowledgeCandidates(
+    await searchVectorStore({
+      apiKey,
+      vectorStoreId,
+      query: retrievalQuery,
+      maxResults: 3,
+    }),
+    routeClassification
+  );
+  if (!candidates.length) return [];
+  try {
+    const reranked = await rerankKnowledgeRecords({
+      apiKey,
+      model,
+      customerMessage,
+      normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
+      route: routeClassification,
+      records: candidates,
+      topK: 3,
+    });
+    return reranked.length ? reranked : candidates.slice(0, 3);
+  } catch (error) {
+    await recordSystemError("approved_knowledge_rerank", error, `Product: ${product?.id || ""}`, businessAccountId);
+    return candidates.slice(0, 3);
+  }
+}
+
+function boostKnowledgeCandidates(records, routeClassification) {
+  const primaryIntent = String(routeClassification?.primaryIntent || "");
+  return records.map((record) => {
+    let score = Number(record.retrieval_score || 0);
+    if (primaryIntent && (record.id === primaryIntent || stableFaqTopicId(record) === primaryIntent)) score += 0.2;
+    if (routeClassification?.messageType === "general_faq" && record.knowledge_type === "general_faq") score += 0.1;
+    if (routeClassification?.messageType === "product_question" && record.knowledge_type !== "general_faq") score += 0.1;
+    return { ...record, retrieval_score: score };
+  });
+}
+
+function formatRerankedKnowledgeContext(records = []) {
+  return records.slice(0, 3).map((record, index) => [
+    `Candidate #${index + 1}`,
+    `ID: ${record.id || ""}`,
+    `Type: ${record.knowledge_type || record.scope || record.kind || ""}`,
+    `Topic/category: ${record.topic || record.category || record.title || ""}`,
+    `Approved answer: ${record.approved_reply || record.brunei_malay_approved_reply || record.value || ""}`,
+    `Examples: ${(record.example_questions || []).join(" | ")}`,
+    `Brunei-Malay examples: ${(record.brunei_malay_example_questions || []).join(" | ")}`,
+    `Summary: ${record.summary || record.brunei_malay_summary || ""}`,
+    `Vector-store chunk: ${String(record.text || "").slice(0, 1800)}`,
+    `Extracted/search text: ${[record.extracted_text, record.embedding_text, record.brunei_malay_search_text].filter(Boolean).join(" | ").slice(0, 1000)}`,
+  ].filter((line) => !/:\s*$/.test(line)).join("\n")).join("\n\n");
 }
 
 function sanitizeProductKnowledgeReply(reply) {
@@ -2673,6 +2868,18 @@ function sanitizeProductKnowledgeReply(reply) {
     .filter((sentence) => !/\bblackheads?\s*out\s*in\s*5\s*minutes?\b/i.test(sentence))
     .join(" ")
     .trim();
+}
+
+function buildKnowledgeRetrievalQuery(customerMessage, product = null, routeClassification = null) {
+  const normalized = normalizeCustomerMessage(customerMessage);
+  const productName = String(product?.name || "").trim();
+  const sku = String(product?.sku || product?.skuCode || product?.productCode || "").trim();
+  const intent = String(routeClassification?.primaryIntent || "").trim();
+  const messageType = String(routeClassification?.messageType || "").trim();
+  return [productName, sku, messageType, intent, normalized || customerMessage]
+    .filter(Boolean)
+    .join(" | ")
+    .slice(0, 800);
 }
 
 function orderSubmittedCustomerMessages(product) {
@@ -2953,6 +3160,7 @@ async function getDueFollowupsForTeams(now = new Date()) {
     const teamCatalog = teamContent.catalog;
     const product = teamCatalog.products.find((item) => item.id === customer.productId);
     if (!product) continue;
+    if (customer.handoffStatus === "human_required") continue;
     const anotherDateItem = anotherDatePurchaseFollowupItem(customer, product, teamContent, now);
     if (anotherDateItem) {
       due.push(anotherDateItem);
@@ -3023,10 +3231,10 @@ async function dispatchFollowupQueue(now = new Date()) {
       message: item.message,
     };
     const specialAnotherDateFollowup = item.followupKey === "another_date_purchase_followup";
-    if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || (customer.followupBlocked && !specialAnotherDateFollowup)) {
+    if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.handoffStatus === "human_required" || (customer.followupBlocked && !specialAnotherDateFollowup)) {
       await operations.updateFollowupDispatch(item.id, {
         status: "cancelled",
-        lastError: !customer ? "Customer no longer exists." : "Customer ordered or opted out before send.",
+        lastError: !customer ? "Customer no longer exists." : "Customer no longer eligible for follow-up.",
       });
       result.cancelled.push(sentItem);
       continue;
@@ -3693,7 +3901,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allDeletedCustomers,
     allOrders,
     allOutbox,
-    noReplyReviews,
     systemState,
     allFollowupQueue,
     orderStatusReplies,
@@ -3703,7 +3910,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     store.listDeletedCustomers(businessAccountId),
     store.listOrders(businessAccountId),
     store.listOutbox(businessAccountId),
-    operations.listNoReplyReviews(businessAccountId),
     operations.getState(),
     operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
@@ -3748,14 +3954,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     return customerPhone(customerId, order);
   };
   const guardrails = buildGuardrailSummary(customers, now);
-  const noReplyAlerts = buildNoReplyRows(
-    customers,
-    outbox,
-    productById,
-    noReplyReviews,
-    now,
-    systemState.noReplyMonitorStartedAt
-  );
   const followupRows = buildFollowupRows(customers, productById, now, followupQueue);
   const pendingFollowupDispatches = followupQueue.filter((item) =>
     ["queued", "processing", "retry_pending"].includes(item.status)
@@ -3843,7 +4041,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       outbox: outbox.length,
       optedOut: guardrails.optedOut,
       blockedFollowups: guardrails.blockedFollowups,
-      noReplyAlerts: noReplyAlerts.length,
     },
     analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
     profile: normalizeDashboardProfile(systemState.dashboardProfile),
@@ -3865,7 +4062,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     })),
     customers: customerRows,
     anotherDatePurchaseCustomers,
-    noReplyAlerts,
     handoffQueue,
     orders: orders.map((order) => ({
       id: order.id,
@@ -3933,43 +4129,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       .slice(0, 200)
       .map(formatDashboardMessage),
   };
-}
-
-function buildNoReplyRows(customers, outbox, productById, reviews = [], now = new Date(), monitoringStartedAt = "") {
-  const resolvedKeys = new Set(
-    reviews.filter((review) => review.status === "resolved").map((review) => `${review.customerId}:${review.inboundMessageId}`)
-  );
-  const thresholdMs = Math.max(Number(config.noReplyAlertMinutes || 2), 1) * 60 * 1000;
-  return customers.flatMap((customer) => {
-    const messages = outbox
-      .filter((message) => message.from === customer.id || message.to === customer.id)
-      .slice()
-      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
-    const latestInbound = messages.slice().reverse().find((message) => message.direction === "inbound");
-    if (!latestInbound || resolvedKeys.has(`${customer.id}:${latestInbound.id}`)) return [];
-    if (monitoringStartedAt && String(latestInbound.createdAt) < String(monitoringStartedAt)) return [];
-    const hasReply = messages.some(
-      (message) =>
-        message.direction === "outbound" &&
-        message.channel !== "admin" &&
-        message.to === customer.id &&
-        String(message.createdAt) > String(latestInbound.createdAt)
-    );
-    if (hasReply) return [];
-    const waitedMs = now.getTime() - new Date(latestInbound.createdAt).getTime();
-    if (!Number.isFinite(waitedMs) || waitedMs < thresholdMs) return [];
-    return [{
-      customerId: customer.id,
-      inboundMessageId: latestInbound.id,
-      product: productById.get(customer.productId)?.name || customer.productId || "",
-      labelDisplay: customer.labelDisplay || "",
-      receivedAt: latestInbound.createdAt || "",
-      waitingMinutes: Math.max(1, Math.floor(waitedMs / (60 * 1000))),
-      customerMessage: latestInbound.body || latestInbound.caption || "",
-      reason: customer.handoffReason || "No recorded AI reply after this customer message.",
-      handoffStatus: customer.handoffStatus || "",
-    }];
-  }).sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)));
 }
 
 async function buildComplianceData() {
@@ -4097,6 +4256,7 @@ function guardrailDisplay(customer, now = new Date()) {
   if (!status.blocked) return "ok";
   if (status.reason === "opted_out") return "opted out: no follow-up";
   if (status.reason === "complaint_handoff") return "complaint: human required";
+  if (status.reason === "human_handoff") return "human handoff: no follow-up";
   if (status.reason === "outside_24_hour_window") return "template follow-up required";
   if (status.reason === "order_submitted") return "order submitted";
   if (customer.followupBlockedReason === "another_date_purchase") return "another date purchase";
@@ -4109,6 +4269,7 @@ function followupGuardrailStatus(customer, now = new Date()) {
   if (customer.complaintStatus === "open" || customer.followupBlockedReason === "complaint_handoff") {
     return { blocked: true, reason: "complaint_handoff" };
   }
+  if (customer.handoffStatus === "human_required") return { blocked: true, reason: "human_handoff" };
   if (customer.followupBlocked) return { blocked: true, reason: "followup_blocked" };
   if (!isWithinCustomerServiceWindow(customer, now)) return { blocked: false, reason: "outside_24_hour_window" };
   return { blocked: false, reason: "ok" };
@@ -4140,6 +4301,9 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
     const guardrail = followupGuardrailStatus(customer, now);
     if (hasOrder) status = "skipped order";
     if (guardrail.reason === "opted_out") status = "blocked: opted out";
+    if (guardrail.reason === "human_handoff") status = "blocked: human handoff";
+    if (guardrail.reason === "complaint_handoff") status = "blocked: complaint";
+    if (guardrail.reason === "followup_blocked") status = "blocked";
     if (guardrail.reason === "outside_24_hour_window") {
       status = status === "due" ? "due: send approved template" : `${status}: approved template`;
     }
@@ -5362,7 +5526,26 @@ function shouldBufferIncompleteOrderDetails(customer, text, product) {
   if (/[?？]\s*$/.test(body)) return false;
   if (/^(ada|berapa|can|boleh|do|does|is|are|kenapa|apa|macam mana|how|why|what)\b/i.test(body)) return false;
   const draft = extractOrderDetails(body, product);
-  return Boolean(draft.hasAnyDetails && !draft.isComplete);
+  return Boolean(draft.hasAnyDetails && !draft.isComplete && hasStrongPartialOrderEvidence(body, draft));
+}
+
+function hasStrongPartialOrderEvidence(text, draft = {}) {
+  const body = String(text || "").trim();
+  const normalized = body.toLowerCase();
+  if (!body) return false;
+  const hasLabelledOrderField = /\b(full\s*name|nama|name|full\s*address|alamat|address|phone\s*number|phone|contact|nombor|number|order\s*option|pilihan|package|pakej|paket|pkg)\s*[:：]/i.test(body);
+  if (hasLabelledOrderField) return true;
+  const phoneMatches = body.match(/\+?\d[\d\s-]{5,}\d/g) || [];
+  const hasLikelyPhone = phoneMatches.some((value) => value.replace(/\D/g, "").length >= 7);
+  const hasAddressCue = /\b(spg|simpang|jalan|jln|kg|kampung|rumah|house|no\.?|unit|block|blok|lot|mukim|bandar|kb|tutong|temburong|brunei|muara|mentiri|mumong)\b/i.test(body);
+  const hasClearOrderIntent = /\b(nak|mau|mahu|want|ambil|order|beli|buy|confirm|lock|proceed|jadi|book|booking)\b/i.test(body);
+  const hasExplicitOrderOption =
+    Boolean(draft.orderOptionId || draft.orderOptionChoice || draft.addOnChoice || draft.packageId) &&
+    /\b(package|pakej|paket|pkg|option|pilihan|order|ambil|mau|nak|beli|buy)\b/i.test(normalized);
+  if (hasLikelyPhone && (hasAddressCue || hasClearOrderIntent || hasExplicitOrderOption)) return true;
+  if (hasAddressCue && hasClearOrderIntent) return true;
+  if (hasExplicitOrderOption && hasClearOrderIntent) return true;
+  return false;
 }
 
 function bufferIncompleteOrderDetails(args, customer, product) {
@@ -6104,32 +6287,20 @@ async function recordSystemError(scope, error, details = "", accountId = config.
 }
 
 async function buildSystemManagementData() {
-  const [state, accounts, failedMessages, errors, audits, customers, outbox, noReplyReviews, followupQueue] = await Promise.all([
+  const [state, accounts, failedMessages, errors, audits, followupQueue] = await Promise.all([
     operations.getState(),
     adminAccounts.listAccounts(),
     operations.listFailedMessages(),
     operations.listErrors(),
     store.listAuditLog(),
-    store.listCustomers(),
-    store.listOutbox(),
-    operations.listNoReplyReviews(),
     operations.listFollowupQueue(),
   ]);
-  const productById = new Map(catalog.products.map((product) => [product.id, product]));
   return {
     state,
     accounts: accounts.filter((account) => account.role === "business_admin"),
     failedMessages,
     errors,
     audits: [...audits].reverse().slice(0, 100),
-    noReplyAlertCount: buildNoReplyRows(
-      customers,
-      outbox,
-      productById,
-      noReplyReviews,
-      new Date(),
-      state.noReplyMonitorStartedAt
-    ).length,
     queuedFollowupCount: followupQueue.filter((item) => ["queued", "processing", "retry_pending"].includes(item.status)).length,
   };
 }
@@ -6304,6 +6475,7 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
     : (existing.brunei_malay_example_questions || []);
   const saved = {
     id,
+    topic_key: String(body.topicKey || existing.topic_key || existing.topicKey || id).trim() || id,
     topic,
     example_questions: exampleQuestions,
     approved_reply: approvedReply,
@@ -8111,8 +8283,7 @@ function superAdminSystemHtml() {
         [fmt(data.state.lastUpdatedAt) || "-", "Last Update"],
         [pending, "Messages Need Retry"],
         [data.queuedFollowupCount || 0, "Followups Queued"],
-        [data.errors.length, "Recorded Errors"],
-        [data.noReplyAlertCount || 0, "No Reply Alerts"]
+        [data.errors.length, "Recorded Errors"]
       ];
       document.querySelector("#summary").innerHTML = figures.map(item =>
         '<div class="metric"><strong>' + esc(item[0]) + '</strong><span>' + esc(item[1]) + '</span></div>'
@@ -8655,7 +8826,6 @@ function adminDashboardHtml() {
       <button class="tab" type="button" data-tab="handoff">Handoff</button>
       <button class="tab" type="button" data-tab="orders">Orders</button>
       <button class="tab" type="button" data-tab="followups">Follow-ups</button>
-      <button class="tab" id="no-reply-tab" type="button" data-tab="no-reply">No Reply</button>
       <button class="tab" type="button" data-tab="deleted">Deleted</button>
     </div>
     <section id="customers" class="panel active">
@@ -8711,11 +8881,6 @@ function adminDashboardHtml() {
       <div class="subtabs" id="followup-label-tabs"></div>
       <div class="table-wrap"></div>
     </section>
-    <section id="no-reply" class="panel">
-      <h2>No Reply Monitor</h2>
-      <p class="note">Shows customer messages that have no recorded AI reply after ${escapeHtml(config.noReplyAlertMinutes)} minute(s). Send the case to Handoff for manual reply, or resolve it after staff have already replied.</p>
-      <div class="table-wrap"></div>
-    </section>
     <section id="deleted" class="panel"><h2>Deleted / Expired Customers</h2><div class="table-wrap"></div></section>
     <section id="profile" class="panel">
       <h2>Profile</h2>
@@ -8743,7 +8908,6 @@ function adminDashboardHtml() {
       handoff: document.querySelector("#handoff .table-wrap"),
       orders: document.querySelector("#orders .table-wrap"),
       followups: document.querySelector("#followups .table-wrap"),
-      noReply: document.querySelector("#no-reply .table-wrap"),
       deleted: document.querySelector("#deleted .table-wrap")
     };
     let dashboardData = null;
@@ -8844,10 +9008,6 @@ function adminDashboardHtml() {
       return rowsForDate(dashboardData ? dashboardData.followups : [], "nextDueAt");
     }
 
-    function dashboardNoReplyAlerts() {
-      return rowsForDate(dashboardData ? dashboardData.noReplyAlerts : [], "receivedAt");
-    }
-
     function dashboardDeletedCustomers() {
       return rowsForDate(dashboardData ? dashboardData.deletedCustomers : [], "deletedAt");
     }
@@ -8867,7 +9027,6 @@ function adminDashboardHtml() {
         followupsDue: followupRows.filter(row => /^due\b/i.test(row.status || "")).length,
         followupsQueued: followupRows.filter(row => row.queueStatus).length,
         deleted: rowsForDate(data.deletedCustomers || [], "deletedAt", selectedDate).length,
-        noReplyAlerts: rowsForDate(data.noReplyAlerts || [], "receivedAt", selectedDate).length,
       };
     }
 
@@ -8989,15 +9148,6 @@ function adminDashboardHtml() {
             const parts = String(item).split("::");
             await request("/admin/orders/reached-warehouse", { orderId: parts[0] || "" });
           }
-        } else if (actionKey === "no-reply-handoff") {
-          for (const customerId of ids) {
-            await request("/admin/no-reply/handoff", { customerId });
-          }
-        } else if (actionKey === "no-reply-resolve") {
-          for (const item of ids) {
-            const parts = item.split("::");
-            await request("/admin/no-reply/resolve", { customerId: parts[0] || "", inboundMessageId: parts[1] || "" });
-          }
         }
         clearBulkSelection(sectionKey);
         await loadDashboard();
@@ -9032,8 +9182,7 @@ function adminDashboardHtml() {
         ['Customers', stats.newCustomers],
         ['Handoff', stats.handoff],
         ['Complaints', stats.complaints],
-        ['Orders', stats.orders],
-        ['No Reply Alerts', stats.noReplyAlerts]
+        ['Orders', stats.orders]
       ];
       document.querySelector('#summary').innerHTML = summaryItems.map(item =>
         '<div class="metric"><strong>' + esc(item[1]) + '</strong><span>' + esc(item[0]) + '</span></div>'
@@ -9051,7 +9200,6 @@ function adminDashboardHtml() {
 
       renderFollowupLabelTabs(dashboardFollowups());
       renderFollowups();
-      renderNoReplyAlerts();
 
       sections.deleted.innerHTML = bulkTable("deleted", dashboardDeletedCustomers(), [
         { label: 'Customer', key: 'id' },
@@ -9408,43 +9556,7 @@ function adminDashboardHtml() {
         { value: stats.followupsDue, title: "Due" },
         { value: stats.followupsQueued, title: "Queued", soft: true }
       ]);
-      setTabLabel("no-reply", "No Reply", [{ value: stats.noReplyAlerts }]);
       setTabLabel("deleted", "Deleted", [{ value: stats.deleted }]);
-    }
-
-    function renderNoReplyAlerts() {
-      const rows = dashboardNoReplyAlerts();
-      if (!rows.length) {
-        sections.noReply.innerHTML = '<div class="empty">No unanswered customer messages waiting for review.</div>';
-        return;
-      }
-      sections.noReply.innerHTML = bulkTable("no-reply", rows, [
-        { label: 'Received', key: 'receivedAt', render: r => fmtTime(r.receivedAt) },
-        { label: 'Customer', key: 'customerId' },
-        { label: 'Product', key: 'product' },
-        { label: 'Waiting', key: 'waitingMinutes', render: r => pill(r.waitingMinutes + ' min') },
-        { label: 'Customer Message', key: 'customerMessage' },
-        { label: 'Reason', key: 'reason' },
-        { label: 'Action', key: 'customerId', render: r => '<div class="actions"><button type="button" data-no-reply-reply="' + esc(r.customerId) + '">Reply</button><button type="button" data-no-reply-handoff="' + esc(r.customerId) + '">Send to Handoff</button><button type="button" data-no-reply-resolve="' + esc(r.customerId) + '" data-message-id="' + esc(r.inboundMessageId) + '">Mark Resolved</button></div>' }
-      ], [
-        { key: "no-reply-handoff", label: "Send Selected to Handoff" },
-        { key: "no-reply-resolve", label: "Mark Selected Resolved" }
-      ], r => String(r.customerId || "") + "::" + String(r.inboundMessageId || ""));
-      bindBulkSelection("no-reply");
-      document.querySelectorAll("button[data-no-reply-reply]").forEach(button => button.addEventListener("click", () => {
-        window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.noReplyReply);
-      }));
-      document.querySelectorAll("button[data-no-reply-handoff]").forEach(button => button.addEventListener("click", async () => {
-        await request("/admin/no-reply/handoff", { customerId: button.dataset.noReplyHandoff });
-        loadDashboard();
-      }));
-      document.querySelectorAll("button[data-no-reply-resolve]").forEach(button => button.addEventListener("click", async () => {
-        await request("/admin/no-reply/resolve", {
-          customerId: button.dataset.noReplyResolve,
-          inboundMessageId: button.dataset.messageId
-        });
-        loadDashboard();
-      }));
     }
 
     function renderCustomerLabelTabs(customers) {
@@ -10002,8 +10114,8 @@ function replyLibraryPageHtml() {
     .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
     .field { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
     .field.wide { grid-column: 1 / -1; }
-    input, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
-    input:focus, textarea:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    input, textarea, select { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
+    input:focus, textarea:focus, select:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
     textarea { min-height: 88px; resize: vertical; line-height: 1.42; }
     textarea.reply { min-height: 118px; }
     .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
@@ -10042,7 +10154,8 @@ function replyLibraryPageHtml() {
       <form id="faq-form" class="editor">
         <input id="faq-id" type="hidden" />
         <div class="fields">
-          <label class="field wide" for="faq-topic">Topic <input id="faq-topic" required /></label>
+          <label class="field wide" for="faq-topic-key">FAQ Topic <select id="faq-topic-key"></select></label>
+          <label class="field wide" for="faq-topic">Display Label <input id="faq-topic" required /></label>
           <label class="field wide" for="faq-examples">Example Customer Questions <textarea id="faq-examples" required></textarea></label>
           <label class="field wide" for="faq-reply">Approved Reply <textarea class="reply" id="faq-reply" required></textarea></label>
         </div>
@@ -10094,6 +10207,11 @@ function replyLibraryPageHtml() {
     function renderSalesRepeatActionOptions(selected) {
       return salesRepeatActionOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
     }
+    function faqTopicKey(faq) { return faq.topic_key || faq.topicKey || faq.id || ""; }
+    function renderFaqTopicOptions(selected) {
+      const records = faqLibrary.general || [];
+      return '<option value="">New FAQ topic</option>' + records.map(faq => '<option value="' + esc(faqTopicKey(faq)) + '"' + (faqTopicKey(faq) === selected ? ' selected' : '') + '>' + esc(faq.topic || faq.id) + '</option>').join('');
+    }
     function renderFaqRows(records) {
       if (!records.length) return '<div class="empty">No general FAQs yet.</div>';
       return '<table><thead><tr><th>Topic</th><th>Example Questions</th><th>Approved Reply</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(faq => {
@@ -10112,6 +10230,7 @@ function replyLibraryPageHtml() {
       }).join('') + '</tbody></table>';
     }
     function renderFaq() {
+      document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(document.querySelector("#faq-topic-key").value);
       document.querySelector("#faq-list").innerHTML = renderFaqRows(faqLibrary.general || []);
       document.querySelectorAll(".edit-faq").forEach(button => button.addEventListener("click", () => editFaq(button.dataset.id)));
       document.querySelectorAll(".delete-faq").forEach(button => button.addEventListener("click", () => deleteFaq(button.dataset.id, button.dataset.topic)));
@@ -10123,11 +10242,11 @@ function replyLibraryPageHtml() {
       document.querySelectorAll(".delete-sales").forEach(button => button.addEventListener("click", () => deleteSales(button.dataset.id, button.dataset.label)));
     }
     function newFaq() {
-      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = "";
+      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(""); document.querySelector("#faq-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = "";
     }
     function editFaq(id) {
       const faq = (faqLibrary.general || []).find(item => item.id === id); if (!faq) return;
-      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic").value = faq.topic || ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = "";
+      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-topic").value = faq.topic || ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = "";
     }
     function newSales() {
       document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
@@ -10145,7 +10264,7 @@ function replyLibraryPageHtml() {
     async function saveFaq(event) {
       event.preventDefault(); const button = document.querySelector("#save-faq"); const state = document.querySelector("#faq-state"); button.disabled = true; state.textContent = "Saving...";
       try {
-        const response = await fetch("/admin/faq-library/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#faq-id").value, scope: "general", topic: document.querySelector("#faq-topic").value, exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#faq-reply").value, active: document.querySelector("#faq-active").checked }) });
+        const response = await fetch("/admin/faq-library/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#faq-id").value, scope: "general", topicKey: document.querySelector("#faq-topic-key").value, topic: document.querySelector("#faq-topic").value, exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#faq-reply").value, active: document.querySelector("#faq-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); faqLibrary = result.data; renderFaq(); editFaq(result.faq.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
@@ -12308,12 +12427,12 @@ function productFlowPageHtml() {
 
     async function syncVectorStore() {
       const button = document.querySelector("#sync-vector-store");
-      if (!confirm("Sync all approved FAQ, product image knowledge, and sales replies for this team to the same OpenAI vector store? This removes old attached files first, then uploads the latest files.")) {
+      if (!confirm("Sync approved general FAQ, product FAQ, and product image knowledge for this team to the same OpenAI vector store? This removes old attached files first, then uploads the latest files.")) {
         return;
       }
       button.disabled = true;
       document.querySelector("#vector-sync-status").textContent = "Syncing same team vector store...";
-      status("Syncing approved FAQ, product knowledge, and sales replies to OpenAI vector store...");
+      status("Syncing approved FAQ and product image knowledge to OpenAI vector store...");
       try {
         const response = await fetch("/admin/product-flow/knowledge/sync-vector-store", {
           method: "POST",
