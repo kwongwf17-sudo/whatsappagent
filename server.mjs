@@ -6469,11 +6469,6 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
   }
   const index = records.findIndex((faq) => faq.id === id);
   const existing = index >= 0 ? records[index] : {};
-  const bruneiMalayExampleQuestions = "bruneiMalayExampleQuestions" in body
-    ? (Array.isArray(body.bruneiMalayExampleQuestions)
-        ? body.bruneiMalayExampleQuestions.map((question) => String(question).trim()).filter(Boolean)
-        : String(body.bruneiMalayExampleQuestions || "").split(/\r?\n/).map((question) => question.trim()).filter(Boolean))
-    : (existing.brunei_malay_example_questions || []);
   const saved = {
     id,
     topic_key: String(body.topicKey || existing.topic_key || existing.topicKey || id).trim() || id,
@@ -6482,19 +6477,6 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
     approved_reply: approvedReply,
     active: body.active !== false,
   };
-  const bruneiMalayTopic = "bruneiMalayTopic" in body
-    ? String(body.bruneiMalayTopic || "").trim()
-    : String(existing.brunei_malay_topic || "");
-  const bruneiMalayApprovedReply = "bruneiMalayApprovedReply" in body
-    ? String(body.bruneiMalayApprovedReply || "").trim()
-    : String(existing.brunei_malay_approved_reply || "");
-  const bruneiMalaySearchText = "bruneiMalaySearchText" in body
-    ? String(body.bruneiMalaySearchText || "").trim()
-    : String(existing.brunei_malay_search_text || "");
-  if (bruneiMalayTopic) saved.brunei_malay_topic = bruneiMalayTopic;
-  if (bruneiMalayExampleQuestions.length) saved.brunei_malay_example_questions = bruneiMalayExampleQuestions;
-  if (bruneiMalayApprovedReply) saved.brunei_malay_approved_reply = bruneiMalayApprovedReply;
-  if (bruneiMalaySearchText) saved.brunei_malay_search_text = bruneiMalaySearchText;
   if (index >= 0) records[index] = saved;
   else records.push(saved);
   return { ...saved, scope, productId };
@@ -6842,18 +6824,12 @@ function approvedProductFaqsForEditor(product) {
     .filter((faq) => faq && faq.active !== false)
     .map((faq) => ({
       id: String(faq.id || ""),
-      topic: String(faq.topic || faq.brunei_malay_topic || ""),
-      bruneiMalayTopic: String(faq.brunei_malay_topic || ""),
+      topic: String(faq.topic || ""),
       exampleQuestions: [
         ...(Array.isArray(faq.example_questions) ? faq.example_questions : []),
         ...(Array.isArray(faq.customer_messages) ? faq.customer_messages : []),
       ].map((item) => String(item || "").trim()).filter(Boolean),
-      bruneiMalayExampleQuestions: (Array.isArray(faq.brunei_malay_example_questions) ? faq.brunei_malay_example_questions : [])
-        .map((item) => String(item || "").trim())
-        .filter(Boolean),
       approvedReply: String(faq.approved_reply || faq.answer || ""),
-      bruneiMalayApprovedReply: String(faq.brunei_malay_approved_reply || ""),
-      bruneiMalaySearchText: String(faq.brunei_malay_search_text || ""),
       active: faq.active !== false,
     }));
 }
@@ -11843,18 +11819,6 @@ function productFlowPageHtml() {
               <label class="field wide" for="product-faq-reply">Approved Reply
                 <textarea class="reply" id="product-faq-reply"></textarea>
               </label>
-              <label class="field wide" for="product-faq-bm-topic">Brunei-Malay Topic
-                <input id="product-faq-bm-topic" />
-              </label>
-              <label class="field wide" for="product-faq-bm-examples">Brunei-Malay Example Questions
-                <textarea id="product-faq-bm-examples"></textarea>
-              </label>
-              <label class="field wide" for="product-faq-bm-reply">Brunei-Malay Approved Reply
-                <textarea class="reply" id="product-faq-bm-reply"></textarea>
-              </label>
-              <label class="field wide" for="product-faq-bm-search">Brunei-Malay Search Text
-                <textarea id="product-faq-bm-search"></textarea>
-              </label>
             </div>
             <div class="editor-actions">
               <label for="product-faq-active"><input id="product-faq-active" type="checkbox" checked /> Active</label>
@@ -12199,16 +12163,11 @@ function productFlowPageHtml() {
     }
 
     function faqItemHtml(faq) {
-      const questions = [
-        ...(faq.exampleQuestions || []),
-        ...(faq.bruneiMalayExampleQuestions || [])
-      ].filter(Boolean).join("\\n");
+      const questions = (faq.exampleQuestions || []).filter(Boolean).join("\\n");
       return '<div class="knowledge-item">' +
         '<strong>' + esc(faq.topic || faq.id || "Approved product FAQ") + '</strong>' +
         (questions ? '<p><b>Questions:</b>\\n' + esc(questions) + '</p>' : '') +
         (faq.approvedReply ? '<p><b>Approved answer:</b>\\n' + esc(faq.approvedReply) + '</p>' : '') +
-        (faq.bruneiMalayApprovedReply ? '<p><b>Brunei-Malay answer:</b>\\n' + esc(faq.bruneiMalayApprovedReply) + '</p>' : '') +
-        (faq.bruneiMalaySearchText ? '<div class="knowledge-meta">Search text: ' + esc(faq.bruneiMalaySearchText) + '</div>' : '') +
         '<div class="knowledge-actions">' +
           '<button type="button" data-edit-product-faq="' + esc(faq.id) + '">Edit</button>' +
           '<button class="danger" type="button" data-delete-product-faq="' + esc(faq.id) + '" data-faq-topic="' + esc(faq.topic || faq.id) + '">Delete</button>' +
@@ -12232,10 +12191,6 @@ function productFlowPageHtml() {
       document.querySelector("#product-faq-topic").value = "";
       document.querySelector("#product-faq-examples").value = "";
       document.querySelector("#product-faq-reply").value = "";
-      document.querySelector("#product-faq-bm-topic").value = "";
-      document.querySelector("#product-faq-bm-examples").value = "";
-      document.querySelector("#product-faq-bm-reply").value = "";
-      document.querySelector("#product-faq-bm-search").value = "";
       document.querySelector("#product-faq-active").checked = true;
     }
 
@@ -12257,10 +12212,6 @@ function productFlowPageHtml() {
       document.querySelector("#product-faq-topic").value = faq.topic || "";
       document.querySelector("#product-faq-examples").value = (faq.exampleQuestions || []).join("\\n");
       document.querySelector("#product-faq-reply").value = faq.approvedReply || "";
-      document.querySelector("#product-faq-bm-topic").value = faq.bruneiMalayTopic || "";
-      document.querySelector("#product-faq-bm-examples").value = (faq.bruneiMalayExampleQuestions || []).join("\\n");
-      document.querySelector("#product-faq-bm-reply").value = faq.bruneiMalayApprovedReply || "";
-      document.querySelector("#product-faq-bm-search").value = faq.bruneiMalaySearchText || "";
       document.querySelector("#product-faq-active").checked = faq.active !== false;
       document.querySelector("#product-faq-status").textContent = "Editing product FAQ";
       showProductFaqForm();
@@ -12286,10 +12237,6 @@ function productFlowPageHtml() {
             topic: document.querySelector("#product-faq-topic").value,
             exampleQuestions: document.querySelector("#product-faq-examples").value.split(/\\r?\\n/),
             approvedReply: document.querySelector("#product-faq-reply").value,
-            bruneiMalayTopic: document.querySelector("#product-faq-bm-topic").value,
-            bruneiMalayExampleQuestions: document.querySelector("#product-faq-bm-examples").value.split(/\\r?\\n/),
-            bruneiMalayApprovedReply: document.querySelector("#product-faq-bm-reply").value,
-            bruneiMalaySearchText: document.querySelector("#product-faq-bm-search").value,
             active: document.querySelector("#product-faq-active").checked
           })
         });
