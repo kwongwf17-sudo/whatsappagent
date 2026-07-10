@@ -882,6 +882,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       try {
         const profile = await operations.updateDashboardProfile({
+          accountId: adminSession.accountId,
           name: body.name,
           accentColor: body.accentColor,
         });
@@ -3862,7 +3863,7 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
   const teamContent = content || await getTeamContent(businessAccountId);
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return {
-    profile: normalizeDashboardProfile((await operations.getState()).dashboardProfile),
+    profile: normalizeDashboardProfile(await operations.getDashboardProfile(businessAccountId)),
     followupMessages: teamFollowupMessages(teamContent),
     anotherDatePurchaseFollowup: teamAnotherDatePurchaseFollowup(teamContent),
     settings: {
@@ -3901,7 +3902,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allDeletedCustomers,
     allOrders,
     allOutbox,
-    systemState,
+    dashboardProfile,
     allFollowupQueue,
     orderStatusReplies,
     allComplaintCases,
@@ -3910,7 +3911,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     store.listDeletedCustomers(businessAccountId),
     store.listOrders(businessAccountId),
     store.listOutbox(businessAccountId),
-    operations.getState(),
+    operations.getDashboardProfile(businessAccountId),
     operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
@@ -4043,7 +4044,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       blockedFollowups: guardrails.blockedFollowups,
     },
     analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
-    profile: normalizeDashboardProfile(systemState.dashboardProfile),
+    profile: normalizeDashboardProfile(dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
     followupMessages: teamFollowupMessages({ catalog: teamCatalog }),
