@@ -10174,10 +10174,6 @@ function replyLibraryPageHtml() {
             <input id="faq-new-topic" />
             <span class="field-help">Example: Delivery Fee. This creates the stable topic used by the AI classifier.</span>
           </label>
-          <label class="field wide" for="faq-topic">Topic Name Shown in Library
-            <input id="faq-topic" required />
-            <span class="field-help">This is the admin-facing display name. Keep it short and clear.</span>
-          </label>
           <label class="field wide" for="faq-examples">Example Customer Questions <textarea id="faq-examples" required></textarea></label>
           <label class="field wide" for="faq-reply">Approved Reply <textarea class="reply" id="faq-reply" required></textarea></label>
         </div>
@@ -10206,10 +10202,6 @@ function replyLibraryPageHtml() {
           <label class="field wide" id="sales-new-intent-wrap" for="sales-new-intent">New Sales Intent Name
             <input id="sales-new-intent" />
             <span class="field-help">Example: Wants to ask husband first. This creates the stable intent used by the sales classifier.</span>
-          </label>
-          <label class="field wide" for="sales-intent-label">Sales Intent Name Shown in Library
-            <input id="sales-intent-label" required />
-            <span class="field-help">This is the admin-facing display name for the sales reply category.</span>
           </label>
           <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
           <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
@@ -10282,23 +10274,13 @@ function replyLibraryPageHtml() {
       return (salesLibrary.general || []).find(reply => salesIntentKey(reply) === key);
     }
     function syncFaqTopicFields() {
-      const selected = selectedFaqTopic();
       const isNew = !document.querySelector("#faq-topic-key").value;
       document.querySelector("#faq-new-topic-wrap").hidden = !isNew;
-      if (selected && !document.querySelector("#faq-id").value) {
-        document.querySelector("#faq-topic").value = friendlyFaqTopicLabel(selected.topic || selected.id);
-      }
     }
     function syncSalesIntentFields() {
-      const selected = selectedSalesIntent();
       const selectedKey = document.querySelector("#sales-intent-key").value;
       const isNew = !selectedKey;
       document.querySelector("#sales-new-intent-wrap").hidden = !isNew;
-      if (selected && !document.querySelector("#sales-id").value) {
-        document.querySelector("#sales-intent-label").value = salesIntentLabel(selectedKey, selected);
-      } else if (!selected && selectedKey) {
-        document.querySelector("#sales-intent-label").value = salesIntentLabel(selectedKey);
-      }
     }
     function renderFaqRows(records) {
       if (!records.length) return '<div class="empty">No general FAQs yet.</div>';
@@ -10332,18 +10314,18 @@ function replyLibraryPageHtml() {
       syncSalesIntentFields();
     }
     function newFaq() {
-      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(""); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
+      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(""); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function editFaq(id) {
       const faq = (faqLibrary.general || []).find(item => item.id === id); if (!faq) return;
-      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-topic").value = friendlyFaqTopicLabel(faq.topic || ""); document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
+      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-intent-label").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-intent-label").value = salesIntentLabel(salesIntentKey(reply), reply); document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -10356,7 +10338,8 @@ function replyLibraryPageHtml() {
       try {
         const selectedTopicKey = document.querySelector("#faq-topic-key").value;
         const newTopicName = document.querySelector("#faq-new-topic").value.trim();
-        const displayName = document.querySelector("#faq-topic").value.trim() || newTopicName;
+        const selectedTopic = selectedFaqTopic();
+        const displayName = selectedTopic ? friendlyFaqTopicLabel(selectedTopic.topic || selectedTopic.id) : newTopicName;
         const topicKey = selectedTopicKey || stableKey(newTopicName || displayName, "faq_topic");
         const response = await fetch("/admin/faq-library/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#faq-id").value, scope: "general", topicKey, topic: displayName, exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#faq-reply").value, active: document.querySelector("#faq-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); faqLibrary = result.data; renderFaq(); editFaq(result.faq.id); state.textContent = "Saved";
@@ -10367,7 +10350,8 @@ function replyLibraryPageHtml() {
       try {
         const selectedIntentKey = document.querySelector("#sales-intent-key").value;
         const newIntentName = document.querySelector("#sales-new-intent").value.trim();
-        const displayName = document.querySelector("#sales-intent-label").value.trim() || newIntentName;
+        const selectedIntent = selectedSalesIntent();
+        const displayName = selectedIntentKey ? salesIntentLabel(selectedIntentKey, selectedIntent) : newIntentName;
         const salesIntent = selectedIntentKey || stableKey(newIntentName || displayName, "sales_intent");
         const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
@@ -10389,8 +10373,6 @@ function replyLibraryPageHtml() {
     document.querySelector("#new-sales").addEventListener("click", newSales);
     document.querySelector("#faq-topic-key").addEventListener("change", syncFaqTopicFields);
     document.querySelector("#sales-intent-key").addEventListener("change", syncSalesIntentFields);
-    document.querySelector("#faq-new-topic").addEventListener("input", () => { if (!document.querySelector("#faq-topic").value.trim()) document.querySelector("#faq-topic").value = document.querySelector("#faq-new-topic").value; });
-    document.querySelector("#sales-new-intent").addEventListener("input", () => { if (!document.querySelector("#sales-intent-label").value.trim()) document.querySelector("#sales-intent-label").value = document.querySelector("#sales-new-intent").value; });
     document.querySelector("#faq-form").addEventListener("submit", saveFaq);
     document.querySelector("#sales-form").addEventListener("submit", saveSales);
     document.querySelector("#refresh").addEventListener("click", () => { loadFaq(); loadSales(); });
