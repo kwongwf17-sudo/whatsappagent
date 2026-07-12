@@ -2778,7 +2778,6 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
           productName: product?.name || "",
           customerMessage: String(customerMessage || "").slice(0, 500),
           handoffReason: answer?.handoffReason || "",
-          buyingIntent: answer?.buyingIntent || "",
           replyType: answer?.replyType || "",
         }),
         businessAccountId
