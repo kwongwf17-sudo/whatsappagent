@@ -8201,6 +8201,8 @@ function superAdminSystemHtml() {
       select.value = selectedTeamSettingsAccount;
       const account = currentTeamSettingsAccount();
       const settings = account ? account.settings || {} : {};
+      const state = document.querySelector("#team-settings-state");
+      if (state && !settings.openaiVectorStoreIdLooksInvalid) state.textContent = "";
       document.querySelector("#team-public-base-url").value = settings.publicBaseUrl || "";
       document.querySelector("#team-assets-base-url").value = settings.assetsBaseUrl || "";
       document.querySelector("#team-phone-number-id").value = "";
@@ -8213,7 +8215,12 @@ function superAdminSystemHtml() {
       document.querySelector("#team-access-token-current").textContent =
         settings.whatsappAccessToken ? "Current: " + settings.whatsappAccessToken : "No team-specific access token saved.";
       document.querySelector("#team-openai-api-key-current").textContent =
-        settings.openaiApiKey ? "Current: " + settings.openaiApiKey : "No team-specific OpenAI API key saved. Railway default will be used.";
+        settings.openaiApiKeyLooksInvalid
+          ? "Saved value looks wrong: it starts with vs_. Replace it with an OpenAI API key starting with sk-."
+          : settings.openaiApiKey ? "Current: " + settings.openaiApiKey : "No team-specific OpenAI API key saved. Railway default will be used.";
+      if (settings.openaiVectorStoreIdLooksInvalid) {
+        state.textContent = "Saved vector store ID looks wrong: it starts with sk-. Replace it with a vector store ID starting with vs_.";
+      }
     }
     async function saveTeamSettings(event) {
       event.preventDefault();
@@ -8233,6 +8240,18 @@ function superAdminSystemHtml() {
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
       const openaiApiKey = document.querySelector("#team-openai-api-key").value.trim();
+      if (openaiApiKey && !openaiApiKey.startsWith("sk-")) {
+        state.textContent = openaiApiKey.startsWith("vs_")
+          ? "OpenAI API Key is wrong: paste the sk- key here, not the vs_ vector store ID."
+          : "OpenAI API Key must start with sk-.";
+        return;
+      }
+      if (settings.openaiVectorStoreId && !settings.openaiVectorStoreId.startsWith("vs_")) {
+        state.textContent = settings.openaiVectorStoreId.startsWith("sk-")
+          ? "Vector Store ID is wrong: paste the vs_ ID here, not the sk- OpenAI API key."
+          : "Approved Knowledge Vector Store ID must start with vs_.";
+        return;
+      }
       if (phoneNumberId) settings.whatsappPhoneNumberId = phoneNumberId;
       if (accessToken) settings.whatsappAccessToken = accessToken;
       if (openaiApiKey) settings.openaiApiKey = openaiApiKey;
