@@ -8156,6 +8156,8 @@ function superAdminSystemHtml() {
   <script>
     let data = null;
     let selectedTeamSettingsAccount = "";
+    let teamSettingsDirty = false;
+    let teamSettingsSaving = false;
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
         return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
@@ -8191,7 +8193,7 @@ function superAdminSystemHtml() {
     }
     function renderTeamSettings(force = false) {
       const form = document.querySelector("#team-settings-form");
-      if (!force && form.contains(document.activeElement)) return;
+      if (!force && (teamSettingsDirty || teamSettingsSaving || form.contains(document.activeElement))) return;
       const accounts = data ? data.accounts || [] : [];
       const select = document.querySelector("#team-account-id");
       if (!selectedTeamSettingsAccount && accounts[0]) selectedTeamSettingsAccount = accounts[0].id;
@@ -8255,6 +8257,7 @@ function superAdminSystemHtml() {
       if (phoneNumberId) settings.whatsappPhoneNumberId = phoneNumberId;
       if (accessToken) settings.whatsappAccessToken = accessToken;
       if (openaiApiKey) settings.openaiApiKey = openaiApiKey;
+      teamSettingsSaving = true;
       state.textContent = "Saving...";
       try {
         const result = await request("/superadmin/system/team-settings", {
@@ -8263,10 +8266,13 @@ function superAdminSystemHtml() {
         });
         data.accounts = (data.accounts || []).map(account => account.id === result.account.id ? result.account : account);
         selectedTeamSettingsAccount = result.account.id;
+        teamSettingsDirty = false;
         renderTeamSettings(true);
         state.textContent = "Saved";
       } catch (error) {
         state.textContent = error.message;
+      } finally {
+        teamSettingsSaving = false;
       }
     }
     function normalizeDashboardUrl(value) {
@@ -8358,7 +8364,15 @@ function superAdminSystemHtml() {
     });
     document.querySelector("#team-account-id").addEventListener("change", event => {
       selectedTeamSettingsAccount = event.target.value;
+      teamSettingsDirty = false;
       renderTeamSettings(true);
+    });
+    document.querySelector("#team-settings-form").addEventListener("input", event => {
+      if (event.target && event.target.matches("input, select, textarea")) {
+        teamSettingsDirty = true;
+        const state = document.querySelector("#team-settings-state");
+        if (state) state.textContent = "Unsaved changes";
+      }
     });
     document.querySelector("#team-settings-form").addEventListener("submit", saveTeamSettings);
     document.querySelector("#refresh").addEventListener("click", load);
