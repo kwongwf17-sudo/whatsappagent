@@ -2667,11 +2667,11 @@ async function maybeClassifyCustomerMessageRoute({
 }
 
 function routeAllowsFallback(route) {
-  return !route || route.confidence === "low" || route.messageType === "unknown";
+  return !route || route.confidence === "low";
 }
 
 function routeAllowsSalesReply(route) {
-  return routeAllowsFallback(route) || route.messageType === "sales_reply";
+  return routeAllowsFallback(route) || ["sales_reply", "purchase_intent"].includes(route.messageType);
 }
 
 function routeAllowsKnowledgeAnswer(route) {
@@ -2752,11 +2752,13 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
       );
       return null;
     }
+    const account = await adminAccounts.getAccount(businessAccountId).catch(() => null);
+    const businessName = String(account?.name || config.businessName || "this business").trim() || "this business";
     const answer = await createCustomerServiceResponse({
       apiKey,
       model,
       vectorStoreId,
-      businessName: config.businessName,
+      businessName,
       supportLanguage: config.supportLanguage,
       customerId,
       customerMessage,
@@ -4341,7 +4343,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
 }
 
 function buildAnalytics({ customers, orders, productById, now, catalog: activeCatalog = catalog }) {
-  const selectedDateCustomers = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, now));
+  const selectedDateCustomers = dailyCustomerRows(customers, orders, now);
   const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
   const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
   const selectedDateOrdersFromNewCustomers = selectedDateOrders.filter((order) =>
@@ -4373,7 +4375,7 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
   const sevenDayCustomerCounts = Array.from({ length: 7 }, (_, index) => {
     const date = addLocalDays(now, index - 6);
     const dateKey = formatLocalDate(date);
-    const count = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, date)).length;
+    const count = dailyCustomerRows(customers, orders, date).length;
     return {
       date: dateKey,
       label: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
@@ -4400,6 +4402,18 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
       followups: followupPerformance,
     },
   };
+}
+
+function dailyCustomerRows(customers = [], orders = [], now = new Date()) {
+  const orderCustomerIds = new Set(
+    orders
+      .filter((order) => isSameLocalDate(order.createdAt, now))
+      .map((order) => order.customerId)
+      .filter(Boolean)
+  );
+  return customers.filter((customer) =>
+    isSameLocalDate(customer.firstSeenAt, now) || orderCustomerIds.has(customer.id)
+  );
 }
 
 function buildFollowupPerformance(customers, now, activeCatalog = catalog) {
@@ -4576,7 +4590,8 @@ function isSameLocalDate(value, now) {
 
 function parseSelectedDate(value) {
   if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return new Date();
-  const date = new Date(`${value}T12:00:00`);
+  const [year, month, day] = value.split("-").map((part) => Number(part));
+  const date = followupZonedLocalToDate({ year, month, day, hour: 12, minute: 0, second: 0, millisecond: 0 });
   return Number.isNaN(date.getTime()) ? new Date() : date;
 }
 
@@ -4594,9 +4609,10 @@ function isDemoEnvironmentCustomerId(value) {
 
 function formatLocalDate(value) {
   const date = value instanceof Date ? value : new Date(value);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const parts = followupZonedDateParts(date);
+  const year = parts.year;
+  const month = String(parts.month).padStart(2, "0");
+  const day = String(parts.day).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
