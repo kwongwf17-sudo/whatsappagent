@@ -1483,8 +1483,8 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         productId: product.id,
         pendingOrder: null,
         awaitingPackageBInterest: false,
-        handoffStatus: "human_required",
-        handoffReason: "Customer submitted complete order details.",
+        handoffStatus: "",
+        handoffReason: "",
         complaintCaseId: "",
         complaintStatus: "",
         complaintCategory: "",
@@ -1496,6 +1496,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         followupBlocked: true,
         followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
+      clearPendingCustomerBuffers(adminSession.accountId, customerId);
       await store.appendAuditLog({
         action: "manual_order_submitted",
         customerId,
@@ -3734,11 +3735,10 @@ async function appendSimOpeningFlow(customerId, firstSeenAt, product) {
 
 async function appendSimOrderConversation({ batchId, index, customerId, product, packageItem, intentAt, detailsAt }) {
   await appendSimInbound(customerId, intentAt, `Saya mau order Package ${packageItem.id || "B"}`);
-  await appendSimOutbound(customerId, addSeconds(intentAt, 5), "Noted and thank you.");
   await appendSimOutbound(
     customerId,
-    addSeconds(intentAt, 9),
-    "Can you help me fill up this details for hold promo? 🥰 \n\n✅ Full name : \n🏠 Full address : \n📱 Phone number : \n\nOrder Package :"
+    addSeconds(intentAt, 5),
+    orderFormMessageForProduct(product)
   );
 
   const phone = `6738${String(100000 + index).slice(-6)}`;
@@ -5422,6 +5422,16 @@ function orderDetailBufferKey(businessAccountId, customerId) {
   return `${businessAccountId || config.accountId}::${customerId}`;
 }
 
+function clearPendingCustomerBuffers(businessAccountId, customerId) {
+  const key = orderDetailBufferKey(businessAccountId, customerId);
+  const mergeBuffer = pendingMessageMergeBuffers.get(key);
+  if (mergeBuffer?.timer) clearTimeout(mergeBuffer.timer);
+  pendingMessageMergeBuffers.delete(key);
+  const orderBuffer = pendingOrderDetailBuffers.get(key);
+  if (orderBuffer?.timer) clearTimeout(orderBuffer.timer);
+  pendingOrderDetailBuffers.delete(key);
+}
+
 function shouldBufferMergedCustomerMessage(text) {
   const delayMs = Math.max(0, Number(config.messageMergeBufferMs) || 0);
   return delayMs > 0 && Boolean(String(text || "").trim());
@@ -6869,6 +6879,22 @@ function normalizeOrderForm(value = {}) {
     phoneLabel: cleanOrderFormValue(source.phoneLabel || source.phone_label, DEFAULT_ORDER_FORM.phoneLabel),
     optionLabel: cleanOrderFormValue(source.optionLabel || source.option_label, DEFAULT_ORDER_FORM.optionLabel),
   };
+}
+
+function orderFormMessageForProduct(product) {
+  const form = normalizeOrderForm(product?.order_form);
+  const optionNames = (Array.isArray(product?.packages) ? product.packages : [])
+    .map((item) => String(item?.name || "").trim())
+    .filter(Boolean)
+    .join(" / ");
+  return [
+    form.intro,
+    "",
+    `✅ ${form.nameLabel} :`,
+    `🏠 ${form.addressLabel} :`,
+    `📱 ${form.phoneLabel} :`,
+    `${form.optionLabel} : ${optionNames}`,
+  ].join("\n");
 }
 
 function cleanOrderFormValue(value, fallback) {
