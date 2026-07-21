@@ -2018,98 +2018,6 @@ async function processInboundMessage({
 
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
   const optOutIntent = detectOptOutIntent(text);
-  if (!customer.pendingOrder && !isProductNameOnlyOpening && contextMatchedProduct && (Number(customer.inboundCount || 0) <= 1 || contextStartsNewProductJourney)) {
-    const messageSource = {
-      ...source,
-      productId: contextMatchedProduct.id,
-      productNameMatch: true,
-      adContextProductMatch: true,
-    };
-    const plan = await buildConversationPlan({
-      catalog: teamCatalog,
-      customer,
-      customerMessage: text,
-      source: messageSource,
-      faqLibrary: teamFaqLibrary,
-      salesReplyLibrary: teamSalesReplyLibrary,
-      approvedFaqMatch: null,
-      salesReplyMatch: null,
-      ragAnswer: null,
-      conversationContext,
-    });
-    console.log(`Skipping OpenAI for ad-context opening flow to ${from}: ${contextMatchedProduct.id}`);
-    const updatedCustomer = await store.updateCustomer(from, () => ({
-      ...newProductJourneyPatch(customer, contextMatchedProduct),
-      ...(plan.customerPatch || {}),
-      productId: contextMatchedProduct.id,
-      conversationState: "opening_flow_sent",
-      openingFlowSentAt: new Date().toISOString(),
-      openingFlowProductId: contextMatchedProduct.id,
-      complaintCaseId: "",
-      complaintStatus: "",
-      complaintCategory: "",
-      complaintAt: "",
-      followupBlocked: false,
-      followupBlockedReason: "",
-      handoffStatus: "",
-      handoffReason: "",
-    }), businessAccountId);
-    const outbound = clampMessages(plan.messages);
-    await delayBeforeNewCustomerOpeningFlow(customer, "ad-context opening flow");
-    await sendOutbound(from, outbound, { businessAccountId });
-    return {
-      customer: updatedCustomer,
-      order: null,
-      messages: outbound,
-      handoffRequired: Boolean(plan.handoffRequired),
-      handoffReason: plan.handoffReason || "",
-    };
-  }
-  if (!customer.pendingOrder && isProductNameOnlyOpening) {
-    const messageSource = {
-      ...source,
-      productId: textMatchedProduct.id,
-      productNameMatch: true,
-    };
-    const plan = await buildConversationPlan({
-      catalog: teamCatalog,
-      customer,
-      customerMessage: text,
-      source: messageSource,
-      faqLibrary: teamFaqLibrary,
-      salesReplyLibrary: teamSalesReplyLibrary,
-      approvedFaqMatch: null,
-      salesReplyMatch: null,
-      ragAnswer: null,
-      conversationContext,
-    });
-    console.log(`Skipping OpenAI for product-name opening flow to ${from}`);
-    const updatedCustomer = await store.updateCustomer(from, () => ({
-      ...newProductJourneyPatch(customer, textMatchedProduct),
-      ...(plan.customerPatch || {}),
-      conversationState: "opening_flow_sent",
-      openingFlowSentAt: new Date().toISOString(),
-      openingFlowProductId: textMatchedProduct.id,
-      complaintCaseId: "",
-      complaintStatus: "",
-      complaintCategory: "",
-      complaintAt: "",
-      followupBlocked: false,
-      followupBlockedReason: "",
-      handoffStatus: "",
-      handoffReason: "",
-    }), businessAccountId);
-    const outbound = clampMessages(plan.messages);
-    await delayBeforeNewCustomerOpeningFlow(customer, "product-name opening flow");
-    await sendOutbound(from, outbound, { businessAccountId });
-    return {
-      customer: updatedCustomer,
-      order: null,
-      messages: outbound,
-      handoffRequired: Boolean(plan.handoffRequired),
-      handoffReason: plan.handoffReason || "",
-    };
-  }
   if (customer.complaintStatus === "open" && !optOutIntent.optedOut) {
     await store.appendAuditLog({
       actor: "ai_agent",
@@ -2324,10 +2232,10 @@ async function processInboundMessage({
   const classifiedKnowledgeRoute =
     routeClassification?.confidence !== "low" &&
     ["general_faq", "product_question"].includes(routeClassification?.messageType);
-  const exactSalesReply = fixedOpeningFlow || faqSalesResponse
+  const exactSalesReply = faqSalesResponse
     ? null
     : (allowSalesReplyRoute ? findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary }) : null);
-  const vectorSalesReply = fixedOpeningFlow || faqSalesResponse || exactSalesReply || !allowSalesReplyRoute
+  const vectorSalesReply = faqSalesResponse || exactSalesReply || !allowSalesReplyRoute
     ? null
     : await maybeSelectApprovedSalesReply({
         customerMessage: text,
