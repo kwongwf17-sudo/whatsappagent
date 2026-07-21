@@ -882,6 +882,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       try {
         const profile = await operations.updateDashboardProfile({
+          accountId: adminSession.accountId,
           name: body.name,
           accentColor: body.accentColor,
         });
@@ -1482,8 +1483,8 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         productId: product.id,
         pendingOrder: null,
         awaitingPackageBInterest: false,
-        handoffStatus: "human_required",
-        handoffReason: "Customer submitted complete order details.",
+        handoffStatus: "",
+        handoffReason: "",
         complaintCaseId: "",
         complaintStatus: "",
         complaintCategory: "",
@@ -1495,6 +1496,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         followupBlocked: true,
         followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
+      clearPendingCustomerBuffers(adminSession.accountId, customerId);
       await store.appendAuditLog({
         action: "manual_order_submitted",
         customerId,
@@ -2016,98 +2018,6 @@ async function processInboundMessage({
 
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
   const optOutIntent = detectOptOutIntent(text);
-  if (!customer.pendingOrder && !isProductNameOnlyOpening && contextMatchedProduct && (Number(customer.inboundCount || 0) <= 1 || contextStartsNewProductJourney)) {
-    const messageSource = {
-      ...source,
-      productId: contextMatchedProduct.id,
-      productNameMatch: true,
-      adContextProductMatch: true,
-    };
-    const plan = await buildConversationPlan({
-      catalog: teamCatalog,
-      customer,
-      customerMessage: text,
-      source: messageSource,
-      faqLibrary: teamFaqLibrary,
-      salesReplyLibrary: teamSalesReplyLibrary,
-      approvedFaqMatch: null,
-      salesReplyMatch: null,
-      ragAnswer: null,
-      conversationContext,
-    });
-    console.log(`Skipping OpenAI for ad-context opening flow to ${from}: ${contextMatchedProduct.id}`);
-    const updatedCustomer = await store.updateCustomer(from, () => ({
-      ...newProductJourneyPatch(customer, contextMatchedProduct),
-      ...(plan.customerPatch || {}),
-      productId: contextMatchedProduct.id,
-      conversationState: "opening_flow_sent",
-      openingFlowSentAt: new Date().toISOString(),
-      openingFlowProductId: contextMatchedProduct.id,
-      complaintCaseId: "",
-      complaintStatus: "",
-      complaintCategory: "",
-      complaintAt: "",
-      followupBlocked: false,
-      followupBlockedReason: "",
-      handoffStatus: "",
-      handoffReason: "",
-    }), businessAccountId);
-    const outbound = clampMessages(plan.messages);
-    await delayBeforeNewCustomerOpeningFlow(customer, "ad-context opening flow");
-    await sendOutbound(from, outbound, { businessAccountId });
-    return {
-      customer: updatedCustomer,
-      order: null,
-      messages: outbound,
-      handoffRequired: Boolean(plan.handoffRequired),
-      handoffReason: plan.handoffReason || "",
-    };
-  }
-  if (!customer.pendingOrder && isProductNameOnlyOpening) {
-    const messageSource = {
-      ...source,
-      productId: textMatchedProduct.id,
-      productNameMatch: true,
-    };
-    const plan = await buildConversationPlan({
-      catalog: teamCatalog,
-      customer,
-      customerMessage: text,
-      source: messageSource,
-      faqLibrary: teamFaqLibrary,
-      salesReplyLibrary: teamSalesReplyLibrary,
-      approvedFaqMatch: null,
-      salesReplyMatch: null,
-      ragAnswer: null,
-      conversationContext,
-    });
-    console.log(`Skipping OpenAI for product-name opening flow to ${from}`);
-    const updatedCustomer = await store.updateCustomer(from, () => ({
-      ...newProductJourneyPatch(customer, textMatchedProduct),
-      ...(plan.customerPatch || {}),
-      conversationState: "opening_flow_sent",
-      openingFlowSentAt: new Date().toISOString(),
-      openingFlowProductId: textMatchedProduct.id,
-      complaintCaseId: "",
-      complaintStatus: "",
-      complaintCategory: "",
-      complaintAt: "",
-      followupBlocked: false,
-      followupBlockedReason: "",
-      handoffStatus: "",
-      handoffReason: "",
-    }), businessAccountId);
-    const outbound = clampMessages(plan.messages);
-    await delayBeforeNewCustomerOpeningFlow(customer, "product-name opening flow");
-    await sendOutbound(from, outbound, { businessAccountId });
-    return {
-      customer: updatedCustomer,
-      order: null,
-      messages: outbound,
-      handoffRequired: Boolean(plan.handoffRequired),
-      handoffReason: plan.handoffReason || "",
-    };
-  }
   if (customer.complaintStatus === "open" && !optOutIntent.optedOut) {
     await store.appendAuditLog({
       actor: "ai_agent",
@@ -2322,10 +2232,10 @@ async function processInboundMessage({
   const classifiedKnowledgeRoute =
     routeClassification?.confidence !== "low" &&
     ["general_faq", "product_question"].includes(routeClassification?.messageType);
-  const exactSalesReply = fixedOpeningFlow || faqSalesResponse
+  const exactSalesReply = faqSalesResponse
     ? null
     : (allowSalesReplyRoute ? findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary }) : null);
-  const vectorSalesReply = fixedOpeningFlow || faqSalesResponse || exactSalesReply || !allowSalesReplyRoute
+  const vectorSalesReply = faqSalesResponse || exactSalesReply || !allowSalesReplyRoute
     ? null
     : await maybeSelectApprovedSalesReply({
         customerMessage: text,
@@ -2666,11 +2576,11 @@ async function maybeClassifyCustomerMessageRoute({
 }
 
 function routeAllowsFallback(route) {
-  return !route || route.confidence === "low" || route.messageType === "unknown";
+  return !route || route.confidence === "low";
 }
 
 function routeAllowsSalesReply(route) {
-  return routeAllowsFallback(route) || route.messageType === "sales_reply";
+  return routeAllowsFallback(route) || ["sales_reply", "purchase_intent"].includes(route.messageType);
 }
 
 function routeAllowsKnowledgeAnswer(route) {
@@ -2751,11 +2661,13 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
       );
       return null;
     }
+    const account = await adminAccounts.getAccount(businessAccountId).catch(() => null);
+    const businessName = String(account?.name || config.businessName || "this business").trim() || "this business";
     const answer = await createCustomerServiceResponse({
       apiKey,
       model,
       vectorStoreId,
-      businessName: config.businessName,
+      businessName,
       supportLanguage: config.supportLanguage,
       customerId,
       customerMessage,
@@ -2777,7 +2689,6 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
           productName: product?.name || "",
           customerMessage: String(customerMessage || "").slice(0, 500),
           handoffReason: answer?.handoffReason || "",
-          buyingIntent: answer?.buyingIntent || "",
           replyType: answer?.replyType || "",
         }),
         businessAccountId
@@ -3732,11 +3643,10 @@ async function appendSimOpeningFlow(customerId, firstSeenAt, product) {
 
 async function appendSimOrderConversation({ batchId, index, customerId, product, packageItem, intentAt, detailsAt }) {
   await appendSimInbound(customerId, intentAt, `Saya mau order Package ${packageItem.id || "B"}`);
-  await appendSimOutbound(customerId, addSeconds(intentAt, 5), "Noted and thank you.");
   await appendSimOutbound(
     customerId,
-    addSeconds(intentAt, 9),
-    "Can you help me fill up this details for hold promo? 🥰 \n\n✅ Full name : \n🏠 Full address : \n📱 Phone number : \n\nOrder Package :"
+    addSeconds(intentAt, 5),
+    orderFormMessageForProduct(product)
   );
 
   const phone = `6738${String(100000 + index).slice(-6)}`;
@@ -3862,7 +3772,7 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
   const teamContent = content || await getTeamContent(businessAccountId);
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return {
-    profile: normalizeDashboardProfile((await operations.getState()).dashboardProfile),
+    profile: normalizeDashboardProfile(await operations.getDashboardProfile(businessAccountId)),
     followupMessages: teamFollowupMessages(teamContent),
     anotherDatePurchaseFollowup: teamAnotherDatePurchaseFollowup(teamContent),
     settings: {
@@ -3901,7 +3811,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allDeletedCustomers,
     allOrders,
     allOutbox,
-    systemState,
+    dashboardProfile,
     allFollowupQueue,
     orderStatusReplies,
     allComplaintCases,
@@ -3910,7 +3820,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     store.listDeletedCustomers(businessAccountId),
     store.listOrders(businessAccountId),
     store.listOutbox(businessAccountId),
-    operations.getState(),
+    operations.getDashboardProfile(businessAccountId),
     operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
@@ -4043,7 +3953,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       blockedFollowups: guardrails.blockedFollowups,
     },
     analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
-    profile: normalizeDashboardProfile(systemState.dashboardProfile),
+    profile: normalizeDashboardProfile(dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
     followupMessages: teamFollowupMessages({ catalog: teamCatalog }),
@@ -4341,7 +4251,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
 }
 
 function buildAnalytics({ customers, orders, productById, now, catalog: activeCatalog = catalog }) {
-  const selectedDateCustomers = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, now));
+  const selectedDateCustomers = dailyCustomerRows(customers, orders, now);
   const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
   const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
   const selectedDateOrdersFromNewCustomers = selectedDateOrders.filter((order) =>
@@ -4373,7 +4283,7 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
   const sevenDayCustomerCounts = Array.from({ length: 7 }, (_, index) => {
     const date = addLocalDays(now, index - 6);
     const dateKey = formatLocalDate(date);
-    const count = customers.filter((customer) => isSameLocalDate(customer.firstSeenAt, date)).length;
+    const count = dailyCustomerRows(customers, orders, date).length;
     return {
       date: dateKey,
       label: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
@@ -4400,6 +4310,18 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
       followups: followupPerformance,
     },
   };
+}
+
+function dailyCustomerRows(customers = [], orders = [], now = new Date()) {
+  const orderCustomerIds = new Set(
+    orders
+      .filter((order) => isSameLocalDate(order.createdAt, now))
+      .map((order) => order.customerId)
+      .filter(Boolean)
+  );
+  return customers.filter((customer) =>
+    isSameLocalDate(customer.firstSeenAt, now) || orderCustomerIds.has(customer.id)
+  );
 }
 
 function buildFollowupPerformance(customers, now, activeCatalog = catalog) {
@@ -4576,7 +4498,8 @@ function isSameLocalDate(value, now) {
 
 function parseSelectedDate(value) {
   if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return new Date();
-  const date = new Date(`${value}T12:00:00`);
+  const [year, month, day] = value.split("-").map((part) => Number(part));
+  const date = followupZonedLocalToDate({ year, month, day, hour: 12, minute: 0, second: 0, millisecond: 0 });
   return Number.isNaN(date.getTime()) ? new Date() : date;
 }
 
@@ -4594,9 +4517,10 @@ function isDemoEnvironmentCustomerId(value) {
 
 function formatLocalDate(value) {
   const date = value instanceof Date ? value : new Date(value);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const parts = followupZonedDateParts(date);
+  const year = parts.year;
+  const month = String(parts.month).padStart(2, "0");
+  const day = String(parts.day).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
@@ -5404,6 +5328,16 @@ function cleanupProcessedMessages() {
 
 function orderDetailBufferKey(businessAccountId, customerId) {
   return `${businessAccountId || config.accountId}::${customerId}`;
+}
+
+function clearPendingCustomerBuffers(businessAccountId, customerId) {
+  const key = orderDetailBufferKey(businessAccountId, customerId);
+  const mergeBuffer = pendingMessageMergeBuffers.get(key);
+  if (mergeBuffer?.timer) clearTimeout(mergeBuffer.timer);
+  pendingMessageMergeBuffers.delete(key);
+  const orderBuffer = pendingOrderDetailBuffers.get(key);
+  if (orderBuffer?.timer) clearTimeout(orderBuffer.timer);
+  pendingOrderDetailBuffers.delete(key);
 }
 
 function shouldBufferMergedCustomerMessage(text) {
@@ -6468,11 +6402,6 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
   }
   const index = records.findIndex((faq) => faq.id === id);
   const existing = index >= 0 ? records[index] : {};
-  const bruneiMalayExampleQuestions = "bruneiMalayExampleQuestions" in body
-    ? (Array.isArray(body.bruneiMalayExampleQuestions)
-        ? body.bruneiMalayExampleQuestions.map((question) => String(question).trim()).filter(Boolean)
-        : String(body.bruneiMalayExampleQuestions || "").split(/\r?\n/).map((question) => question.trim()).filter(Boolean))
-    : (existing.brunei_malay_example_questions || []);
   const saved = {
     id,
     topic_key: String(body.topicKey || existing.topic_key || existing.topicKey || id).trim() || id,
@@ -6481,19 +6410,6 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
     approved_reply: approvedReply,
     active: body.active !== false,
   };
-  const bruneiMalayTopic = "bruneiMalayTopic" in body
-    ? String(body.bruneiMalayTopic || "").trim()
-    : String(existing.brunei_malay_topic || "");
-  const bruneiMalayApprovedReply = "bruneiMalayApprovedReply" in body
-    ? String(body.bruneiMalayApprovedReply || "").trim()
-    : String(existing.brunei_malay_approved_reply || "");
-  const bruneiMalaySearchText = "bruneiMalaySearchText" in body
-    ? String(body.bruneiMalaySearchText || "").trim()
-    : String(existing.brunei_malay_search_text || "");
-  if (bruneiMalayTopic) saved.brunei_malay_topic = bruneiMalayTopic;
-  if (bruneiMalayExampleQuestions.length) saved.brunei_malay_example_questions = bruneiMalayExampleQuestions;
-  if (bruneiMalayApprovedReply) saved.brunei_malay_approved_reply = bruneiMalayApprovedReply;
-  if (bruneiMalaySearchText) saved.brunei_malay_search_text = bruneiMalaySearchText;
   if (index >= 0) records[index] = saved;
   else records.push(saved);
   return { ...saved, scope, productId };
@@ -6533,8 +6449,9 @@ function saveSalesReply(body, content = defaultTeamContent) {
   const scope = "general";
   const productId = "";
   const salesIntent = normalizeSalesIntent(body.salesIntent || body.intentKey || body.objectionType);
-  const objectionType = SALES_INTENT_LABELS.get(salesIntent) || salesIntent;
-  const intent = salesIntentDescription(salesIntent);
+  const salesIntentLabel = String(body.salesIntentLabel || body.objectionType || "").trim();
+  const objectionType = salesIntentLabel || SALES_INTENT_LABELS.get(salesIntent) || readableStorageLabel(salesIntent);
+  const intent = String(body.intent || "").trim() || salesIntentDescription(salesIntent) || `Customer sales response or hesitation: ${objectionType}`;
   const approvedReply = String(body.approvedReply || "").trim();
   const repeatAction = normalizeSalesRepeatAction(body.repeatAction);
   const exampleMessages = Array.isArray(body.exampleMessages)
@@ -6583,7 +6500,8 @@ function normalizeSalesRepeatAction(value) {
 }
 
 function normalizeSalesIntent(value) {
-  const raw = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const original = String(value || "").trim();
+  const raw = original.toLowerCase().replace(/[\s-]+/g, "_");
   if (SALES_INTENT_LABELS.has(raw)) return raw;
   if (/(price|nego|negotiat|discount|murah|less)/i.test(raw)) return "price_objection_negotiation";
   if (/(fikir|think|tanya|ask|later|nanti|next_time)/i.test(raw)) return "thinking_first";
@@ -6591,7 +6509,15 @@ function normalizeSalesIntent(value) {
   if (/(expensive|mahal|too_much)/i.test(raw)) return "too_expensive";
   if (/(not_interested|no_interest|nda_minat|inda_minat|not_now|next_time)/i.test(raw)) return "not_interested";
   if (/(another_date|specific_date|tarikh|date|bulan|hari|next_month|minggu_depan)/i.test(raw)) return "another_date_purchase";
-  return "";
+  return original ? safeAssetSegment(original).replace(/-/g, "_") : "";
+}
+
+function readableStorageLabel(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function salesIntentDescription(salesIntent) {
@@ -6729,7 +6655,7 @@ function productFlowEditorData(product, options = {}) {
     orderOptions: orderOptionsForEditor(product),
     orderForm: orderFormForEditor(product),
     orderClosingMessages: orderClosingMessagesForEditor(product),
-    salesPrompt: String(product.sales_prompt ?? product.package_question ?? ""),
+    salesPrompt: String(product.sales_prompt ?? ""),
     salesPromptFrequency: normalizeSalesPromptFrequency(product.sales_prompt_frequency),
     approvedFaqs: approvedProductFaqsForEditor(product),
     extractedKnowledge: productKnowledgeForEditor(product),
@@ -6831,18 +6757,12 @@ function approvedProductFaqsForEditor(product) {
     .filter((faq) => faq && faq.active !== false)
     .map((faq) => ({
       id: String(faq.id || ""),
-      topic: String(faq.topic || faq.brunei_malay_topic || ""),
-      bruneiMalayTopic: String(faq.brunei_malay_topic || ""),
+      topic: String(faq.topic || ""),
       exampleQuestions: [
         ...(Array.isArray(faq.example_questions) ? faq.example_questions : []),
         ...(Array.isArray(faq.customer_messages) ? faq.customer_messages : []),
       ].map((item) => String(item || "").trim()).filter(Boolean),
-      bruneiMalayExampleQuestions: (Array.isArray(faq.brunei_malay_example_questions) ? faq.brunei_malay_example_questions : [])
-        .map((item) => String(item || "").trim())
-        .filter(Boolean),
       approvedReply: String(faq.approved_reply || faq.answer || ""),
-      bruneiMalayApprovedReply: String(faq.brunei_malay_approved_reply || ""),
-      bruneiMalaySearchText: String(faq.brunei_malay_search_text || ""),
       active: faq.active !== false,
     }));
 }
@@ -6867,6 +6787,22 @@ function normalizeOrderForm(value = {}) {
     phoneLabel: cleanOrderFormValue(source.phoneLabel || source.phone_label, DEFAULT_ORDER_FORM.phoneLabel),
     optionLabel: cleanOrderFormValue(source.optionLabel || source.option_label, DEFAULT_ORDER_FORM.optionLabel),
   };
+}
+
+function orderFormMessageForProduct(product) {
+  const form = normalizeOrderForm(product?.order_form);
+  const optionNames = (Array.isArray(product?.packages) ? product.packages : [])
+    .map((item) => String(item?.name || "").trim())
+    .filter(Boolean)
+    .join(" / ");
+  return [
+    form.intro,
+    "",
+    `✅ ${form.nameLabel} :`,
+    `🏠 ${form.addressLabel} :`,
+    `📱 ${form.phoneLabel} :`,
+    `${form.optionLabel} : ${optionNames}`,
+  ].join("\n");
 }
 
 function cleanOrderFormValue(value, fallback) {
@@ -6897,7 +6833,6 @@ function updateProductFlowText(product, body) {
   );
   const hasBlockUpdate = Object.prototype.hasOwnProperty.call(body, "openingFlowBlocks");
   if (hasFlowTextUpdate) {
-    product.package_question = String(body.packageQuestion ?? current.packageQuestion ?? "");
     const next = {
       ...current,
       ...Object.fromEntries(
@@ -8171,6 +8106,8 @@ function superAdminSystemHtml() {
   <script>
     let data = null;
     let selectedTeamSettingsAccount = "";
+    let teamSettingsDirty = false;
+    let teamSettingsSaving = false;
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
         return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
@@ -8206,7 +8143,7 @@ function superAdminSystemHtml() {
     }
     function renderTeamSettings(force = false) {
       const form = document.querySelector("#team-settings-form");
-      if (!force && form.contains(document.activeElement)) return;
+      if (!force && (teamSettingsDirty || teamSettingsSaving || form.contains(document.activeElement))) return;
       const accounts = data ? data.accounts || [] : [];
       const select = document.querySelector("#team-account-id");
       if (!selectedTeamSettingsAccount && accounts[0]) selectedTeamSettingsAccount = accounts[0].id;
@@ -8216,6 +8153,8 @@ function superAdminSystemHtml() {
       select.value = selectedTeamSettingsAccount;
       const account = currentTeamSettingsAccount();
       const settings = account ? account.settings || {} : {};
+      const state = document.querySelector("#team-settings-state");
+      if (state && !settings.openaiVectorStoreIdLooksInvalid) state.textContent = "";
       document.querySelector("#team-public-base-url").value = settings.publicBaseUrl || "";
       document.querySelector("#team-assets-base-url").value = settings.assetsBaseUrl || "";
       document.querySelector("#team-phone-number-id").value = "";
@@ -8228,7 +8167,12 @@ function superAdminSystemHtml() {
       document.querySelector("#team-access-token-current").textContent =
         settings.whatsappAccessToken ? "Current: " + settings.whatsappAccessToken : "No team-specific access token saved.";
       document.querySelector("#team-openai-api-key-current").textContent =
-        settings.openaiApiKey ? "Current: " + settings.openaiApiKey : "No team-specific OpenAI API key saved. Railway default will be used.";
+        settings.openaiApiKeyLooksInvalid
+          ? "Saved value looks wrong: it starts with vs_. Replace it with an OpenAI API key starting with sk-."
+          : settings.openaiApiKey ? "Current: " + settings.openaiApiKey : "No team-specific OpenAI API key saved. Railway default will be used.";
+      if (settings.openaiVectorStoreIdLooksInvalid) {
+        state.textContent = "Saved vector store ID looks wrong: it starts with sk-. Replace it with a vector store ID starting with vs_.";
+      }
     }
     async function saveTeamSettings(event) {
       event.preventDefault();
@@ -8248,9 +8192,22 @@ function superAdminSystemHtml() {
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
       const openaiApiKey = document.querySelector("#team-openai-api-key").value.trim();
+      if (openaiApiKey && !openaiApiKey.startsWith("sk-")) {
+        state.textContent = openaiApiKey.startsWith("vs_")
+          ? "OpenAI API Key is wrong: paste the sk- key here, not the vs_ vector store ID."
+          : "OpenAI API Key must start with sk-.";
+        return;
+      }
+      if (settings.openaiVectorStoreId && !settings.openaiVectorStoreId.startsWith("vs_")) {
+        state.textContent = settings.openaiVectorStoreId.startsWith("sk-")
+          ? "Vector Store ID is wrong: paste the vs_ ID here, not the sk- OpenAI API key."
+          : "Approved Knowledge Vector Store ID must start with vs_.";
+        return;
+      }
       if (phoneNumberId) settings.whatsappPhoneNumberId = phoneNumberId;
       if (accessToken) settings.whatsappAccessToken = accessToken;
       if (openaiApiKey) settings.openaiApiKey = openaiApiKey;
+      teamSettingsSaving = true;
       state.textContent = "Saving...";
       try {
         const result = await request("/superadmin/system/team-settings", {
@@ -8259,10 +8216,13 @@ function superAdminSystemHtml() {
         });
         data.accounts = (data.accounts || []).map(account => account.id === result.account.id ? result.account : account);
         selectedTeamSettingsAccount = result.account.id;
+        teamSettingsDirty = false;
         renderTeamSettings(true);
         state.textContent = "Saved";
       } catch (error) {
         state.textContent = error.message;
+      } finally {
+        teamSettingsSaving = false;
       }
     }
     function normalizeDashboardUrl(value) {
@@ -8354,7 +8314,15 @@ function superAdminSystemHtml() {
     });
     document.querySelector("#team-account-id").addEventListener("change", event => {
       selectedTeamSettingsAccount = event.target.value;
+      teamSettingsDirty = false;
       renderTeamSettings(true);
+    });
+    document.querySelector("#team-settings-form").addEventListener("input", event => {
+      if (event.target && event.target.matches("input, select, textarea")) {
+        teamSettingsDirty = true;
+        const state = document.querySelector("#team-settings-state");
+        if (state) state.textContent = "Unsaved changes";
+      }
     });
     document.querySelector("#team-settings-form").addEventListener("submit", saveTeamSettings);
     document.querySelector("#refresh").addEventListener("click", load);
@@ -10114,6 +10082,8 @@ function replyLibraryPageHtml() {
     .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
     .field { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
     .field.wide { grid-column: 1 / -1; }
+    .field-help { color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.35; }
+    .field[hidden] { display: none; }
     input, textarea, select { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
     input:focus, textarea:focus, select:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
     textarea { min-height: 88px; resize: vertical; line-height: 1.42; }
@@ -10154,8 +10124,14 @@ function replyLibraryPageHtml() {
       <form id="faq-form" class="editor">
         <input id="faq-id" type="hidden" />
         <div class="fields">
-          <label class="field wide" for="faq-topic-key">FAQ Topic <select id="faq-topic-key"></select></label>
-          <label class="field wide" for="faq-topic">Display Label <input id="faq-topic" required /></label>
+          <label class="field wide" for="faq-topic-key">FAQ Topic / Category
+            <select id="faq-topic-key"></select>
+            <span class="field-help">Choose an existing topic for similar questions, or choose "Add new FAQ topic" to create a new category.</span>
+          </label>
+          <label class="field wide" id="faq-new-topic-wrap" for="faq-new-topic">New FAQ Topic Name
+            <input id="faq-new-topic" />
+            <span class="field-help">Example: Delivery Fee. This creates the stable topic used by the AI classifier.</span>
+          </label>
           <label class="field wide" for="faq-examples">Example Customer Questions <textarea id="faq-examples" required></textarea></label>
           <label class="field wide" for="faq-reply">Approved Reply <textarea class="reply" id="faq-reply" required></textarea></label>
         </div>
@@ -10177,7 +10153,14 @@ function replyLibraryPageHtml() {
       <form id="sales-form" class="editor">
         <input id="sales-id" type="hidden" />
         <div class="fields">
-          <label class="field wide" for="sales-intent-key">Sales Intent <select id="sales-intent-key" required></select></label>
+          <label class="field wide" for="sales-intent-key">Sales Intent / Category
+            <select id="sales-intent-key"></select>
+            <span class="field-help">Choose an existing hesitation/objection intent, or choose "Add new sales intent".</span>
+          </label>
+          <label class="field wide" id="sales-new-intent-wrap" for="sales-new-intent">New Sales Intent Name
+            <input id="sales-new-intent" />
+            <span class="field-help">Example: Wants to ask husband first. This creates the stable intent used by the sales classifier.</span>
+          </label>
           <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
           <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
           <label class="field wide" for="sales-repeat-action">Same Intent Again <select id="sales-repeat-action"></select></label>
@@ -10197,10 +10180,38 @@ function replyLibraryPageHtml() {
     const salesIntentOptions = ${JSON.stringify(SALES_INTENT_OPTIONS)};
     const salesRepeatActionOptions = ${JSON.stringify(SALES_REPEAT_ACTION_OPTIONS)};
     function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]); }
+    function readableLabel(value) {
+      return String(value || "").replace(/[_-]+/g, " ").replace(/\\s+/g, " ").trim().replace(/\\b\\w/g, ch => ch.toUpperCase());
+    }
+    function stableKey(value, fallback) {
+      return String(value || fallback || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || String(fallback || "custom").toLowerCase();
+    }
+    const faqTopicLabelMap = new Map([
+      ["Business or warehouse location and how delivery is arranged", "Business / warehouse location"],
+      ["Whether customer needs to pay a delivery charge or whether delivery is free", "Delivery fee"],
+      ["Whether delivery service is available", "Delivery availability"],
+      ["Whether customer may pay at the end of the month", "End-of-month payment"],
+      ["How many days new stock takes to arrive", "Stock arrival time"],
+      ["Whether the business delivers the arrived item or customer must collect it", "Delivery or self-collect"],
+      ["Learned: Kedai dekat mane?", "Business location"],
+      ["Learned: Kedai dekat mana?", "Business location"],
+    ]);
+    function friendlyFaqTopicLabel(value) {
+      const text = String(value || "").trim();
+      return faqTopicLabelMap.get(text) || text.replace(/^Learned:\\s*/i, "");
+    }
     function salesIntentKey(reply) { return reply.sales_intent || reply.intent_key || String(reply.objection_type || "").toLowerCase().replace(/[\\s-]+/g, "_"); }
-    function salesIntentLabel(key) { return (salesIntentOptions.find(item => item.key === key) || {}).label || key || ""; }
+    function salesIntentLabel(key, reply) { return (salesIntentOptions.find(item => item.key === key) || {}).label || reply?.objection_type || readableLabel(key) || ""; }
+    function salesIntentChoices() {
+      const choices = [...salesIntentOptions];
+      (salesLibrary.general || []).forEach(reply => {
+        const key = salesIntentKey(reply);
+        if (key && !choices.some(item => item.key === key)) choices.push({ key, label: salesIntentLabel(key, reply) });
+      });
+      return choices;
+    }
     function renderSalesIntentOptions(selected) {
-      return '<option value="">Select sales intent</option>' + salesIntentOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
+      return '<option value="">Add new sales intent</option>' + salesIntentChoices().map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
     }
     function salesRepeatActionKey(reply) { return reply.repeat_action || "openai_acknowledge"; }
     function salesRepeatActionLabel(key) { return (salesRepeatActionOptions.find(item => item.key === key) || {}).label || key || ""; }
@@ -10210,14 +10221,31 @@ function replyLibraryPageHtml() {
     function faqTopicKey(faq) { return faq.topic_key || faq.topicKey || faq.id || ""; }
     function renderFaqTopicOptions(selected) {
       const records = faqLibrary.general || [];
-      return '<option value="">New FAQ topic</option>' + records.map(faq => '<option value="' + esc(faqTopicKey(faq)) + '"' + (faqTopicKey(faq) === selected ? ' selected' : '') + '>' + esc(faq.topic || faq.id) + '</option>').join('');
+      return '<option value="">Add new FAQ topic</option>' + records.map(faq => '<option value="' + esc(faqTopicKey(faq)) + '"' + (faqTopicKey(faq) === selected ? ' selected' : '') + '>' + esc(friendlyFaqTopicLabel(faq.topic || faq.id)) + '</option>').join('');
+    }
+    function selectedFaqTopic() {
+      const key = document.querySelector("#faq-topic-key").value;
+      return (faqLibrary.general || []).find(faq => faqTopicKey(faq) === key);
+    }
+    function selectedSalesIntent() {
+      const key = document.querySelector("#sales-intent-key").value;
+      return (salesLibrary.general || []).find(reply => salesIntentKey(reply) === key);
+    }
+    function syncFaqTopicFields() {
+      const isNew = !document.querySelector("#faq-topic-key").value;
+      document.querySelector("#faq-new-topic-wrap").hidden = !isNew;
+    }
+    function syncSalesIntentFields() {
+      const selectedKey = document.querySelector("#sales-intent-key").value;
+      const isNew = !selectedKey;
+      document.querySelector("#sales-new-intent-wrap").hidden = !isNew;
     }
     function renderFaqRows(records) {
       if (!records.length) return '<div class="empty">No general FAQs yet.</div>';
       return '<table><thead><tr><th>Topic</th><th>Example Questions</th><th>Approved Reply</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(faq => {
         const questions = (faq.example_questions || []).map(esc).join('<br>');
         const status = faq.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
-        return '<tr><td>' + esc(faq.topic) + '</td><td>' + questions + '</td><td class="reply">' + esc(faq.approved_reply) + '</td><td>' + status + '</td><td><button type="button" class="edit-faq" data-id="' + esc(faq.id) + '">Edit</button> <button type="button" class="delete-faq" data-id="' + esc(faq.id) + '" data-topic="' + esc(faq.topic || faq.id) + '">Delete</button></td></tr>';
+        return '<tr><td>' + esc(friendlyFaqTopicLabel(faq.topic)) + '</td><td>' + questions + '</td><td class="reply">' + esc(faq.approved_reply) + '</td><td>' + status + '</td><td><button type="button" class="edit-faq" data-id="' + esc(faq.id) + '">Edit</button> <button type="button" class="delete-faq" data-id="' + esc(faq.id) + '" data-topic="' + esc(friendlyFaqTopicLabel(faq.topic || faq.id)) + '">Delete</button></td></tr>';
       }).join('') + '</tbody></table>';
     }
     function renderSalesRows(records) {
@@ -10226,7 +10254,7 @@ function replyLibraryPageHtml() {
         const examples = (reply.example_messages || []).map(esc).join('<br>');
         const status = reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
         const intentKey = salesIntentKey(reply);
-        return '<tr><td>' + esc(salesIntentLabel(intentKey)) + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td>' + esc(salesRepeatActionLabel(salesRepeatActionKey(reply))) + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(salesIntentLabel(intentKey) || reply.id) + '">Delete</button></td></tr>';
+        return '<tr><td>' + esc(salesIntentLabel(intentKey, reply)) + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td>' + esc(salesRepeatActionLabel(salesRepeatActionKey(reply))) + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(salesIntentLabel(intentKey, reply) || reply.id) + '">Delete</button></td></tr>';
       }).join('') + '</tbody></table>';
     }
     function renderFaq() {
@@ -10234,26 +10262,28 @@ function replyLibraryPageHtml() {
       document.querySelector("#faq-list").innerHTML = renderFaqRows(faqLibrary.general || []);
       document.querySelectorAll(".edit-faq").forEach(button => button.addEventListener("click", () => editFaq(button.dataset.id)));
       document.querySelectorAll(".delete-faq").forEach(button => button.addEventListener("click", () => deleteFaq(button.dataset.id, button.dataset.topic)));
+      syncFaqTopicFields();
     }
     function renderSales() {
       document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(document.querySelector("#sales-intent-key").value);
       document.querySelector("#sales-list").innerHTML = renderSalesRows(salesLibrary.general || []);
       document.querySelectorAll(".edit-sales").forEach(button => button.addEventListener("click", () => editSales(button.dataset.id)));
       document.querySelectorAll(".delete-sales").forEach(button => button.addEventListener("click", () => deleteSales(button.dataset.id, button.dataset.label)));
+      syncSalesIntentFields();
     }
     function newFaq() {
-      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(""); document.querySelector("#faq-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = "";
+      document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(""); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function editFaq(id) {
       const faq = (faqLibrary.general || []).find(item => item.id === id); if (!faq) return;
-      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-topic").value = faq.topic || ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = "";
+      document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = "";
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -10264,14 +10294,24 @@ function replyLibraryPageHtml() {
     async function saveFaq(event) {
       event.preventDefault(); const button = document.querySelector("#save-faq"); const state = document.querySelector("#faq-state"); button.disabled = true; state.textContent = "Saving...";
       try {
-        const response = await fetch("/admin/faq-library/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#faq-id").value, scope: "general", topicKey: document.querySelector("#faq-topic-key").value, topic: document.querySelector("#faq-topic").value, exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#faq-reply").value, active: document.querySelector("#faq-active").checked }) });
+        const selectedTopicKey = document.querySelector("#faq-topic-key").value;
+        const newTopicName = document.querySelector("#faq-new-topic").value.trim();
+        const selectedTopic = selectedFaqTopic();
+        const displayName = selectedTopic ? friendlyFaqTopicLabel(selectedTopic.topic || selectedTopic.id) : newTopicName;
+        const topicKey = selectedTopicKey || stableKey(newTopicName || displayName, "faq_topic");
+        const response = await fetch("/admin/faq-library/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#faq-id").value, scope: "general", topicKey, topic: displayName, exampleQuestions: document.querySelector("#faq-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#faq-reply").value, active: document.querySelector("#faq-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); faqLibrary = result.data; renderFaq(); editFaq(result.faq.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
     async function saveSales(event) {
       event.preventDefault(); const button = document.querySelector("#save-sales"); const state = document.querySelector("#sales-state"); button.disabled = true; state.textContent = "Saving...";
       try {
-        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent: document.querySelector("#sales-intent-key").value, exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
+        const selectedIntentKey = document.querySelector("#sales-intent-key").value;
+        const newIntentName = document.querySelector("#sales-new-intent").value.trim();
+        const selectedIntent = selectedSalesIntent();
+        const displayName = selectedIntentKey ? salesIntentLabel(selectedIntentKey, selectedIntent) : newIntentName;
+        const salesIntent = selectedIntentKey || stableKey(newIntentName || displayName, "sales_intent");
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
@@ -10289,6 +10329,8 @@ function replyLibraryPageHtml() {
     }
     document.querySelector("#new-faq").addEventListener("click", newFaq);
     document.querySelector("#new-sales").addEventListener("click", newSales);
+    document.querySelector("#faq-topic-key").addEventListener("change", syncFaqTopicFields);
+    document.querySelector("#sales-intent-key").addEventListener("change", syncSalesIntentFields);
     document.querySelector("#faq-form").addEventListener("submit", saveFaq);
     document.querySelector("#sales-form").addEventListener("submit", saveSales);
     document.querySelector("#refresh").addEventListener("click", () => { loadFaq(); loadSales(); });
@@ -11759,18 +11801,6 @@ function productFlowPageHtml() {
               <label class="field wide" for="product-faq-reply">Approved Reply
                 <textarea class="reply" id="product-faq-reply"></textarea>
               </label>
-              <label class="field wide" for="product-faq-bm-topic">Brunei-Malay Topic
-                <input id="product-faq-bm-topic" />
-              </label>
-              <label class="field wide" for="product-faq-bm-examples">Brunei-Malay Example Questions
-                <textarea id="product-faq-bm-examples"></textarea>
-              </label>
-              <label class="field wide" for="product-faq-bm-reply">Brunei-Malay Approved Reply
-                <textarea class="reply" id="product-faq-bm-reply"></textarea>
-              </label>
-              <label class="field wide" for="product-faq-bm-search">Brunei-Malay Search Text
-                <textarea id="product-faq-bm-search"></textarea>
-              </label>
             </div>
             <div class="editor-actions">
               <label for="product-faq-active"><input id="product-faq-active" type="checkbox" checked /> Active</label>
@@ -12115,16 +12145,11 @@ function productFlowPageHtml() {
     }
 
     function faqItemHtml(faq) {
-      const questions = [
-        ...(faq.exampleQuestions || []),
-        ...(faq.bruneiMalayExampleQuestions || [])
-      ].filter(Boolean).join("\\n");
+      const questions = (faq.exampleQuestions || []).filter(Boolean).join("\\n");
       return '<div class="knowledge-item">' +
         '<strong>' + esc(faq.topic || faq.id || "Approved product FAQ") + '</strong>' +
         (questions ? '<p><b>Questions:</b>\\n' + esc(questions) + '</p>' : '') +
         (faq.approvedReply ? '<p><b>Approved answer:</b>\\n' + esc(faq.approvedReply) + '</p>' : '') +
-        (faq.bruneiMalayApprovedReply ? '<p><b>Brunei-Malay answer:</b>\\n' + esc(faq.bruneiMalayApprovedReply) + '</p>' : '') +
-        (faq.bruneiMalaySearchText ? '<div class="knowledge-meta">Search text: ' + esc(faq.bruneiMalaySearchText) + '</div>' : '') +
         '<div class="knowledge-actions">' +
           '<button type="button" data-edit-product-faq="' + esc(faq.id) + '">Edit</button>' +
           '<button class="danger" type="button" data-delete-product-faq="' + esc(faq.id) + '" data-faq-topic="' + esc(faq.topic || faq.id) + '">Delete</button>' +
@@ -12148,10 +12173,6 @@ function productFlowPageHtml() {
       document.querySelector("#product-faq-topic").value = "";
       document.querySelector("#product-faq-examples").value = "";
       document.querySelector("#product-faq-reply").value = "";
-      document.querySelector("#product-faq-bm-topic").value = "";
-      document.querySelector("#product-faq-bm-examples").value = "";
-      document.querySelector("#product-faq-bm-reply").value = "";
-      document.querySelector("#product-faq-bm-search").value = "";
       document.querySelector("#product-faq-active").checked = true;
     }
 
@@ -12173,10 +12194,6 @@ function productFlowPageHtml() {
       document.querySelector("#product-faq-topic").value = faq.topic || "";
       document.querySelector("#product-faq-examples").value = (faq.exampleQuestions || []).join("\\n");
       document.querySelector("#product-faq-reply").value = faq.approvedReply || "";
-      document.querySelector("#product-faq-bm-topic").value = faq.bruneiMalayTopic || "";
-      document.querySelector("#product-faq-bm-examples").value = (faq.bruneiMalayExampleQuestions || []).join("\\n");
-      document.querySelector("#product-faq-bm-reply").value = faq.bruneiMalayApprovedReply || "";
-      document.querySelector("#product-faq-bm-search").value = faq.bruneiMalaySearchText || "";
       document.querySelector("#product-faq-active").checked = faq.active !== false;
       document.querySelector("#product-faq-status").textContent = "Editing product FAQ";
       showProductFaqForm();
@@ -12202,10 +12219,6 @@ function productFlowPageHtml() {
             topic: document.querySelector("#product-faq-topic").value,
             exampleQuestions: document.querySelector("#product-faq-examples").value.split(/\\r?\\n/),
             approvedReply: document.querySelector("#product-faq-reply").value,
-            bruneiMalayTopic: document.querySelector("#product-faq-bm-topic").value,
-            bruneiMalayExampleQuestions: document.querySelector("#product-faq-bm-examples").value.split(/\\r?\\n/),
-            bruneiMalayApprovedReply: document.querySelector("#product-faq-bm-reply").value,
-            bruneiMalaySearchText: document.querySelector("#product-faq-bm-search").value,
             active: document.querySelector("#product-faq-active").checked
           })
         });
