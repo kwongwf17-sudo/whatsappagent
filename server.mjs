@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildConversationPlan,
   classifyFaqSalesPromptResponse,
+  conversationActiveState,
   approvedFaqRecordsForProduct,
   extractOrderDetails,
   findApprovedFaqLocalMatch,
@@ -356,6 +357,11 @@ const SALES_REPEAT_ACTION_OPTIONS = [
   { key: "handoff", label: "Handoff to admin" },
 ];
 const SALES_REPEAT_ACTION_LABELS = new Map(SALES_REPEAT_ACTION_OPTIONS.map((item) => [item.key, item.label]));
+const SALES_AFTER_REPLY_OPTIONS = [
+  { key: "WAIT_FOR_CUSTOMER", label: "Wait for customer" },
+  { key: "CLOSE_SALES_CONVERSATION", label: "Close sales conversation" },
+];
+const SALES_AFTER_REPLY_LABELS = new Map(SALES_AFTER_REPLY_OPTIONS.map((item) => [item.key, item.label]));
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1966,6 +1972,7 @@ async function processInboundMessage({
   }
 
   const conversationContext = await recentConversationContext(from, businessAccountId);
+  const activeState = conversationActiveState(customer);
   const sourceMatchedProduct = findProductMatch(teamCatalog, "", source);
   const contextMatchedProduct = customer.productId
     ? sourceMatchedProduct
@@ -1976,6 +1983,7 @@ async function processInboundMessage({
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
   const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
   const shouldPrioritizeOpeningFlow =
+    !activeState &&
     !customer.pendingOrder &&
     (
       isProductNameOnlyOpening ||
@@ -2224,7 +2232,7 @@ async function processInboundMessage({
   }
 
   const product = routedProduct;
-  const productOpeningFlow = shouldSendProductOpeningFlow(customer, product, text, source);
+  const productOpeningFlow = !activeState && shouldSendProductOpeningFlow(customer, product, text, source);
   const messageSource = productOpeningFlow ? { ...source, productNameMatch: true } : source;
   const fixedOpeningFlow = productOpeningFlow;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
@@ -2264,6 +2272,7 @@ async function processInboundMessage({
         intent: selectedSalesReply.intent || "",
         approvedReply: selectedSalesReply.approved_reply,
         repeatAction: selectedSalesReply.repeat_action,
+        afterReply: selectedSalesReply.after_reply || selectedSalesReply.afterReply || "",
       }
     : null;
   const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || selectedSalesReply || !allowKnowledgeRoute
@@ -2283,7 +2292,7 @@ async function processInboundMessage({
   if (faqSalesResponse) {
     console.log(`Skipping OpenAI for Package B interest response from ${from}: ${faqSalesResponse}`);
   }
-  const planningCustomer = shouldStartNewProductJourney(customer, product)
+  const planningCustomer = !activeState && shouldStartNewProductJourney(customer, product)
     ? { ...customer, productId: product.id, followupsSent: {}, pendingOrder: null, awaitingPackageBInterest: false }
     : customer;
   const plan = await buildConversationPlan({
@@ -4165,6 +4174,7 @@ function guardrailDisplay(customer, now = new Date()) {
   const status = followupGuardrailStatus(customer, now);
   if (!status.blocked) return "ok";
   if (status.reason === "opted_out") return "opted out: no follow-up";
+  if (status.reason === "sales_conversation_closed") return "sales closed: no follow-up";
   if (status.reason === "complaint_handoff") return "complaint: human required";
   if (status.reason === "human_handoff") return "human handoff: no follow-up";
   if (status.reason === "outside_24_hour_window") return "template follow-up required";
@@ -4176,6 +4186,17 @@ function guardrailDisplay(customer, now = new Date()) {
 function followupGuardrailStatus(customer, now = new Date()) {
   if (customer.optedOut) return { blocked: true, reason: "opted_out" };
   if ((customer.orderIds || []).length > 0) return { blocked: true, reason: "order_submitted" };
+  const salesStatus = String(customer.salesStatus || "").trim().toLowerCase();
+  const conversationState = String(customer.conversationState || "").trim().toLowerCase();
+  const followupBlockedReason = String(customer.followupBlockedReason || "").trim().toLowerCase();
+  if (
+    customer.salesConversationClosed ||
+    salesStatus === "sales_closed" ||
+    conversationState === "sales_closed" ||
+    followupBlockedReason === "sales_conversation_closed"
+  ) {
+    return { blocked: true, reason: "sales_conversation_closed" };
+  }
   if (customer.complaintStatus === "open" || customer.followupBlockedReason === "complaint_handoff") {
     return { blocked: true, reason: "complaint_handoff" };
   }
@@ -4211,6 +4232,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
     const guardrail = followupGuardrailStatus(customer, now);
     if (hasOrder) status = "skipped order";
     if (guardrail.reason === "opted_out") status = "blocked: opted out";
+    if (guardrail.reason === "sales_conversation_closed") status = "blocked: sales closed";
     if (guardrail.reason === "human_handoff") status = "blocked: human handoff";
     if (guardrail.reason === "complaint_handoff") status = "blocked: complaint";
     if (guardrail.reason === "followup_blocked") status = "blocked";
@@ -6438,7 +6460,12 @@ function salesRepliesData(content = defaultTeamContent) {
   return {
     general: (teamSalesReplyLibrary.sales_replies || [])
       .filter((reply) => (reply.scope || "business") !== "product")
-      .map((reply) => ({ ...reply, scope: "general", productId: "" })),
+      .map((reply) => ({
+        ...reply,
+        after_reply: normalizeSalesAfterReplyAction(reply.after_reply || reply.afterReply),
+        scope: "general",
+        productId: "",
+      })),
     products: [],
   };
 }
@@ -6454,6 +6481,7 @@ function saveSalesReply(body, content = defaultTeamContent) {
   const intent = String(body.intent || "").trim() || salesIntentDescription(salesIntent) || `Customer sales response or hesitation: ${objectionType}`;
   const approvedReply = String(body.approvedReply || "").trim();
   const repeatAction = normalizeSalesRepeatAction(body.repeatAction);
+  const afterReply = normalizeSalesAfterReplyAction(body.afterReply || body.after_reply);
   const exampleMessages = Array.isArray(body.exampleMessages)
     ? body.exampleMessages.map((message) => String(message).trim()).filter(Boolean)
     : String(body.exampleMessages || "").split(/\r?\n/).map((message) => message.trim()).filter(Boolean);
@@ -6484,6 +6512,7 @@ function saveSalesReply(body, content = defaultTeamContent) {
     example_messages: exampleMessages,
     approved_reply: approvedReply,
     repeat_action: repeatAction,
+    after_reply: afterReply,
     scope: storageScope,
     productId: "",
     active: body.active !== false,
@@ -6497,6 +6526,11 @@ function saveSalesReply(body, content = defaultTeamContent) {
 function normalizeSalesRepeatAction(value) {
   const action = String(value || "openai_acknowledge").trim();
   return SALES_REPEAT_ACTION_LABELS.has(action) ? action : "openai_acknowledge";
+}
+
+function normalizeSalesAfterReplyAction(value) {
+  const action = String(value || "WAIT_FOR_CUSTOMER").trim().toUpperCase();
+  return SALES_AFTER_REPLY_LABELS.has(action) ? action : "WAIT_FOR_CUSTOMER";
 }
 
 function normalizeSalesIntent(value) {
@@ -10163,6 +10197,10 @@ function replyLibraryPageHtml() {
           </label>
           <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
           <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
+          <label class="field wide" for="sales-after-reply">After Reply
+            <select id="sales-after-reply"></select>
+            <span class="field-help">Choose "Wait for customer" to keep normal follow-ups active. Choose "Close sales conversation" to stop sales follow-ups and sales prompts after this approved reply. "Same Intent Again" only applies if the same intent appears later.</span>
+          </label>
           <label class="field wide" for="sales-repeat-action">Same Intent Again <select id="sales-repeat-action"></select></label>
         </div>
         <div class="editor-actions">
@@ -10179,6 +10217,7 @@ function replyLibraryPageHtml() {
     let salesLibrary = { general: [] };
     const salesIntentOptions = ${JSON.stringify(SALES_INTENT_OPTIONS)};
     const salesRepeatActionOptions = ${JSON.stringify(SALES_REPEAT_ACTION_OPTIONS)};
+    const salesAfterReplyOptions = ${JSON.stringify(SALES_AFTER_REPLY_OPTIONS)};
     function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]); }
     function readableLabel(value) {
       return String(value || "").replace(/[_-]+/g, " ").replace(/\\s+/g, " ").trim().replace(/\\b\\w/g, ch => ch.toUpperCase());
@@ -10218,6 +10257,11 @@ function replyLibraryPageHtml() {
     function renderSalesRepeatActionOptions(selected) {
       return salesRepeatActionOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
     }
+    function salesAfterReplyKey(reply) { return reply.after_reply || reply.afterReply || "WAIT_FOR_CUSTOMER"; }
+    function salesAfterReplyLabel(key) { return (salesAfterReplyOptions.find(item => item.key === key) || {}).label || key || ""; }
+    function renderSalesAfterReplyOptions(selected) {
+      return salesAfterReplyOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
+    }
     function faqTopicKey(faq) { return faq.topic_key || faq.topicKey || faq.id || ""; }
     function renderFaqTopicOptions(selected) {
       const records = faqLibrary.general || [];
@@ -10250,11 +10294,11 @@ function replyLibraryPageHtml() {
     }
     function renderSalesRows(records) {
       if (!records.length) return '<div class="empty">No general sales replies yet.</div>';
-      return '<table><thead><tr><th>Sales Intent</th><th>Examples</th><th>Approved Reply</th><th>Same Intent Again</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(reply => {
+      return '<table><thead><tr><th>Sales Intent</th><th>Examples</th><th>Approved Reply</th><th>After Reply</th><th>Same Intent Again</th><th>Status</th><th></th></tr></thead><tbody>' + records.map(reply => {
         const examples = (reply.example_messages || []).map(esc).join('<br>');
         const status = reply.active === false ? '<span class="pill off">Inactive</span>' : '<span class="pill">Active</span>';
         const intentKey = salesIntentKey(reply);
-        return '<tr><td>' + esc(salesIntentLabel(intentKey, reply)) + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td>' + esc(salesRepeatActionLabel(salesRepeatActionKey(reply))) + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(salesIntentLabel(intentKey, reply) || reply.id) + '">Delete</button></td></tr>';
+        return '<tr><td>' + esc(salesIntentLabel(intentKey, reply)) + '</td><td>' + examples + '</td><td class="reply">' + esc(reply.approved_reply) + '</td><td>' + esc(salesAfterReplyLabel(salesAfterReplyKey(reply))) + '</td><td>' + esc(salesRepeatActionLabel(salesRepeatActionKey(reply))) + '</td><td>' + status + '</td><td><button type="button" class="edit-sales" data-id="' + esc(reply.id) + '">Edit</button> <button type="button" class="delete-sales" data-id="' + esc(reply.id) + '" data-label="' + esc(salesIntentLabel(intentKey, reply) || reply.id) + '">Delete</button></td></tr>';
       }).join('') + '</tbody></table>';
     }
     function renderFaq() {
@@ -10279,11 +10323,11 @@ function replyLibraryPageHtml() {
       document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions("WAIT_FOR_CUSTOMER"); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions(salesAfterReplyKey(reply)); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -10311,7 +10355,7 @@ function replyLibraryPageHtml() {
         const selectedIntent = selectedSalesIntent();
         const displayName = selectedIntentKey ? salesIntentLabel(selectedIntentKey, selectedIntent) : newIntentName;
         const salesIntent = selectedIntentKey || stableKey(newIntentName || displayName, "sales_intent");
-        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, afterReply: document.querySelector("#sales-after-reply").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
