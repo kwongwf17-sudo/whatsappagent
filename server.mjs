@@ -2237,9 +2237,6 @@ async function processInboundMessage({
   const fixedOpeningFlow = productOpeningFlow;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
   const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
-  const classifiedKnowledgeRoute =
-    routeClassification?.confidence !== "low" &&
-    ["general_faq", "product_question"].includes(routeClassification?.messageType);
   const exactSalesReply = faqSalesResponse
     ? null
     : (allowSalesReplyRoute ? findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary }) : null);
@@ -2256,7 +2253,7 @@ async function processInboundMessage({
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
   const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || selectedSalesReply
     ? null
-    : (allowKnowledgeRoute && !classifiedKnowledgeRoute ? findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext }) : null);
+    : (allowKnowledgeRoute ? findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext }) : null);
   const approvedFaqMatch = exactApprovedFaq
     ? {
         faqId: exactApprovedFaq.id,
