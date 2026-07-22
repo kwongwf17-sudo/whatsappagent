@@ -19,8 +19,8 @@ import {
   normalizeCustomerMessage,
   salesReplyRecordsForProduct,
   formatStockArrivalMessage,
+  shouldSendProductOpeningFlow,
   textMessage,
-  usesFixedOpeningFlow,
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
@@ -2224,9 +2224,9 @@ async function processInboundMessage({
   }
 
   const product = routedProduct;
-  const productNameOpening = isProductNameMessage(product, text);
-  const messageSource = productNameOpening ? { ...source, productNameMatch: true } : source;
-  const fixedOpeningFlow = usesFixedOpeningFlow(customer, text, messageSource);
+  const productOpeningFlow = shouldSendProductOpeningFlow(customer, product, text, source);
+  const messageSource = productOpeningFlow ? { ...source, productNameMatch: true } : source;
+  const fixedOpeningFlow = productOpeningFlow;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
   const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
   const classifiedKnowledgeRoute =
