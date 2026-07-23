@@ -20,7 +20,8 @@ import {
   normalizeCustomerMessage,
   salesReplyRecordsForProduct,
   formatStockArrivalMessage,
-  shouldSendProductOpeningFlow,
+  getOpeningFlowDecision,
+  resolveProduct,
   textMessage,
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
@@ -56,6 +57,7 @@ import {
   complaintCategoryDisplay,
   detectObviousComplaint,
 } from "./lib/complaints.mjs";
+import { validateProductionConfig } from "./lib/config_security.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 await loadEnvFile(path.join(__dirname, ".env"));
@@ -131,6 +133,7 @@ const config = {
   appVersion: getEnv("APP_VERSION", "0.1.0-demo"),
   skipHttpServer: parseBool(getEnv("WHATSAPP_SKIP_HTTP", "false")),
 };
+validateProductionConfig(config);
 
 const FOLLOWUP_TEMPLATE_LANGUAGE = "en";
 const FOLLOWUP_TEMPLATE_BY_KEY = {
@@ -210,9 +213,12 @@ await adminAccounts.ensureInitialAccount({
 });
 await operations.ensureState({ version: config.appVersion });
 let catalogWriteQueue = Promise.resolve();
-const processedMessageIds = new Map();
 const pendingOrderDetailBuffers = new Map();
 const pendingMessageMergeBuffers = new Map();
+const PENDING_BUFFER_TYPE = {
+  MESSAGE_MERGE: "message_merge",
+  ORDER_DETAIL: "order_detail",
+};
 const deliveredOutboundMessages = new Map();
 const submittedOutboundMessages = new Map();
 const outboundDeliveryWaiters = new Map();
@@ -1502,7 +1508,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         followupBlocked: true,
         followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
-      clearPendingCustomerBuffers(adminSession.accountId, customerId);
+      await clearPendingCustomerBuffers(adminSession.accountId, customerId);
       await store.appendAuditLog({
         action: "manual_order_submitted",
         customerId,
@@ -1586,6 +1592,7 @@ if (!config.skipHttpServer) {
     console.log(`Mode: ${config.demoMode ? "demo/local outbox" : config.transportMode === "web" ? "WhatsApp Web QR" : "WhatsApp Cloud API"}`);
     console.log(`Webhook endpoint: ${config.webhookPath}`);
   });
+  void recoverPendingCustomerBuffers();
 }
 
 if (!config.skipHttpServer && webTransportManager) {
@@ -1593,7 +1600,6 @@ if (!config.skipHttpServer && webTransportManager) {
     .then((accounts) => webTransportManager.start({
       accounts,
       onMessage: async (message) => {
-        if (alreadyProcessed(message.id)) return;
         if (message.source?.fromMe) {
           await handleManualBusinessMessage(message);
           return;
@@ -1701,7 +1707,6 @@ async function handleWebhookPayload(rawBody) {
     }
 
     for (const message of messages) {
-      if (alreadyProcessed(message.id)) continue;
       const businessAccountId = await businessAccountIdForPhoneNumber(message.phoneNumberId);
       const text = getMessageText(message);
       if (!text) {
@@ -1864,11 +1869,30 @@ async function recordInboundMediaHandoff({
 }) {
   const normalizedMediaType = normalizeInboundMediaType(mediaType);
   const contactPatch = customerContactPatch(from, source);
+  const correlationId = correlationIdForInbound(id, from);
+  if (id) {
+    const claim = await store.claimProcessedMessage(id, businessAccountId, {
+      customerId: String(from || ""),
+      correlationId,
+      mediaType: normalizedMediaType,
+    });
+    if (!claim.claimed) {
+      console.log(`Skipping duplicate inbound ${normalizedMediaType} message ${id} from ${from}.`);
+      return {
+        customer: await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch }),
+        messages: [],
+        duplicateInbound: true,
+        correlationId: claim.record?.correlationId || correlationId,
+      };
+    }
+  }
   if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
     console.log(`Skipping duplicate inbound ${normalizedMediaType} message ${id} from ${from}.`);
     return {
       customer: await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch }),
       messages: [],
+      duplicateInbound: true,
+      correlationId,
     };
   }
   console.log(`Incoming WhatsApp ${normalizedMediaType} message from ${from}; routed to handoff.`);
@@ -1878,6 +1902,7 @@ async function recordInboundMediaHandoff({
     from,
     to: "agent",
     businessAccountId,
+    correlationId,
     channel: "customer",
     type: normalizedMediaType,
     body: inboundMediaPlaceholder(normalizedMediaType),
@@ -1893,6 +1918,7 @@ async function recordInboundMediaHandoff({
     ...contactPatch,
     handoffStatus: "human_required",
     handoffReason: `Customer sent ${normalizedMediaType}; manual reply required.`,
+    handoffSeverity: handoffSeverityForReason(`Customer sent ${normalizedMediaType}; manual reply required.`),
   });
   await store.appendAuditLog({
     actor: "ai_agent",
@@ -1900,11 +1926,64 @@ async function recordInboundMediaHandoff({
     customerId: from,
     businessAccountId,
     result: normalizedMediaType,
+    correlationId,
   });
-  return { customer, messages: [] };
+  if (id) {
+    await store.completeProcessedMessage(id, businessAccountId, {
+      correlationId,
+      customerId: String(from || ""),
+      handoffRequired: true,
+    });
+  }
+  return { customer, messages: [], correlationId };
 }
 
-async function processInboundMessage({
+async function processInboundMessage(args) {
+  const id = String(args?.id || "").trim();
+  const businessAccountId = args?.businessAccountId || config.accountId;
+  const correlationId = args?.correlationId || correlationIdForInbound(id, args?.from);
+  if (id && !args?.skipInboundRecord) {
+    const claim = await store.claimProcessedMessage(id, businessAccountId, {
+      customerId: String(args?.from || ""),
+      correlationId,
+    });
+    if (!claim.claimed) {
+      console.log(`Skipping duplicate inbound message ${id} from ${args?.from}; status=${claim.record?.processingStatus || "unknown"}.`);
+      return {
+        customer: await store.getOrCreateCustomer(args.from, { businessAccountId, ...customerContactPatch(args.from, args.source || {}) }),
+        order: null,
+        messages: [],
+        handoffRequired: false,
+        handoffReason: "Duplicate inbound message skipped.",
+        duplicateInbound: true,
+        correlationId: claim.record?.correlationId || correlationId,
+      };
+    }
+  }
+
+  try {
+    const result = await processInboundMessageCore({ ...args, correlationId });
+    if (id && !args?.skipInboundRecord) {
+      await store.completeProcessedMessage(id, businessAccountId, {
+        correlationId,
+        customerId: String(args?.from || ""),
+        orderId: result?.order?.id || result?.order?.orderId || "",
+        handoffRequired: Boolean(result?.handoffRequired),
+      });
+    }
+    return { ...result, correlationId };
+  } catch (error) {
+    if (id && !args?.skipInboundRecord) {
+      await store.failProcessedMessage(id, businessAccountId, error?.code || error?.name || "PROCESSING_FAILED", {
+        correlationId,
+        customerId: String(args?.from || ""),
+      }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function processInboundMessageCore({
   id,
   from,
   text,
@@ -1916,6 +1995,8 @@ async function processInboundMessage({
   skipOrderDetailBuffer = false,
   skipMessageMergeBuffer = false,
   skipInboundRecord = false,
+  isFirstEligibleInbound,
+  correlationId,
 }) {
   console.log(`Incoming WhatsApp message from ${from}: ${text}`);
   const contactPatch = customerContactPatch(from, source);
@@ -1933,6 +2014,10 @@ async function processInboundMessage({
   const teamCatalog = content.catalog;
   const teamFaqLibrary = content.faqLibrary;
   const teamSalesReplyLibrary = content.salesReplyLibrary;
+  const existingCustomer = await store.getCustomer(from, businessAccountId);
+  const firstEligibleInbound = typeof isFirstEligibleInbound === "boolean"
+    ? isFirstEligibleInbound
+    : !existingCustomer || Number(existingCustomer.inboundCount || 0) === 0;
   if (!skipInboundRecord) {
     await store.appendOutbox({
       ...(id ? { id } : {}),
@@ -1940,6 +2025,7 @@ async function processInboundMessage({
       from,
       to: "agent",
       businessAccountId,
+      correlationId,
       channel: "customer",
       type: "text",
       body: text,
@@ -1968,6 +2054,8 @@ async function processInboundMessage({
       businessAccountId,
       contentAccountId,
       knowledgeAccountId,
+      isFirstEligibleInbound: firstEligibleInbound,
+      correlationId,
     }, customer);
   }
 
@@ -1987,7 +2075,7 @@ async function processInboundMessage({
     !customer.pendingOrder &&
     (
       isProductNameOnlyOpening ||
-      (contextMatchedProduct && (Number(customer.inboundCount || 0) <= 1 || contextStartsNewProductJourney))
+      (contextMatchedProduct && (firstEligibleInbound || contextStartsNewProductJourney))
     );
   if (!shouldPrioritizeOpeningFlow && !skipOrderDetailBuffer && shouldBufferIncompleteOrderDetails(customer, text, bufferProduct)) {
     return bufferIncompleteOrderDetails({
@@ -1999,6 +2087,8 @@ async function processInboundMessage({
       businessAccountId,
       contentAccountId,
       knowledgeAccountId,
+      isFirstEligibleInbound: firstEligibleInbound,
+      correlationId,
     }, customer, bufferProduct);
   }
 
@@ -2013,6 +2103,7 @@ async function processInboundMessage({
         action: "live_reply_suppressed",
         customerId: from,
         result: blocked.code,
+        correlationId,
       });
       return {
         customer: updatedCustomer,
@@ -2033,6 +2124,7 @@ async function processInboundMessage({
       customerId: from,
       result: customer.complaintCaseId || "open_complaint",
       businessAccountId,
+      correlationId,
     });
     return {
       customer,
@@ -2056,9 +2148,10 @@ async function processInboundMessage({
       customerId: from,
       result: "followups_blocked",
       reason: `${optOutIntent.reason}: ${text}`,
+      correlationId,
     });
     const outbound = [textMessage("Noted kita, kami tidak akan follow up lagi. Terima kasih.")];
-    await sendOutbound(from, outbound, { businessAccountId });
+    await sendOutbound(from, outbound, { businessAccountId, correlationId });
     return {
       customer: updatedCustomer,
       order: null,
@@ -2079,9 +2172,10 @@ async function processInboundMessage({
       customerId: from,
       result: "noted_followups_continue",
       reason: `${optOutIntent.reason}: ${text}`,
+      correlationId,
     });
     const outbound = [textMessage("Baik kita, no worries. Kalau berminat nanti, kita boleh message kami semula.")];
-    await sendOutbound(from, outbound, { businessAccountId });
+    await sendOutbound(from, outbound, { businessAccountId, correlationId });
     return {
       customer: updatedCustomer,
       order: null,
@@ -2123,6 +2217,7 @@ async function processInboundMessage({
       reason: complaintIntent.reason,
       customerMessage: text,
       inboundMessageId: id,
+      correlationId,
     });
     const complaintReply = complaintIntent.reply || await maybeCreateComplaintHandoffReply({
       customerMessage: text,
@@ -2143,6 +2238,7 @@ async function processInboundMessage({
       followupBlockedReason: "complaint_handoff",
       handoffStatus: "human_required",
       handoffReason: `Complaint - ${categoryLabel}`,
+      handoffSeverity: handoffSeverityForReason(`Complaint - ${categoryLabel}`, "complaint"),
     }), businessAccountId);
     await store.appendAuditLog({
       actor: "ai_agent",
@@ -2150,11 +2246,13 @@ async function processInboundMessage({
       customerId: from,
       result: `${complaint.id}:${complaint.category}`,
       businessAccountId,
+      correlationId,
     });
-    if (businessAccountId !== DEMO_ACCOUNT_ID) await notifyAdmin(`Complaint handoff for ${from} (${categoryLabel}): ${text}`);
+    if (businessAccountId !== DEMO_ACCOUNT_ID) await notifyAdmin(`Complaint handoff for ${from} (${categoryLabel}): ${text}`, { businessAccountId, correlationId });
     if (outbound.length) {
       await sendOutbound(from, outbound, {
         businessAccountId,
+        correlationId,
         purpose: "complaint_acknowledgement",
       });
     }
@@ -2174,6 +2272,7 @@ async function processInboundMessage({
       awaitingPackageBInterest: false,
       handoffStatus: "human_required",
       handoffReason: "Customer requested delivery reschedule.",
+      handoffSeverity: handoffSeverityForReason("Customer requested delivery reschedule.", "order_risk"),
       lastDeliveryRescheduleRequestAt: new Date().toISOString(),
     }), businessAccountId);
     await store.appendAuditLog({
@@ -2182,12 +2281,14 @@ async function processInboundMessage({
       customerId: from,
       result: latestOrder ? latestOrder.id : "no_linked_order",
       businessAccountId,
+      correlationId,
     });
     if (businessAccountId !== DEMO_ACCOUNT_ID) {
-      await notifyAdmin(`Delivery reschedule requested for ${from}: ${text}`);
+      await notifyAdmin(`Delivery reschedule requested for ${from}: ${text}`, { businessAccountId, correlationId });
     }
     await sendOutbound(from, outbound, {
       businessAccountId,
+      correlationId,
       purpose: "delivery_reschedule_handoff",
     });
     return {
@@ -2216,10 +2317,12 @@ async function processInboundMessage({
       customerId: from,
       result: latestOrder ? `${latestOrder.id}:${latestOrder.status}` : "no_linked_order",
       businessAccountId,
+      correlationId,
     });
     await delayBeforeStatusReply(from, "order status reply");
     await sendOutbound(from, outbound, {
       businessAccountId,
+      correlationId,
       purpose: "order_status_reply",
     });
     return {
@@ -2231,10 +2334,16 @@ async function processInboundMessage({
     };
   }
 
-  const product = routedProduct;
-  const productOpeningFlow = !activeState && shouldSendProductOpeningFlow(customer, product, text, source);
-  const messageSource = productOpeningFlow ? { ...source, productNameMatch: true } : source;
-  const fixedOpeningFlow = productOpeningFlow;
+  const productResolution = resolveProduct(teamCatalog, text, source, customer.productId);
+  const product = productResolution.product || routedProduct;
+  const openingFlowDecision = getOpeningFlowDecision({
+    customer,
+    productResolution: { ...productResolution, product },
+    customerMessage: text,
+    source,
+    isFirstEligibleInbound: firstEligibleInbound,
+  });
+  const messageSource = openingFlowDecision.shouldSend ? { ...source, productNameMatch: true } : source;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
   const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
   const exactSalesReply = faqSalesResponse
@@ -2251,7 +2360,7 @@ async function processInboundMessage({
         businessAccountId: knowledgeAccountId,
       });
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
-  const exactApprovedFaq = fixedOpeningFlow || faqSalesResponse || selectedSalesReply
+  const exactApprovedFaq = faqSalesResponse || selectedSalesReply
     ? null
     : (allowKnowledgeRoute ? findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext }) : null);
   const approvedFaqMatch = exactApprovedFaq
@@ -2272,7 +2381,7 @@ async function processInboundMessage({
         afterReply: selectedSalesReply.after_reply || selectedSalesReply.afterReply || "",
       }
     : null;
-  const ragAnswer = fixedOpeningFlow || faqSalesResponse || exactApprovedFaq || selectedSalesReply || !allowKnowledgeRoute
+  const ragAnswer = faqSalesResponse || exactApprovedFaq || selectedSalesReply || !allowKnowledgeRoute
     ? null
     : await maybeCreateApprovedKnowledgeRagAnswer({
         customerMessage: text,
@@ -2283,8 +2392,8 @@ async function processInboundMessage({
         product,
         businessAccountId: knowledgeAccountId,
       });
-  if (fixedOpeningFlow) {
-    console.log(`Skipping OpenAI for fixed opening flow to ${from}`);
+  if (openingFlowDecision.shouldSend) {
+    console.log(`Prepending opening flow to ${from}: ${openingFlowDecision.reason}`);
   }
   if (faqSalesResponse) {
     console.log(`Skipping OpenAI for Package B interest response from ${from}: ${faqSalesResponse}`);
@@ -2304,6 +2413,9 @@ async function processInboundMessage({
     ragAnswer,
     routeClassification,
     conversationContext,
+    productResolution: { ...productResolution, product },
+    openingFlowDecision,
+    isFirstEligibleInbound: firstEligibleInbound,
   });
 
   let repeatPatch = {};
@@ -2355,34 +2467,30 @@ async function processInboundMessage({
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
     ...(plan.customerPatch || {}),
+    ...(plan.handoffRequired || repeatHandoffRequired
+      ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || plan.handoffReason || "", plan.handoffSeverity) }
+      : {}),
     ...anotherDatePatch,
     ...repeatPatch,
-    ...(fixedOpeningFlow
-      ? {
-          conversationState: "opening_flow_sent",
-          openingFlowSentAt: new Date().toISOString(),
-          openingFlowProductId: product?.id || "",
-        }
-      : {}),
   }), businessAccountId);
   let order = null;
   if (plan.order) {
-    order = await store.addOrder({ ...plan.order, businessAccountId });
+    order = await store.addOrder({ ...plan.order, businessAccountId, inboundMessageId: id || "", correlationId });
   }
 
   if (plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(plan.adminMessage);
+    await notifyAdmin(plan.adminMessage, { businessAccountId, correlationId });
   }
 
   if ((plan.handoffRequired || repeatHandoffRequired) && !plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || plan.handoffReason || "No reason supplied."}`);
+    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || plan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
   }
 
   const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? plan.messages));
-  if (!order && fixedOpeningFlow) {
-    await delayBeforeNewCustomerOpeningFlow(customer, "fixed opening flow");
+  if (!order && openingFlowDecision.shouldSend) {
+    await delayBeforeNewCustomerOpeningFlow(customer, "opening flow");
   }
-  await sendOutbound(from, outbound, { businessAccountId });
+  await sendOutbound(from, outbound, { businessAccountId, correlationId });
 
   return {
     customer: updatedCustomer,
@@ -2390,6 +2498,7 @@ async function processInboundMessage({
     messages: outbound,
     handoffRequired: Boolean(plan.handoffRequired || repeatHandoffRequired),
     handoffReason: repeatHandoffReason || plan.handoffReason || "",
+    handoffSeverity: handoffSeverityForReason(repeatHandoffReason || plan.handoffReason || "", plan.handoffSeverity),
   };
 }
 
@@ -4971,6 +5080,24 @@ function detectOptOutIntent(text) {
   return { optedOut: false, uncertain: false, reason: "not_opt_out" };
 }
 
+function correlationIdForInbound(messageId = "", customerId = "") {
+  const stable = String(messageId || "").trim();
+  if (stable) return `inbound_${crypto.createHash("sha256").update(stable).digest("hex").slice(0, 16)}`;
+  return `inbound_${String(customerId || "unknown").replace(/[^a-z0-9_-]/gi, "")}_${crypto.randomUUID()}`;
+}
+
+function handoffSeverityForReason(reason = "", explicitSeverity = "") {
+  const explicit = String(explicitSeverity || "").trim().toLowerCase();
+  if (["informational", "normal", "high", "critical"].includes(explicit)) return explicit;
+  const text = String(reason || "").toLowerCase();
+  if (/\b(compliance|security|guardrail|unsafe|policy)\b/.test(text)) return "critical";
+  if (/\b(complaint|refund|dispute|payment|paid|reschedule|delivery|order submitted|routing rule failed|system|failed)\b/.test(text)) {
+    return "high";
+  }
+  if (/\b(human|handoff|manual|admin|review)\b/.test(text)) return "normal";
+  return "normal";
+}
+
 function normalizeIntentText(value) {
   return String(value || "")
     .toLowerCase()
@@ -4990,12 +5117,12 @@ function groupBy(items, getKey) {
   return grouped;
 }
 
-async function notifyAdmin(body) {
+async function notifyAdmin(body, meta = {}) {
   if (config.adminWhatsAppNumber) {
-    await sendOutbound(config.adminWhatsAppNumber, [textMessage(body)], { channel: "admin" });
+    await sendOutbound(config.adminWhatsAppNumber, [textMessage(body)], { channel: "admin", ...meta });
     return;
   }
-  await store.appendOutbox({ to: "admin", channel: "admin", type: "text", body });
+  await store.appendOutbox({ to: "admin", channel: "admin", type: "text", body, ...meta });
   console.log(`Admin notification:\n${body}`);
 }
 
@@ -5330,33 +5457,117 @@ function timingSafeEqual(a, b) {
   return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-function alreadyProcessed(messageId) {
-  if (!messageId) return false;
-  cleanupProcessedMessages();
-  if (processedMessageIds.has(messageId)) return true;
-  processedMessageIds.set(messageId, Date.now());
-  return false;
-}
-
-function cleanupProcessedMessages() {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [messageId, timestamp] of processedMessageIds) {
-    if (timestamp < cutoff) processedMessageIds.delete(messageId);
-  }
-}
-
 function orderDetailBufferKey(businessAccountId, customerId) {
   return `${businessAccountId || config.accountId}::${customerId}`;
 }
 
-function clearPendingCustomerBuffers(businessAccountId, customerId) {
-  const key = orderDetailBufferKey(businessAccountId, customerId);
-  const mergeBuffer = pendingMessageMergeBuffers.get(key);
+function pendingCustomerBufferKey(type, businessAccountId, customerId) {
+  return `${type}::${orderDetailBufferKey(businessAccountId, customerId)}`;
+}
+
+function pendingCustomerBufferMap(type) {
+  if (type === PENDING_BUFFER_TYPE.MESSAGE_MERGE) return pendingMessageMergeBuffers;
+  if (type === PENDING_BUFFER_TYPE.ORDER_DETAIL) return pendingOrderDetailBuffers;
+  return null;
+}
+
+async function clearPendingCustomerBuffers(businessAccountId, customerId) {
+  const mergeKey = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.MESSAGE_MERGE, businessAccountId, customerId);
+  const orderKey = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.ORDER_DETAIL, businessAccountId, customerId);
+  const mergeBuffer = pendingMessageMergeBuffers.get(mergeKey);
   if (mergeBuffer?.timer) clearTimeout(mergeBuffer.timer);
-  pendingMessageMergeBuffers.delete(key);
-  const orderBuffer = pendingOrderDetailBuffers.get(key);
+  pendingMessageMergeBuffers.delete(mergeKey);
+  const orderBuffer = pendingOrderDetailBuffers.get(orderKey);
   if (orderBuffer?.timer) clearTimeout(orderBuffer.timer);
-  pendingOrderDetailBuffers.delete(key);
+  pendingOrderDetailBuffers.delete(orderKey);
+  await Promise.all([
+    store.deletePendingBuffer(mergeKey),
+    store.deletePendingBuffer(orderKey),
+  ]);
+}
+
+function durableBufferArgs(args = {}) {
+  return {
+    id: String(args.id || ""),
+    from: String(args.from || ""),
+    text: String(args.text || ""),
+    source: args.source || {},
+    live: Boolean(args.live),
+    businessAccountId: args.businessAccountId || config.accountId,
+    contentAccountId: args.contentAccountId || args.businessAccountId || config.accountId,
+    knowledgeAccountId: args.knowledgeAccountId || args.contentAccountId || args.businessAccountId || config.accountId,
+    isFirstEligibleInbound: args.isFirstEligibleInbound,
+    correlationId: args.correlationId || correlationIdForInbound(args.id, args.from),
+  };
+}
+
+function mergedBufferSource(sources = []) {
+  return sources.reduce((merged, source) => ({ ...merged, ...(source || {}) }), {});
+}
+
+function pendingBufferDelayMs(record) {
+  const dueAt = Date.parse(record?.dueAt || "");
+  return Number.isFinite(dueAt) ? Math.max(0, dueAt - Date.now()) : 0;
+}
+
+function schedulePendingCustomerBuffer(record) {
+  const map = pendingCustomerBufferMap(record?.type);
+  if (!map || !record?.key) return false;
+  const existing = map.get(record.key);
+  if (existing?.timer) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    void flushPendingCustomerBuffer(record.key).catch((error) => {
+      void recordSystemError(`${record.type || "customer"}_buffer_flush`, error, `${record.customerId || ""}: ${record.messages?.join("\n") || ""}`, record.businessAccountId);
+    });
+  }, pendingBufferDelayMs(record));
+  map.set(record.key, { timer });
+  return true;
+}
+
+async function recoverPendingCustomerBuffers() {
+  try {
+    const records = await store.listPendingBuffers();
+    let scheduled = 0;
+    for (const record of records) {
+      if (schedulePendingCustomerBuffer(record)) scheduled += 1;
+    }
+    if (scheduled) console.log(`Recovered ${scheduled} pending customer buffer(s) from durable storage.`);
+  } catch (error) {
+    await recordSystemError("pending_buffer_recovery", error);
+  }
+}
+
+async function flushPendingCustomerBuffer(key) {
+  const record = await store.getPendingBuffer(key);
+  if (!record) return;
+  const map = pendingCustomerBufferMap(record.type);
+  if (map) {
+    const existing = map.get(key);
+    if (existing?.timer) clearTimeout(existing.timer);
+    map.delete(key);
+  }
+
+  const messages = Array.isArray(record.messages) ? record.messages.filter(Boolean) : [];
+  const combinedText = messages.join("\n").trim();
+  if (!combinedText) {
+    await store.deletePendingBuffer(key);
+    return;
+  }
+
+  const args = record.args || {};
+  await processInboundMessage({
+    ...args,
+    id: "",
+    from: args.from || record.customerId,
+    text: combinedText,
+    source: mergedBufferSource(record.sources || []),
+    businessAccountId: args.businessAccountId || record.businessAccountId || config.accountId,
+    skipOrderDetailBuffer: true,
+    skipMessageMergeBuffer: true,
+    skipInboundRecord: true,
+    correlationId: record.correlationId || args.correlationId || correlationIdForInbound("", record.customerId),
+  });
+  await store.deletePendingBuffer(key);
 }
 
 function shouldBufferMergedCustomerMessage(text) {
@@ -5364,28 +5575,27 @@ function shouldBufferMergedCustomerMessage(text) {
   return delayMs > 0 && Boolean(String(text || "").trim());
 }
 
-function bufferMergedCustomerMessage(args, customer) {
+async function bufferMergedCustomerMessage(args, customer) {
   const delayMs = Math.max(0, Number(config.messageMergeBufferMs) || 0);
-  const key = orderDetailBufferKey(args.businessAccountId, args.from);
+  const key = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.MESSAGE_MERGE, args.businessAccountId, args.from);
   const existing = pendingMessageMergeBuffers.get(key);
   if (existing?.timer) clearTimeout(existing.timer);
-  const messages = [...(existing?.messages || []), String(args.text || "").trim()].filter(Boolean);
-  const sources = [...(existing?.sources || []), args.source || {}];
-  const timer = setTimeout(() => {
-    pendingMessageMergeBuffers.delete(key);
-    const combinedText = messages.join("\n");
-    const combinedSource = sources.reduce((merged, source) => ({ ...merged, ...source }), {});
-    void processInboundMessage({
-      ...args,
-      id: "",
-      text: combinedText,
-      source: combinedSource,
-      skipMessageMergeBuffer: true,
-      skipInboundRecord: true,
-    }).catch((error) => recordSystemError("message_merge_buffer_flush", error, `${args.from}: ${combinedText}`, args.businessAccountId));
-  }, delayMs);
-  pendingMessageMergeBuffers.set(key, { timer, messages, sources });
-  console.log(`Buffering customer message merge from ${args.from} for ${delayMs}ms (${messages.length} fragment(s)).`);
+  const saved = await store.updatePendingBuffer(key, (stored) => {
+    const messages = [...(stored?.messages || []), String(args.text || "").trim()].filter(Boolean);
+    const sources = [...(stored?.sources || []), args.source || {}];
+    return {
+      type: PENDING_BUFFER_TYPE.MESSAGE_MERGE,
+      businessAccountId: args.businessAccountId || config.accountId,
+      customerId: args.from,
+      dueAt: new Date(Date.now() + delayMs).toISOString(),
+      messages,
+      sources,
+      args: durableBufferArgs(args),
+      correlationId: args.correlationId || stored?.correlationId || correlationIdForInbound(args.id, args.from),
+    };
+  });
+  schedulePendingCustomerBuffer(saved);
+  console.log(`Buffering customer message merge from ${args.from} for ${delayMs}ms (${saved.messages.length} fragment(s)).`);
   return {
     customer,
     order: null,
@@ -5501,29 +5711,28 @@ function hasStrongPartialOrderEvidence(text, draft = {}) {
   return false;
 }
 
-function bufferIncompleteOrderDetails(args, customer, product) {
+async function bufferIncompleteOrderDetails(args, customer, product) {
   const delayMs = Math.max(0, Number(config.orderDetailBufferMs) || 0);
-  const key = orderDetailBufferKey(args.businessAccountId, args.from);
+  const key = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.ORDER_DETAIL, args.businessAccountId, args.from);
   const existing = pendingOrderDetailBuffers.get(key);
   if (existing?.timer) clearTimeout(existing.timer);
-  const messages = [...(existing?.messages || []), String(args.text || "").trim()].filter(Boolean);
-  const sources = [...(existing?.sources || []), args.source || {}];
-  const timer = setTimeout(() => {
-    pendingOrderDetailBuffers.delete(key);
-    const combinedText = messages.join("\n");
-    const combinedSource = sources.reduce((merged, source) => ({ ...merged, ...source }), {});
-    void processInboundMessage({
-      ...args,
-      id: "",
-      text: combinedText,
-      source: combinedSource,
-      skipOrderDetailBuffer: true,
-      skipMessageMergeBuffer: true,
-      skipInboundRecord: true,
-    }).catch((error) => recordSystemError("order_detail_buffer_flush", error, `${args.from}: ${combinedText}`, args.businessAccountId));
-  }, delayMs);
-  pendingOrderDetailBuffers.set(key, { timer, messages, sources, productId: product?.id || "" });
-  console.log(`Buffering partial order details from ${args.from} for ${delayMs}ms (${messages.length} fragment(s)).`);
+  const saved = await store.updatePendingBuffer(key, (stored) => {
+    const messages = [...(stored?.messages || []), String(args.text || "").trim()].filter(Boolean);
+    const sources = [...(stored?.sources || []), args.source || {}];
+    return {
+      type: PENDING_BUFFER_TYPE.ORDER_DETAIL,
+      businessAccountId: args.businessAccountId || config.accountId,
+      customerId: args.from,
+      productId: product?.id || stored?.productId || "",
+      dueAt: new Date(Date.now() + delayMs).toISOString(),
+      messages,
+      sources,
+      args: durableBufferArgs(args),
+      correlationId: args.correlationId || stored?.correlationId || correlationIdForInbound(args.id, args.from),
+    };
+  });
+  schedulePendingCustomerBuffer(saved);
+  console.log(`Buffering partial order details from ${args.from} for ${delayMs}ms (${saved.messages.length} fragment(s)).`);
   return {
     customer,
     order: null,
