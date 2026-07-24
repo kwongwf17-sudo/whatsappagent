@@ -468,7 +468,6 @@ function isCurrentFollowupSendWindow(customer, item, sequence = [], now = new Da
     now >= dueAt &&
     nowLocal.year === dueLocal.year &&
     nowLocal.month === dueLocal.month &&
-    nowLocal.day === dueLocal.day &&
-    nowLocal.hour === item.sendHour
+    nowLocal.day === dueLocal.day
   );
 }

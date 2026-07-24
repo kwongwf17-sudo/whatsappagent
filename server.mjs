@@ -127,6 +127,8 @@ const config = {
   messageMergeBufferMs: Number(getEnv("MESSAGE_MERGE_BUFFER_MS", "10000")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
+  webLogRawInbound: parseBool(getEnv("WHATSAPP_WEB_LOG_RAW_INBOUND", "false")),
+  webRawInboundLogMaxChars: Number(getEnv("WHATSAPP_WEB_RAW_INBOUND_LOG_MAX_CHARS", "12000")),
   adminPassword: getEnv("ADMIN_PASSWORD", "admin123"),
   adminSessionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "demo_session_secret")),
   superAdminPassword: usableSecretEnv("SUPER_ADMIN_PASSWORD"),
@@ -204,6 +206,8 @@ const webTransportManager = config.transportMode === "web"
       sessionRootDir: config.webSessionDir,
       logger: console,
       processFromMeMessages: config.webProcessFromMeMessages,
+      logRawInbound: config.webLogRawInbound,
+      rawInboundLogMaxChars: config.webRawInboundLogMaxChars,
     })
   : null;
 await adminAccounts.ensureInitialAccount({
@@ -5050,8 +5054,7 @@ function isCurrentFollowupSendWindow(customer, item, sequence = [], now = new Da
     now >= dueAt &&
     nowLocal.year === dueLocal.year &&
     nowLocal.month === dueLocal.month &&
-    nowLocal.day === dueLocal.day &&
-    nowLocal.hour === item.sendHour
+    nowLocal.day === dueLocal.day
   );
 }
 
