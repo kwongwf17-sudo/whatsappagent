@@ -130,6 +130,7 @@ The OpenAI vector store is generated from approved live data only:
 
 - `general-faq.md` from `data/general_faqs.json`
 - `product-faq.md` from `data/product_catalog.json -> products[].approved_faqs`
+- `product-order-options.md` from `data/product_catalog.json -> products[].order_options`
 - `product-image-knowledge.md` from `data/product_catalog.json -> products[].extracted_knowledge.approvedImages`
 
 It must not contain sales replies, SOPs, reply flows, or old static markdown files from `knowledge/`.

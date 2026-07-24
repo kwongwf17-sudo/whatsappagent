@@ -161,6 +161,11 @@ async function generateVectorKnowledgeFiles(outputDir, accountId = "") {
     "utf8"
   );
   await writeFile(
+    path.join(outputDir, "product-order-options.md"),
+    renderProductOrderOptionKnowledge(content.catalog),
+    "utf8"
+  );
+  await writeFile(
     path.join(outputDir, "product-image-knowledge.md"),
     renderProductImageKnowledge(content.catalog),
     "utf8"
@@ -236,6 +241,29 @@ function renderProductFaqKnowledge(catalog = {}) {
   ].join("\n");
 }
 
+function renderProductOrderOptionKnowledge(catalog = {}) {
+  const sections = [];
+  for (const product of catalog.products || []) {
+    const options = orderOptionsForProductKnowledge(product);
+    if (!options.length) continue;
+    sections.push(
+      `## Product: ${product.name || product.id}`,
+      `Product ID: ${product.id || ""}`,
+      product.sku ? `Product SKU: ${product.sku}` : "",
+      "",
+      ...options.map((option, index) => renderOrderOptionRecord(option, product, index)),
+    );
+  }
+  return [
+    "# Vector Store Knowledge: Product Order Options",
+    "",
+    "Use these approved product package and price records only for their matching product.",
+    "They are for answering package, price, quantity, and combo-choice questions. Do not use them for usage, weight, coverage, ingredients, or product benefit questions unless that fact is explicitly listed here.",
+    "",
+    ...sections,
+  ].filter(Boolean).join("\n");
+}
+
 function renderProductImageKnowledge(catalog = {}) {
   const sections = [];
   for (const product of catalog.products || []) {
@@ -256,6 +284,78 @@ function renderProductImageKnowledge(catalog = {}) {
     "",
     ...sections,
   ].join("\n");
+}
+
+function orderOptionsForProductKnowledge(product = {}) {
+  const options = Array.isArray(product.order_options) && product.order_options.length
+    ? product.order_options
+    : (product.packages || []).map((item) => ({
+        id: item.id || "",
+        name: item.name || item.id || "",
+        price: item.price || "",
+        quantity: Number(item.total_units || item.quantity || 1) || 1,
+        aliases: [item.id, item.name].filter(Boolean),
+        requires_add_on: false,
+        add_ons: [],
+      }));
+  return options
+    .map((option, index) => normalizeOrderOptionKnowledgeRecord(option, index))
+    .filter((option) => option.name && option.price);
+}
+
+function normalizeOrderOptionKnowledgeRecord(option = {}, index = 0) {
+  const name = String(option.name || option.label || option.id || `Option ${index + 1}`).trim();
+  return {
+    id: String(option.id || name || `option-${index + 1}`).trim(),
+    name,
+    price: String(option.price || "").trim(),
+    quantity: Math.max(1, Number(option.quantity || option.total_units || 1) || 1),
+    aliases: normalizeKnowledgeLines(option.aliases || option.aliasesText),
+    addOns: normalizeKnowledgeLines(option.add_ons || option.addOns || option.addOnsText),
+    requiresAddOn: Boolean(option.requires_add_on || option.requiresAddOn),
+  };
+}
+
+function renderOrderOptionRecord(option, product, index) {
+  const aliases = [
+    option.name,
+    option.id,
+    `${option.quantity} unit`,
+    option.price,
+    ...option.aliases,
+  ].map((item) => String(item || "").trim()).filter(Boolean);
+  const customerExamples = [
+    `Harga ${option.name}?`,
+    `${option.name} berapa?`,
+    `${option.quantity} unit berapa?`,
+    `Price ${option.name}`,
+  ];
+  return [
+    `### Order Option: ${option.id || option.name || `option-${index + 1}`}`,
+    "Scope: product",
+    "Knowledge type: product_order_option",
+    `Product ID: ${product.id || ""}`,
+    `Product Name: ${product.name || ""}`,
+    `Option name: ${option.name}`,
+    `Price: ${option.price}`,
+    `Quantity: ${option.quantity} unit`,
+    aliases.length ? `Aliases: ${aliases.join(" | ")}` : "",
+    option.addOns.length ? `Combo/add-on choices: ${option.addOns.join(" | ")}` : "",
+    option.requiresAddOn ? "Customer must choose an add-on for this option: yes" : "",
+    ...customerExamples.map((question) => `Customer question example: ${question}`),
+    `Approved answer: ${option.name}: ${option.price} for ${option.quantity} unit${option.quantity > 1 ? "s" : ""}.`,
+    "",
+  ].filter(Boolean).join("\n");
+}
+
+function normalizeKnowledgeLines(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function renderFaqRecord(faq, { scope, product = {} } = {}) {

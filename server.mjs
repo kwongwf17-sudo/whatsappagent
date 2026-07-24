@@ -2366,7 +2366,14 @@ async function processInboundMessageCore({
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
   const exactApprovedFaq = faqSalesResponse || selectedSalesReply
     ? null
-    : (allowKnowledgeRoute ? findApprovedFaqLocalMatch(teamCatalog, product, text, { faqLibrary: teamFaqLibrary, customer, conversationContext }) : null);
+    : (allowKnowledgeRoute
+      ? findApprovedFaqLocalMatch(teamCatalog, product, text, {
+          faqLibrary: teamFaqLibrary,
+          customer,
+          conversationContext,
+          includeProduct: false,
+        })
+      : null);
   const approvedFaqMatch = exactApprovedFaq
     ? {
         faqId: exactApprovedFaq.id,

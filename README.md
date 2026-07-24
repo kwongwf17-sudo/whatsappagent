@@ -177,6 +177,7 @@ For approved knowledge fallback, use OpenAI file search. The vector store must c
 
 - `general-faq.md` from `data/general_faqs.json`
 - `product-faq.md` from `products[].approved_faqs`
+- `product-order-options.md` from `products[].order_options`
 - `product-image-knowledge.md` from `products[].extracted_knowledge.approvedImages`
 
 Do not upload SOP documents, sales reply scripts, reply flows, or old static `knowledge/` files as RAG sources.
