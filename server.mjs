@@ -141,6 +141,7 @@ const FOLLOWUP_TEMPLATE_LANGUAGE = "en";
 const FOLLOWUP_TEMPLATE_BY_KEY = {
   first_day_followup: "dayone_followup",
   day_1_followup: "daytwo_followup",
+  day_2_followup: "daythree_followup",
   day_3_followup: "daythree_followup",
   day_4_followup: "dayfour_followup",
   day_5_followup: "dayfive_followup",
