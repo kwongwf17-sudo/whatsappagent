@@ -12473,6 +12473,10 @@ function productFlowPageHtml() {
     .field.wide { grid-column: 1 / -1; }
     .field input, .field textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
     .field textarea { min-height: 96px; }
+    .upsell-inline { margin: 12px 18px 18px; padding: 12px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
+    .upsell-inline.muted { color: var(--muted); font-size: 14px; font-weight: 700; }
+    .upsell-inline-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .upsell-inline-head strong { font-size: 15px; }
     .followup-fields { margin-top: 12px; }
     .followup-title { margin: 14px 0 4px; font-size: 20px; font-weight: 800; color: #1d1d1f; }
     .followup-note { margin: 0 0 12px; color: var(--muted); font-size: 14px; line-height: 1.35; }
@@ -12491,6 +12495,7 @@ function productFlowPageHtml() {
       .order-options-head { align-items: stretch; flex-direction: column; }
       .option-grid, .option-extra, .fields { grid-template-columns: 1fr; }
       .knowledge-grid { grid-template-columns: 1fr; }
+      .upsell-inline-head { align-items: flex-start; flex-direction: column; }
       .number { margin-bottom: -4px; }
       select { min-width: 0; max-width: 100%; }
     }
@@ -12601,7 +12606,6 @@ function productFlowPageHtml() {
           <div class="fields">
             <label class="field wide" for="upsell-enabled"><input id="upsell-enabled" type="checkbox" /> Enable package upsell for this product</label>
           </div>
-          <div class="option-list" id="upsell-offers"></div>
           <h4 class="followup-title">Upsell Follow-Up</h4>
           <div class="followup-note">Sent hourly after the upsell offer if the customer does not confirm whether to upgrade or keep the original package.</div>
           <div class="fields followup-fields">
@@ -12831,6 +12835,7 @@ function productFlowPageHtml() {
         '<div class="option-extra">' +
           '<label class="check"><input data-option-field="requires_add_on" type="checkbox" ' + (option.requires_add_on ? 'checked' : '') + ' /> Customer must choose an add-on for this option</label>' +
         '</div>' +
+        upsellOfferHtml(option, index) +
       '</div>';
     }
 
@@ -12841,10 +12846,8 @@ function productFlowPageHtml() {
         button.addEventListener("click", () => {
           selectedProduct.orderOptions = (selectedProduct.orderOptions || []).filter((_, index) => index !== Number(button.dataset.removeOption));
           renderOrderOptions();
-          renderUpsellSettings();
         });
       });
-      renderUpsellSettings();
     }
 
     function priceNumber(option) {
@@ -12858,9 +12861,12 @@ function productFlowPageHtml() {
       const targetOptions = ['<option value="">Next higher price package</option>'].concat(higherOptions.map(item =>
         '<option value="' + esc(item.id || "") + '"' + (offer.targetOptionId === item.id ? ' selected' : '') + '>' + esc(item.name || item.id || "") + '</option>'
       )).join('');
-      return '<div class="option-card" data-upsell-option-id="' + esc(option.id || "") + '">' +
-        '<div class="option-card-head">' +
-          '<div class="option-card-title"><span class="option-index">' + esc(index + 1) + '</span><span>' + esc(option.name || "Option") + '</span></div>' +
+      if (!higherOptions.length) {
+        return '<div class="upsell-inline muted">No higher package available for upsell from this option.</div>';
+      }
+      return '<div class="upsell-inline" data-upsell-option-id="' + esc(option.id || "") + '">' +
+        '<div class="upsell-inline-head">' +
+          '<strong>Package upsell</strong>' +
           '<label class="check"><input data-upsell-field="enabled" type="checkbox" ' + (offer.enabled ? 'checked' : '') + ' /> Upsell after this option</label>' +
         '</div>' +
         '<div class="fields">' +
@@ -12874,7 +12880,6 @@ function productFlowPageHtml() {
       if (!selectedProduct) return;
       const settings = selectedProduct.upsellSettings || {};
       document.querySelector("#upsell-enabled").checked = Boolean(settings.enabled);
-      document.querySelector("#upsell-offers").innerHTML = (selectedProduct.orderOptions || []).map(upsellOfferHtml).join("") || '<div class="empty-options">Add order options before configuring upsell.</div>';
       [1, 2, 3].forEach(hour => {
         const reminder = (settings.reminders || []).find(item => item.key === "hour" + hour) || {};
         document.querySelector("#upsell-reminder-hour" + hour + "-enabled").checked = Boolean(reminder.enabled);
@@ -12886,6 +12891,7 @@ function productFlowPageHtml() {
       const offers = {};
       document.querySelectorAll("[data-upsell-option-id]").forEach(card => {
         const optionId = card.dataset.upsellOptionId;
+        if (!optionId) return;
         offers[optionId] = {
           enabled: card.querySelector('[data-upsell-field="enabled"]').checked,
           targetOptionId: card.querySelector('[data-upsell-field="targetOptionId"]').value,
@@ -13323,7 +13329,7 @@ function productFlowPageHtml() {
     }
 
     function readOrderOptions() {
-      return Array.from(document.querySelectorAll(".option-card")).map(card => {
+      return Array.from(document.querySelectorAll("#order-options .option-card")).map(card => {
         const get = field => card.querySelector('[data-option-field="' + field + '"]');
         return {
           name: get("name").value,
