@@ -11,6 +11,7 @@ import {
   conversationActiveState,
   approvedFaqRecordsForProduct,
   extractOrderDetails,
+  formatAdminOrderMessage,
   findApprovedFaqLocalMatch,
   findProduct,
   findProductMatch,
@@ -27,6 +28,7 @@ import {
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import {
   classifyCustomerMessageRoute,
+  classifyUpsellDecision,
   createCustomerServiceResponse,
   createComplaintHandoffReply,
   createSalesIntentRepeatReply,
@@ -180,6 +182,16 @@ const DEFAULT_ORDER_FORM = {
   phoneLabel: "Phone number",
   optionLabel: "Order option",
 };
+const DEFAULT_ORDER_FORM_FOLLOWUP_MESSAGES = [
+  "Hi kita, boleh bantu isi detail order tadi supaya saya dapat hold promo untuk kita ya.",
+  "Follow up saja kita, kalau jadi order boleh share nama, alamat, phone number dan package pilihan ya.",
+  "Last reminder untuk detail order kita ya. Kalau belum ready, no worries, nanti saya follow up macam biasa.",
+];
+const DEFAULT_UPSELL_REMINDER_MESSAGES = [
+  "Hi kita, just follow up pasal upgrade package tadi. Kita mau upgrade atau kekal package asal?",
+  "Follow up saja kita, kalau mau upgrade package boleh bagitau saya ya. Kalau mau yang asal pun boleh.",
+  "Last check kita, mau proceed package asal atau upgrade package tadi?",
+];
 
 const catalog = JSON.parse(await readSeedFile(config.catalogPath, "product_catalog.json"));
 const faqLibrary = await loadFaqLibrary();
@@ -1253,6 +1265,19 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/order-form-followups/save") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const content = await getTeamContent(adminSession.accountId);
+        const orderFormFollowups = updateOrderFormFollowupSettings(content, body.orderFormFollowups || body);
+        await saveTeamContent(adminSession.accountId, content);
+        return sendJson(res, 200, { orderFormFollowups, data: salesRepliesData(content) });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/admin/product-flow/create") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
@@ -2270,6 +2295,18 @@ async function processInboundMessageCore({
     };
   }
 
+  if (customer.pendingUpsell) {
+    const upsellProduct = teamCatalog.products.find((item) => item.id === customer.pendingUpsell?.productId) || routedProduct;
+    const upsellResult = await handlePendingUpsellReply({
+      customer,
+      product: upsellProduct,
+      text,
+      businessAccountId,
+      correlationId,
+    });
+    if (upsellResult) return upsellResult;
+  }
+
   if (!faqSalesResponse && !initialAdOpening && isDeliveryRescheduleRequest(text)) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
     const outbound = [textMessage(deliveryRescheduleReply())];
@@ -2475,30 +2512,54 @@ async function processInboundMessageCore({
   const anotherDatePatch = plan.customerPatch?.salesStatus === "another_date_purchase" || plan.customerPatch?.status === "another_date_purchase"
     ? anotherDatePurchaseCustomerPatch(text)
     : {};
+  const upsellOffer = plan.order
+    ? upsellOfferForOrderDraft(product, plan.order)
+    : null;
+  const effectivePlan = upsellOffer
+    ? {
+        ...plan,
+        order: null,
+        adminMessage: "",
+        customerPatch: {
+          ...(plan.customerPatch || {}),
+          productId: product.id,
+          pendingOrder: null,
+          pendingUpsell: pendingUpsellPatch(product, plan.order, upsellOffer),
+          awaitingPackageBInterest: false,
+          handoffStatus: "",
+          handoffReason: "",
+          followupBlocked: false,
+          followupBlockedReason: "",
+        },
+        messages: [textMessage(upsellOffer.message)],
+        handoffRequired: false,
+        handoffReason: "",
+      }
+    : plan;
 
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
-    ...(plan.customerPatch || {}),
-    ...(plan.handoffRequired || repeatHandoffRequired
-      ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || plan.handoffReason || "", plan.handoffSeverity) }
+    ...(effectivePlan.customerPatch || {}),
+    ...(effectivePlan.handoffRequired || repeatHandoffRequired
+      ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || effectivePlan.handoffReason || "", effectivePlan.handoffSeverity) }
       : {}),
     ...anotherDatePatch,
     ...repeatPatch,
   }), businessAccountId);
   let order = null;
-  if (plan.order) {
-    order = await store.addOrder({ ...plan.order, businessAccountId, inboundMessageId: id || "", correlationId });
+  if (effectivePlan.order) {
+    order = await store.addOrder({ ...effectivePlan.order, businessAccountId, inboundMessageId: id || "", correlationId });
   }
 
-  if (plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(plan.adminMessage, { businessAccountId, correlationId });
+  if (effectivePlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(effectivePlan.adminMessage, { businessAccountId, correlationId });
   }
 
-  if ((plan.handoffRequired || repeatHandoffRequired) && !plan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || plan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
+  if ((effectivePlan.handoffRequired || repeatHandoffRequired) && !effectivePlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || effectivePlan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
   }
 
-  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? plan.messages));
+  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? effectivePlan.messages));
   if (!order && openingFlowDecision.shouldSend) {
     await delayBeforeNewCustomerOpeningFlow(customer, "opening flow");
   }
@@ -2508,9 +2569,9 @@ async function processInboundMessageCore({
     customer: updatedCustomer,
     order,
     messages: outbound,
-    handoffRequired: Boolean(plan.handoffRequired || repeatHandoffRequired),
-    handoffReason: repeatHandoffReason || plan.handoffReason || "",
-    handoffSeverity: handoffSeverityForReason(repeatHandoffReason || plan.handoffReason || "", plan.handoffSeverity),
+    handoffRequired: Boolean(effectivePlan.handoffRequired || repeatHandoffRequired),
+    handoffReason: repeatHandoffReason || effectivePlan.handoffReason || "",
+    handoffSeverity: handoffSeverityForReason(repeatHandoffReason || effectivePlan.handoffReason || "", effectivePlan.handoffSeverity),
   };
 }
 
@@ -2929,6 +2990,462 @@ function orderSubmittedCustomerMessages(product) {
   return cleaned.map(textMessage);
 }
 
+function orderFormFollowupSettings(content = defaultTeamContent) {
+  const source = content?.followupSettings?.orderFormFollowups || {};
+  return [1, 2, 3].map((hour, index) => {
+    const item = source[`hour${hour}`] || source[hour] || {};
+    return {
+      key: `hour${hour}`,
+      hour,
+      enabled: Boolean(item.enabled),
+      message: String(item.message || DEFAULT_ORDER_FORM_FOLLOWUP_MESSAGES[index] || "").trim(),
+    };
+  });
+}
+
+function updateOrderFormFollowupSettings(content = defaultTeamContent, input = {}) {
+  content.followupSettings = content.followupSettings && typeof content.followupSettings === "object"
+    ? content.followupSettings
+    : {};
+  const source = input && typeof input === "object" ? input : {};
+  content.followupSettings.orderFormFollowups = Object.fromEntries(orderFormFollowupSettings({
+    followupSettings: { orderFormFollowups: source },
+  }).map((item) => [item.key, {
+    enabled: Boolean(source[item.key]?.enabled),
+    message: String(source[item.key]?.message || item.message || "").trim(),
+  }]));
+  return orderFormFollowupSettings(content);
+}
+
+function pendingOrderFormFollowups(customer = {}) {
+  const source = customer.pendingOrder?.formFollowups && typeof customer.pendingOrder.formFollowups === "object"
+    ? customer.pendingOrder.formFollowups
+    : {};
+  return {
+    sent: source.sent && typeof source.sent === "object" ? source.sent : {},
+    exhausted: Boolean(source.exhausted),
+    exhaustedAt: String(source.exhaustedAt || ""),
+  };
+}
+
+function isPendingOrderReminderExhausted(customer = {}) {
+  return Boolean(pendingOrderFormFollowups(customer).exhausted);
+}
+
+async function runPendingOrderAutomations(now = new Date()) {
+  const customers = await store.listCustomers(now);
+  const contentByAccount = new Map();
+  const result = { orderFormReminders: [], upsellReminders: [], upsellFinalized: [] };
+  for (const customer of customers) {
+    const accountId = customer.businessAccountId || config.accountId;
+    if (!contentByAccount.has(accountId)) {
+      contentByAccount.set(accountId, await getTeamContent(accountId));
+    }
+    const content = contentByAccount.get(accountId);
+    const product = content.catalog.products.find((item) => item.id === (customer.pendingUpsell?.productId || customer.pendingOrder?.productId || customer.productId));
+    if (!product) continue;
+    if (customer.pendingUpsell) {
+      const upsellResult = await maybeSendPendingUpsellReminder(customer, product, content, now);
+      if (upsellResult?.sent) result.upsellReminders.push(upsellResult);
+      if (upsellResult?.finalized) result.upsellFinalized.push(upsellResult);
+      continue;
+    }
+    if (customer.pendingOrder && !isPendingOrderReminderExhausted(customer)) {
+      const reminderResult = await maybeSendOrderFormReminder(customer, content, now);
+      if (reminderResult?.sent) result.orderFormReminders.push(reminderResult);
+    }
+  }
+  return result;
+}
+
+async function maybeSendOrderFormReminder(customer, content, now = new Date()) {
+  if (!customer.pendingOrder || customer.pendingOrder.draft?.isComplete) return null;
+  const settings = orderFormFollowupSettings(content);
+  const startedAt = new Date(customer.pendingOrder.startedAt || customer.firstSeenAt || now);
+  if (Number.isNaN(startedAt.getTime())) return null;
+  const elapsedHours = (now.getTime() - startedAt.getTime()) / (60 * 60 * 1000);
+  const followups = pendingOrderFormFollowups(customer);
+  const due = settings.find((item) =>
+    item.enabled &&
+    item.message &&
+    elapsedHours >= item.hour &&
+    !followups.sent[item.key]
+  );
+  if (!due) {
+    if (elapsedHours >= 3 && settings.every((item) => !item.enabled || followups.sent[item.key])) {
+      await markPendingOrderFollowupsExhausted(customer, now);
+    }
+    return null;
+  }
+  const businessAccountId = customer.businessAccountId || config.accountId;
+  await sendOutbound(customer.id, [textMessage(due.message)], {
+    businessAccountId,
+    purpose: "order_form_followup",
+    followupKey: `order_form_${due.key}`,
+  });
+  const exhausted = due.hour >= 3 || settings.filter((item) => item.enabled).every((item) => item.key === due.key || followups.sent[item.key]);
+  await store.updateCustomer(customer.id, (current) => ({
+    pendingOrder: {
+      ...(current.pendingOrder || customer.pendingOrder),
+      formFollowups: {
+        sent: {
+          ...pendingOrderFormFollowups(current).sent,
+          [due.key]: now.toISOString(),
+        },
+        exhausted,
+        exhaustedAt: exhausted ? now.toISOString() : "",
+      },
+    },
+  }), businessAccountId);
+  return {
+    sent: true,
+    customerId: customer.id,
+    businessAccountId,
+    reminderKey: due.key,
+    exhausted,
+  };
+}
+
+async function markPendingOrderFollowupsExhausted(customer, now = new Date()) {
+  const businessAccountId = customer.businessAccountId || config.accountId;
+  await store.updateCustomer(customer.id, (current) => ({
+    pendingOrder: {
+      ...(current.pendingOrder || customer.pendingOrder),
+      formFollowups: {
+        ...pendingOrderFormFollowups(current),
+        exhausted: true,
+        exhaustedAt: now.toISOString(),
+      },
+    },
+  }), businessAccountId);
+}
+
+function normalizeProductUpsellSettings(product = {}) {
+  const source = product.upsell_settings && typeof product.upsell_settings === "object" ? product.upsell_settings : {};
+  const options = dashboardOrderOptions(product);
+  const optionIds = new Set(options.map((option) => option.id));
+  const offersSource = source.offers && typeof source.offers === "object" ? source.offers : {};
+  return {
+    enabled: Boolean(source.enabled),
+    offers: Object.fromEntries(options.map((option) => {
+      const offer = offersSource[option.id] || {};
+      const targetOptionId = optionIds.has(String(offer.targetOptionId || offer.target_option_id || "")) ? String(offer.targetOptionId || offer.target_option_id) : "";
+      return [option.id, {
+        enabled: Boolean(offer.enabled),
+        targetOptionId,
+        message: String(offer.message || "").trim(),
+      }];
+    })),
+    reminders: [1, 2, 3].map((hour, index) => {
+      const reminder = source.reminders?.[`hour${hour}`] || source.reminders?.[hour] || {};
+      return {
+        key: `hour${hour}`,
+        hour,
+        enabled: Boolean(reminder.enabled),
+        message: String(reminder.message || DEFAULT_UPSELL_REMINDER_MESSAGES[index] || "").trim(),
+      };
+    }),
+  };
+}
+
+function updateProductUpsellSettings(product = {}, input = {}) {
+  const source = input && typeof input === "object" ? input : {};
+  const options = dashboardOrderOptions(product);
+  product.upsell_settings = {
+    enabled: Boolean(source.enabled),
+    offers: Object.fromEntries(options.map((option) => {
+      const item = source.offers?.[option.id] || {};
+      return [option.id, {
+        enabled: Boolean(item.enabled),
+        targetOptionId: String(item.targetOptionId || "").trim(),
+        message: String(item.message || "").trim(),
+      }];
+    })),
+    reminders: Object.fromEntries([1, 2, 3].map((hour, index) => {
+      const item = source.reminders?.[`hour${hour}`] || {};
+      return [`hour${hour}`, {
+        enabled: Boolean(item.enabled),
+        message: String(item.message || DEFAULT_UPSELL_REMINDER_MESSAGES[index] || "").trim(),
+      }];
+    })),
+  };
+  return normalizeProductUpsellSettings(product);
+}
+
+function orderOptionPriceNumber(option = {}) {
+  const value = Number(String(option.price || "").replace(/[^\d.]/g, ""));
+  return Number.isFinite(value) ? value : 0;
+}
+
+function findOrderOptionForDraft(product, draft = {}) {
+  const options = dashboardOrderOptions(product);
+  return options.find((option) =>
+    (draft.orderOptionId && option.id === draft.orderOptionId) ||
+    (draft.orderOptionName && normalizeCustomerMessage(option.name) === normalizeCustomerMessage(draft.orderOptionName)) ||
+    (draft.packageName && normalizeCustomerMessage(option.name) === normalizeCustomerMessage(draft.packageName)) ||
+    (draft.packageId && legacyPackageIdForDashboardOption(option) === draft.packageId)
+  ) || null;
+}
+
+function nextHigherOrderOption(product, currentOption, explicitTargetId = "") {
+  const options = dashboardOrderOptions(product).filter((option) => orderOptionPriceNumber(option) > orderOptionPriceNumber(currentOption));
+  const explicit = explicitTargetId ? options.find((option) => option.id === explicitTargetId) : null;
+  if (explicit) return explicit;
+  return options.sort((left, right) => orderOptionPriceNumber(left) - orderOptionPriceNumber(right))[0] || null;
+}
+
+function upsellOfferForOrderDraft(product, orderDraft = {}) {
+  const settings = normalizeProductUpsellSettings(product);
+  if (!settings.enabled) return null;
+  const currentOption = findOrderOptionForDraft(product, orderDraft);
+  if (!currentOption) return null;
+  const offer = settings.offers[currentOption.id] || {};
+  if (!offer.enabled) return null;
+  const targetOption = nextHigherOrderOption(product, currentOption, offer.targetOptionId);
+  if (!targetOption) return null;
+  const message = offer.message || `Kita mau upgrade ke ${targetOption.name}${targetOption.price ? ` (${targetOption.price})` : ""}? Kalau mau kekal ${currentOption.name}, bagitau saja ya.`;
+  return { settings, offer, currentOption, targetOption, message };
+}
+
+function orderDraftWithOption(orderDraft = {}, option = {}) {
+  return {
+    ...orderDraft,
+    packageId: option.legacyPackage ? legacyPackageIdForDashboardOption(option) : "",
+    packageName: option.legacyPackage ? option.name : "",
+    packagePrice: option.legacyPackage ? option.price : "",
+    orderOptionId: option.legacyPackage ? "" : option.id || "",
+    orderOptionName: option.legacyPackage ? "" : option.name || "",
+    orderOptionPrice: option.legacyPackage ? "" : option.price || "",
+    quantity: Number(option.quantity || orderDraft.quantity || 1) || 1,
+  };
+}
+
+function pendingUpsellPatch(product, orderDraft, offer, now = new Date()) {
+  return {
+    productId: product.id,
+    originalOrderDraft: orderDraft,
+    currentOptionId: offer.currentOption.id,
+    targetOptionId: offer.targetOption.id,
+    startedAt: now.toISOString(),
+    reminders: { sent: {}, exhausted: false, exhaustedAt: "" },
+  };
+}
+
+function upsellRemindersForCustomer(customer = {}) {
+  const source = customer.pendingUpsell?.reminders && typeof customer.pendingUpsell.reminders === "object" ? customer.pendingUpsell.reminders : {};
+  return {
+    sent: source.sent && typeof source.sent === "object" ? source.sent : {},
+    exhausted: Boolean(source.exhausted),
+    exhaustedAt: String(source.exhaustedAt || ""),
+  };
+}
+
+async function maybeSendPendingUpsellReminder(customer, product, content, now = new Date()) {
+  const pending = customer.pendingUpsell;
+  if (!pending) return null;
+  const settings = normalizeProductUpsellSettings(product);
+  const startedAt = new Date(pending.startedAt || customer.lastMessageAt || now);
+  if (Number.isNaN(startedAt.getTime())) return null;
+  const elapsedHours = (now.getTime() - startedAt.getTime()) / (60 * 60 * 1000);
+  const reminders = upsellRemindersForCustomer(customer);
+  const due = settings.reminders.find((item) =>
+    item.enabled &&
+    item.message &&
+    elapsedHours >= item.hour &&
+    !reminders.sent[item.key]
+  );
+  const businessAccountId = customer.businessAccountId || config.accountId;
+  if (due) {
+    await sendOutbound(customer.id, [textMessage(due.message)], {
+      businessAccountId,
+      purpose: "upsell_followup",
+      followupKey: `upsell_${due.key}`,
+    });
+    const exhausted = due.hour >= 3 || settings.reminders.filter((item) => item.enabled).every((item) => item.key === due.key || reminders.sent[item.key]);
+    await store.updateCustomer(customer.id, (current) => ({
+      pendingUpsell: {
+        ...(current.pendingUpsell || pending),
+        reminders: {
+          sent: {
+            ...upsellRemindersForCustomer(current).sent,
+            [due.key]: now.toISOString(),
+          },
+          exhausted,
+          exhaustedAt: exhausted ? now.toISOString() : "",
+        },
+      },
+    }), businessAccountId);
+    return { sent: true, customerId: customer.id, businessAccountId, reminderKey: due.key };
+  }
+  if (elapsedHours >= 3 && settings.reminders.every((item) => !item.enabled || reminders.sent[item.key])) {
+    return finalizePendingUpsell(customer, product, pending.originalOrderDraft, "upsell_no_reply_original", businessAccountId);
+  }
+  return null;
+}
+
+async function submitOrderFromDraft(customer, product, orderDraft, rawMessage = "", businessAccountId = config.accountId, correlationId = "") {
+  const order = await store.addOrder({
+    businessAccountId,
+    customerId: customer.id,
+    productId: product.id,
+    productName: product.name,
+    shoppingLink: product.shopping_link || "",
+    packageId: orderDraft.packageId || "",
+    packageName: orderDraft.packageName || "",
+    packagePrice: orderDraft.packagePrice || "",
+    orderOptionId: orderDraft.orderOptionId || "",
+    orderOptionName: orderDraft.orderOptionName || "",
+    orderOptionPrice: orderDraft.orderOptionPrice || "",
+    addOnChoice: orderDraft.addOnChoice || "",
+    quantity: orderDraft.quantity || 1,
+    name: orderDraft.name || "",
+    phone: orderDraft.phone || customer.id,
+    address: orderDraft.address || "",
+    rawMessage: rawMessage || "",
+  });
+  const updatedCustomer = await store.updateCustomer(customer.id, () => ({
+    productId: product.id,
+    pendingOrder: null,
+    pendingUpsell: null,
+    awaitingPackageBInterest: false,
+    salesConversationClosed: false,
+    salesStatus: "",
+    conversationState: "",
+    handoffStatus: "human_required",
+    handoffReason: "Customer submitted complete order details.",
+    handoffSeverity: handoffSeverityForReason("Customer submitted complete order details.", "order"),
+    status: "order_submitted",
+    followupBlocked: true,
+    followupBlockedReason: "order_submitted",
+  }), businessAccountId);
+  const outbound = orderSubmittedCustomerMessages(product);
+  await sendOutbound(customer.id, outbound, { businessAccountId, correlationId, purpose: "order_closing_sequence" });
+  const adminMessage = formatAdminOrderMessage(product, orderDraft, customer.id);
+  if (businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(adminMessage, { businessAccountId, correlationId });
+  }
+  await store.appendAuditLog({
+    actor: "ai_agent",
+    action: "order_submitted",
+    customerId: customer.id,
+    result: order.id,
+    businessAccountId,
+    correlationId,
+  });
+  return {
+    finalized: true,
+    order,
+    customer: updatedCustomer,
+    messages: outbound,
+    handoffRequired: true,
+    handoffReason: "Customer submitted complete order details.",
+  };
+}
+
+async function finalizePendingUpsell(customer, product, orderDraft, reason = "upsell_original", businessAccountId = config.accountId, correlationId = "") {
+  const result = await submitOrderFromDraft(customer, product, orderDraft, reason, businessAccountId, correlationId);
+  await store.appendAuditLog({
+    actor: "ai_agent",
+    action: "pending_upsell_finalized",
+    customerId: customer.id,
+    result: reason,
+    businessAccountId,
+    correlationId,
+  });
+  return result;
+}
+
+async function handlePendingUpsellReply({
+  customer,
+  product,
+  text,
+  businessAccountId = config.accountId,
+  correlationId = "",
+}) {
+  const pending = customer.pendingUpsell;
+  if (!pending) return null;
+  const options = dashboardOrderOptions(product);
+  const currentOption = options.find((option) => option.id === pending.currentOptionId);
+  const targetOption = options.find((option) => option.id === pending.targetOptionId);
+  if (!currentOption || !targetOption) {
+    return finalizePendingUpsell(customer, product, pending.originalOrderDraft, "upsell_option_missing_original", businessAccountId, correlationId);
+  }
+  const localOption = matchUpsellOptionReply(text, options);
+  let decision = localOption
+    ? {
+        decision: localOption.id === targetOption.id ? "accept_upsell" : localOption.id === currentOption.id ? "keep_original" : "choose_other_option",
+        selectedOrderOptionId: localOption.id,
+        confidence: "high",
+        reason: "local_option_match",
+      }
+    : null;
+  if (!decision) {
+    decision = await maybeClassifyUpsellDecision({
+      customerMessage: text,
+      currentOption,
+      targetOption,
+      orderOptions: options,
+      businessAccountId,
+    });
+  }
+  if (decision?.confidence === "low" || ["unclear", "unrelated"].includes(decision?.decision)) {
+    const outbound = [textMessage(`Boleh kita confirm mau ${targetOption.name} atau kekal ${currentOption.name}?`)];
+    await sendOutbound(customer.id, outbound, { businessAccountId, correlationId, purpose: "upsell_clarification" });
+    const updatedCustomer = await store.updateCustomer(customer.id, () => ({
+      pendingUpsell: {
+        ...pending,
+        lastDecision: decision || { decision: "unclear" },
+        lastDecisionAt: new Date().toISOString(),
+      },
+    }), businessAccountId);
+    return {
+      customer: updatedCustomer,
+      order: null,
+      messages: outbound,
+      handoffRequired: false,
+      handoffReason: "",
+    };
+  }
+  const selectedOption = options.find((option) => option.id === decision.selectedOrderOptionId) ||
+    (decision.decision === "accept_upsell" ? targetOption : currentOption);
+  const selectedDraft = decision.decision === "keep_original"
+    ? pending.originalOrderDraft
+    : orderDraftWithOption(pending.originalOrderDraft, selectedOption);
+  return finalizePendingUpsell(customer, product, selectedDraft, `upsell_${decision.decision}`, businessAccountId, correlationId);
+}
+
+function matchUpsellOptionReply(text, options = []) {
+  const normalized = normalizeCustomerMessage(text);
+  if (!normalized || /[?ï¼Ÿ]$/.test(String(text || "").trim())) return null;
+  return options.find((option) => {
+    const terms = [option.id, option.name, ...(option.aliases || [])]
+      .map((term) => normalizeCustomerMessage(term))
+      .filter(Boolean);
+    const shortPackage = normalizeCustomerMessage(option.name).match(/^package\s+([a-z0-9]+)$/i)?.[1] || "";
+    if (shortPackage) terms.push(shortPackage);
+    return terms.some((term) => normalized === term || (term.length > 1 && normalized.includes(term)));
+  }) || null;
+}
+
+async function maybeClassifyUpsellDecision({ customerMessage, currentOption, targetOption, orderOptions, businessAccountId }) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return { decision: "unclear", selectedOrderOptionId: "", confidence: "low", reason: "OpenAI API key not configured." };
+  const model = await openAiModelForAccount(businessAccountId);
+  try {
+    return await classifyUpsellDecision({
+      apiKey,
+      model,
+      customerMessage,
+      currentOption,
+      targetOption,
+      orderOptions,
+    });
+  } catch (error) {
+    await recordSystemError("upsell_decision_classifier", error, "", businessAccountId);
+    return { decision: "unclear", selectedOrderOptionId: "", confidence: "low", reason: error.message };
+  }
+}
+
 function followupTemplateName(followupKey) {
   return FOLLOWUP_TEMPLATE_BY_KEY[String(followupKey || "")] || "";
 }
@@ -3115,6 +3632,7 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
 
 async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
   const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
+  const pendingOrderAutomations = await runPendingOrderAutomations(now);
   const due = await getDueFollowupsForTeams(now);
   const operationalDue = respectOperationalControl
     ? await filterOperationalFollowups(due)
@@ -3151,6 +3669,7 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
     queuePaused: dispatched.paused.length,
     queueHeldForApprovedTemplate: dispatched.heldForApprovedTemplate.length,
     heldForApprovedTemplate: templateRequired.length,
+    pendingOrderAutomations,
     deleted: deletedCustomers.length,
     skipped: await buildFollowupSkippedSummary(now),
     checkedAt: now.toISOString(),
@@ -3205,6 +3724,8 @@ async function getDueFollowupsForTeams(now = new Date()) {
       continue;
     }
     if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) continue;
+    if (customer.pendingUpsell) continue;
+    if (customer.pendingOrder && !isPendingOrderReminderExhausted(customer)) continue;
     const sequence = productFollowupSequence(product);
     const item = currentFollowupStage(customer, sequence, now);
     if (!item || customer.followupsSent?.[item.key]) continue;
@@ -4567,6 +5088,7 @@ function dashboardOrderOption(item = {}, legacyPackage = false) {
     name,
     price: String(item.price || "").trim(),
     quantity: Number(item.quantity || item.total_units || 1) || 1,
+    aliases: Array.isArray(item.aliases) ? item.aliases : [],
     legacyPackage: Boolean(legacyPackage || /^package\s+[a-z0-9]+$/i.test(name)),
   };
 }
@@ -6684,6 +7206,7 @@ function salesRepliesData(content = defaultTeamContent) {
         productId: "",
       })),
     products: [],
+    orderFormFollowups: orderFormFollowupSettings(content),
   };
 }
 
@@ -6904,6 +7427,7 @@ function productFlowEditorData(product, options = {}) {
     skuCode: String(product.sku_code || ""),
     shoppingLink: String(product.shopping_link || ""),
     orderOptions: orderOptionsForEditor(product),
+    upsellSettings: normalizeProductUpsellSettings(product),
     orderForm: orderFormForEditor(product),
     orderClosingMessages: orderClosingMessagesForEditor(product),
     salesPrompt: String(product.sales_prompt ?? ""),
@@ -7106,6 +7630,9 @@ function updateProductFlowText(product, body) {
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderOptions")) {
     product.order_options = normalizeOrderOptions(body.orderOptions);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "upsellSettings")) {
+    updateProductUpsellSettings(product, body.upsellSettings);
   }
   if (Object.prototype.hasOwnProperty.call(body, "orderClosingMessages")) {
     product.order_closing_messages = normalizeOrderClosingMessages(body.orderClosingMessages);
@@ -10428,6 +10955,27 @@ function replyLibraryPageHtml() {
         <div id="sales-state"></div>
       </form>
     </section>
+    <section>
+      <h2>Order Form Follow-Up</h2>
+      <div class="note">Sent hourly after the agent asks for order details. Disable any hour you do not want to send.</div>
+      <form id="order-form-followup-form" class="editor">
+        <div class="fields">
+          <label class="field wide" for="order-form-followup-hour1"><input id="order-form-followup-hour1-enabled" type="checkbox" /> Hour 1 message
+            <textarea class="reply" id="order-form-followup-hour1"></textarea>
+          </label>
+          <label class="field wide" for="order-form-followup-hour2"><input id="order-form-followup-hour2-enabled" type="checkbox" /> Hour 2 message
+            <textarea class="reply" id="order-form-followup-hour2"></textarea>
+          </label>
+          <label class="field wide" for="order-form-followup-hour3"><input id="order-form-followup-hour3-enabled" type="checkbox" /> Hour 3 message
+            <textarea class="reply" id="order-form-followup-hour3"></textarea>
+          </label>
+        </div>
+        <div class="editor-actions">
+          <button class="primary" id="save-order-form-followups" type="submit">Save Order Form Follow-Up</button>
+        </div>
+        <div id="order-form-followup-state"></div>
+      </form>
+    </section>
   </main>
   <script>
     let faqLibrary = { general: [] };
@@ -10531,6 +11079,37 @@ function replyLibraryPageHtml() {
       document.querySelectorAll(".edit-sales").forEach(button => button.addEventListener("click", () => editSales(button.dataset.id)));
       document.querySelectorAll(".delete-sales").forEach(button => button.addEventListener("click", () => deleteSales(button.dataset.id, button.dataset.label)));
       syncSalesIntentFields();
+      renderOrderFormFollowups();
+    }
+    function renderOrderFormFollowups() {
+      const items = salesLibrary.orderFormFollowups || [];
+      [1, 2, 3].forEach(hour => {
+        const item = items.find(entry => entry.key === "hour" + hour) || {};
+        document.querySelector("#order-form-followup-hour" + hour + "-enabled").checked = Boolean(item.enabled);
+        document.querySelector("#order-form-followup-hour" + hour).value = item.message || "";
+      });
+    }
+    async function saveOrderFormFollowups(event) {
+      event.preventDefault();
+      const state = document.querySelector("#order-form-followup-state");
+      state.textContent = "Saving...";
+      const orderFormFollowups = {};
+      [1, 2, 3].forEach(hour => {
+        orderFormFollowups["hour" + hour] = {
+          enabled: document.querySelector("#order-form-followup-hour" + hour + "-enabled").checked,
+          message: document.querySelector("#order-form-followup-hour" + hour).value
+        };
+      });
+      try {
+        const response = await fetch("/admin/order-form-followups/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ orderFormFollowups }) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Save failed");
+        salesLibrary = result.data;
+        renderSales();
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      }
     }
     function newFaq() {
       document.querySelector("#faq-id").value = ""; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(""); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = ""; document.querySelector("#faq-reply").value = ""; document.querySelector("#faq-active").checked = true; document.querySelector("#faq-title").textContent = "New General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
@@ -10594,6 +11173,7 @@ function replyLibraryPageHtml() {
     document.querySelector("#sales-intent-key").addEventListener("change", syncSalesIntentFields);
     document.querySelector("#faq-form").addEventListener("submit", saveFaq);
     document.querySelector("#sales-form").addEventListener("submit", saveSales);
+    document.querySelector("#order-form-followup-form").addEventListener("submit", saveOrderFormFollowups);
     document.querySelector("#refresh").addEventListener("click", () => { loadFaq(); loadSales(); });
     Promise.all([loadFaq(), loadSales()]).then(() => { newFaq(); newSales(); document.querySelector("#page-state").textContent = "General replies ready"; }).catch(error => { document.querySelector("#page-state").textContent = error.message; });
   </script>
@@ -12000,6 +12580,29 @@ function productFlowPageHtml() {
         <div class="knowledge-panel">
           <div class="knowledge-head">
             <div>
+              <h3>Package Upsell</h3>
+              <div class="knowledge-note">After complete order details, offer a higher package when available. No upsell is sent when the selected package is already highest.</div>
+            </div>
+          </div>
+          <div class="fields">
+            <label class="field wide" for="upsell-enabled"><input id="upsell-enabled" type="checkbox" /> Enable package upsell for this product</label>
+          </div>
+          <div class="option-list" id="upsell-offers"></div>
+          <div class="fields">
+            <label class="field wide" for="upsell-reminder-hour1"><input id="upsell-reminder-hour1-enabled" type="checkbox" /> Upsell follow-up hour 1
+              <textarea id="upsell-reminder-hour1"></textarea>
+            </label>
+            <label class="field wide" for="upsell-reminder-hour2"><input id="upsell-reminder-hour2-enabled" type="checkbox" /> Upsell follow-up hour 2
+              <textarea id="upsell-reminder-hour2"></textarea>
+            </label>
+            <label class="field wide" for="upsell-reminder-hour3"><input id="upsell-reminder-hour3-enabled" type="checkbox" /> Upsell follow-up hour 3
+              <textarea id="upsell-reminder-hour3"></textarea>
+            </label>
+          </div>
+        </div>
+        <div class="knowledge-panel">
+          <div class="knowledge-head">
+            <div>
               <h3>Order Form Fields</h3>
               <div class="knowledge-note">Edit the message and field labels shown when the customer wants to order. The parser still treats these as name, address, phone, and order option.</div>
             </div>
@@ -12219,8 +12822,69 @@ function productFlowPageHtml() {
         button.addEventListener("click", () => {
           selectedProduct.orderOptions = (selectedProduct.orderOptions || []).filter((_, index) => index !== Number(button.dataset.removeOption));
           renderOrderOptions();
+          renderUpsellSettings();
         });
       });
+      renderUpsellSettings();
+    }
+
+    function priceNumber(option) {
+      return Number(String(option.price || "").replace(/[^\\d.]/g, "")) || 0;
+    }
+
+    function upsellOfferHtml(option, index) {
+      const settings = selectedProduct.upsellSettings || {};
+      const offer = (settings.offers || {})[option.id] || {};
+      const higherOptions = (selectedProduct.orderOptions || []).filter(item => priceNumber(item) > priceNumber(option));
+      const targetOptions = ['<option value="">Next higher price package</option>'].concat(higherOptions.map(item =>
+        '<option value="' + esc(item.id || "") + '"' + (offer.targetOptionId === item.id ? ' selected' : '') + '>' + esc(item.name || item.id || "") + '</option>'
+      )).join('');
+      return '<div class="option-card" data-upsell-option-id="' + esc(option.id || "") + '">' +
+        '<div class="option-card-head">' +
+          '<div class="option-card-title"><span class="option-index">' + esc(index + 1) + '</span><span>' + esc(option.name || "Option") + '</span></div>' +
+          '<label class="check"><input data-upsell-field="enabled" type="checkbox" ' + (offer.enabled ? 'checked' : '') + ' /> Upsell after this option</label>' +
+        '</div>' +
+        '<div class="fields">' +
+          '<label class="field">Target package<select data-upsell-field="targetOptionId">' + targetOptions + '</select></label>' +
+          '<label class="field wide">Upsell message<textarea data-upsell-field="message" placeholder="Offer a higher package for customers who selected ' + esc(option.name || "this option") + '">' + esc(offer.message || "") + '</textarea></label>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderUpsellSettings() {
+      if (!selectedProduct) return;
+      const settings = selectedProduct.upsellSettings || {};
+      document.querySelector("#upsell-enabled").checked = Boolean(settings.enabled);
+      document.querySelector("#upsell-offers").innerHTML = (selectedProduct.orderOptions || []).map(upsellOfferHtml).join("") || '<div class="empty-options">Add order options before configuring upsell.</div>';
+      [1, 2, 3].forEach(hour => {
+        const reminder = (settings.reminders || []).find(item => item.key === "hour" + hour) || {};
+        document.querySelector("#upsell-reminder-hour" + hour + "-enabled").checked = Boolean(reminder.enabled);
+        document.querySelector("#upsell-reminder-hour" + hour).value = reminder.message || "";
+      });
+    }
+
+    function readUpsellSettings() {
+      const offers = {};
+      document.querySelectorAll("[data-upsell-option-id]").forEach(card => {
+        const optionId = card.dataset.upsellOptionId;
+        offers[optionId] = {
+          enabled: card.querySelector('[data-upsell-field="enabled"]').checked,
+          targetOptionId: card.querySelector('[data-upsell-field="targetOptionId"]').value,
+          message: card.querySelector('[data-upsell-field="message"]').value
+        };
+      });
+      const reminders = {};
+      [1, 2, 3].forEach(hour => {
+        reminders["hour" + hour] = {
+          enabled: document.querySelector("#upsell-reminder-hour" + hour + "-enabled").checked,
+          message: document.querySelector("#upsell-reminder-hour" + hour).value
+        };
+      });
+      return {
+        enabled: document.querySelector("#upsell-enabled").checked,
+        offers,
+        reminders
+      };
     }
 
     function renderOrderForm() {
@@ -12665,6 +13329,7 @@ function productFlowPageHtml() {
         ? selectedProduct.salesPromptFrequency
         : 1;
       renderOrderOptions();
+      renderUpsellSettings();
       renderOrderForm();
       renderApprovedFaqs();
       renderKnowledge();
@@ -12782,6 +13447,7 @@ function productFlowPageHtml() {
         salesPromptFrequency: document.querySelector("#salesPromptFrequency").value
       };
       body.orderOptions = readOrderOptions();
+      body.upsellSettings = readUpsellSettings();
       body.orderForm = readOrderForm();
       body.openingFlowBlocks = readOpeningFlowBlocks();
       body.orderClosingMessages = readOrderClosingMessages();
