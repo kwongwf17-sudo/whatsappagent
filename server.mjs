@@ -10860,6 +10860,10 @@ function replyLibraryPageHtml() {
     .fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
     .field { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
     .field.wide { grid-column: 1 / -1; }
+    .followup-field { display: grid; gap: 8px; }
+    .followup-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #1d1d1f; font-size: 13px; font-weight: 700; }
+    .followup-enable { display: inline-flex; align-items: center; gap: 7px; color: #1d1d1f; font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .followup-enable input { width: auto; padding: 0; }
     .field-help { color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.35; }
     .field[hidden] { display: none; }
     input, textarea, select { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
@@ -10960,13 +10964,16 @@ function replyLibraryPageHtml() {
       <div class="note">Sent hourly after the agent asks for order details. Disable any hour you do not want to send.</div>
       <form id="order-form-followup-form" class="editor">
         <div class="fields">
-          <label class="field wide" for="order-form-followup-hour1"><input id="order-form-followup-hour1-enabled" type="checkbox" /> Hour 1 message
+          <label class="field wide followup-field" for="order-form-followup-hour1">
+            <span class="followup-head"><span>Hour 1 message</span><span class="followup-enable"><input id="order-form-followup-hour1-enabled" type="checkbox" /> Enabled</span></span>
             <textarea class="reply" id="order-form-followup-hour1"></textarea>
           </label>
-          <label class="field wide" for="order-form-followup-hour2"><input id="order-form-followup-hour2-enabled" type="checkbox" /> Hour 2 message
+          <label class="field wide followup-field" for="order-form-followup-hour2">
+            <span class="followup-head"><span>Hour 2 message</span><span class="followup-enable"><input id="order-form-followup-hour2-enabled" type="checkbox" /> Enabled</span></span>
             <textarea class="reply" id="order-form-followup-hour2"></textarea>
           </label>
-          <label class="field wide" for="order-form-followup-hour3"><input id="order-form-followup-hour3-enabled" type="checkbox" /> Hour 3 message
+          <label class="field wide followup-field" for="order-form-followup-hour3">
+            <span class="followup-head"><span>Hour 3 message</span><span class="followup-enable"><input id="order-form-followup-hour3-enabled" type="checkbox" /> Enabled</span></span>
             <textarea class="reply" id="order-form-followup-hour3"></textarea>
           </label>
         </div>
@@ -12466,6 +12473,13 @@ function productFlowPageHtml() {
     .field.wide { grid-column: 1 / -1; }
     .field input, .field textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
     .field textarea { min-height: 96px; }
+    .followup-fields { margin-top: 12px; }
+    .followup-title { margin: 14px 0 4px; font-size: 20px; font-weight: 800; color: #1d1d1f; }
+    .followup-note { margin: 0 0 12px; color: var(--muted); font-size: 14px; line-height: 1.35; }
+    .followup-field { display: grid; gap: 8px; }
+    .followup-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #1d1d1f; font-size: 13px; font-weight: 700; }
+    .followup-enable { display: inline-flex; align-items: center; gap: 7px; color: #1d1d1f; font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .followup-enable input { width: auto; padding: 0; }
     .editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 12px; }
     .editor-actions label { display: inline-flex; align-items: center; gap: 7px; margin-right: auto; font-size: 13px; font-weight: 700; }
     .editor-actions input { width: auto; }
@@ -12588,14 +12602,19 @@ function productFlowPageHtml() {
             <label class="field wide" for="upsell-enabled"><input id="upsell-enabled" type="checkbox" /> Enable package upsell for this product</label>
           </div>
           <div class="option-list" id="upsell-offers"></div>
-          <div class="fields">
-            <label class="field wide" for="upsell-reminder-hour1"><input id="upsell-reminder-hour1-enabled" type="checkbox" /> Upsell follow-up hour 1
+          <h4 class="followup-title">Upsell Follow-Up</h4>
+          <div class="followup-note">Sent hourly after the upsell offer if the customer does not confirm whether to upgrade or keep the original package.</div>
+          <div class="fields followup-fields">
+            <label class="field wide followup-field" for="upsell-reminder-hour1">
+              <span class="followup-head"><span>Hour 1 message</span><span class="followup-enable"><input id="upsell-reminder-hour1-enabled" type="checkbox" /> Enabled</span></span>
               <textarea id="upsell-reminder-hour1"></textarea>
             </label>
-            <label class="field wide" for="upsell-reminder-hour2"><input id="upsell-reminder-hour2-enabled" type="checkbox" /> Upsell follow-up hour 2
+            <label class="field wide followup-field" for="upsell-reminder-hour2">
+              <span class="followup-head"><span>Hour 2 message</span><span class="followup-enable"><input id="upsell-reminder-hour2-enabled" type="checkbox" /> Enabled</span></span>
               <textarea id="upsell-reminder-hour2"></textarea>
             </label>
-            <label class="field wide" for="upsell-reminder-hour3"><input id="upsell-reminder-hour3-enabled" type="checkbox" /> Upsell follow-up hour 3
+            <label class="field wide followup-field" for="upsell-reminder-hour3">
+              <span class="followup-head"><span>Hour 3 message</span><span class="followup-enable"><input id="upsell-reminder-hour3-enabled" type="checkbox" /> Enabled</span></span>
               <textarea id="upsell-reminder-hour3"></textarea>
             </label>
           </div>
