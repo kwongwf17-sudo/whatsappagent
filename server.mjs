@@ -131,6 +131,10 @@ const config = {
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   webLogRawInbound: parseBool(getEnv("WHATSAPP_WEB_LOG_RAW_INBOUND", "false")),
   webRawInboundLogMaxChars: Number(getEnv("WHATSAPP_WEB_RAW_INBOUND_LOG_MAX_CHARS", "12000")),
+  outboxRetentionDays: Number(getEnv("OUTBOX_RETENTION_DAYS", "5")),
+  processedMessageRetentionDays: Number(getEnv("PROCESSED_MESSAGE_RETENTION_DAYS", "5")),
+  auditLogMaxRows: Number(getEnv("AUDIT_LOG_MAX_ROWS", "200")),
+  followupQueueCompletedRetentionDays: Number(getEnv("FOLLOWUP_QUEUE_COMPLETED_RETENTION_DAYS", "1")),
   adminPassword: getEnv("ADMIN_PASSWORD", "admin123"),
   adminSessionSecret: getEnv("ADMIN_SESSION_SECRET", getEnv("WHATSAPP_APP_SECRET", "demo_session_secret")),
   superAdminPassword: usableSecretEnv("SUPER_ADMIN_PASSWORD"),
@@ -207,12 +211,20 @@ const postgresAdapter = config.storeBackend === "postgres"
     })
   : null;
 const storageAdapter = sqliteAdapter || postgresAdapter;
-const store = new JsonStore(config.dataDir, { adapter: storageAdapter });
+const store = new JsonStore(config.dataDir, {
+  adapter: storageAdapter,
+  outboxRetentionDays: config.outboxRetentionDays,
+  processedMessageRetentionDays: config.processedMessageRetentionDays,
+  auditLogMaxRows: config.auditLogMaxRows,
+});
 const adminAccounts = new AdminAccountStore(config.dataDir, {
   adapter: storageAdapter,
   encryptionSecret: config.adminSessionSecret,
 });
-const operations = new OperationsStore(config.dataDir, { adapter: storageAdapter });
+const operations = new OperationsStore(config.dataDir, {
+  adapter: storageAdapter,
+  completedFollowupRetentionDays: config.followupQueueCompletedRetentionDays,
+});
 const teamContentStore = new TeamContentStore(config.dataDir, { adapter: storageAdapter });
 const webTransportManager = config.transportMode === "web"
   ? new WebWhatsAppManager({
