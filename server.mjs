@@ -12457,6 +12457,8 @@ function productFlowPageHtml() {
     .knowledge-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
     .knowledge-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
     .knowledge-note { color: var(--muted); font-size: 13px; }
+    .section-switch { display: inline-flex; align-items: center; gap: 8px; color: #1d1d1f; font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .section-switch input { width: auto; padding: 0; }
     .knowledge-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .knowledge-list { display: grid; gap: 8px; }
     .knowledge-item { padding: 10px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; }
@@ -12602,9 +12604,7 @@ function productFlowPageHtml() {
               <h3>Package Upsell</h3>
               <div class="knowledge-note">After complete order details, offer a higher package when available. No upsell is sent when the selected package is already highest.</div>
             </div>
-          </div>
-          <div class="fields">
-            <label class="field wide" for="upsell-enabled"><input id="upsell-enabled" type="checkbox" /> Enable package upsell for this product</label>
+            <label class="section-switch" for="upsell-enabled"><input id="upsell-enabled" type="checkbox" /> Enable upsell</label>
           </div>
           <h4 class="followup-title">Upsell Follow-Up</h4>
           <div class="followup-note">Sent hourly after the upsell offer if the customer does not confirm whether to upgrade or keep the original package.</div>
