@@ -605,12 +605,13 @@ const server = http.createServer(async (req, res) => {
       try {
         const account = await adminAccounts.setOperationalControl(String(body.id || ""), {
           automationPaused: Boolean(body.automationPaused),
+          autoReplyMode: body.autoReplyMode,
           testMode: Boolean(body.testMode),
         });
         await store.appendAuditLog({
           actor: "super_admin",
           action: "automation_control_updated",
-          result: `${account.id}:${account.automationPaused ? "paused" : account.testMode ? "test_mode" : "live"}`,
+          result: `${account.id}:${account.autoReplyMode || (account.automationPaused ? "paused" : "full_ai")}${account.testMode ? ":test_mode" : ""}`,
         });
         return sendJson(res, 200, { account });
       } catch (error) {
@@ -2135,7 +2136,10 @@ async function processInboundMessageCore({
   }
 
   if (live) {
-    const blocked = await liveAutomationBlock(businessAccountId);
+    const blocked = await liveAutomationBlock(
+      businessAccountId,
+      shouldPrioritizeOpeningFlow ? "opening_flow" : "conversation_planning"
+    );
     if (blocked) {
       const updatedCustomer = await store.updateCustomer(from, () => ({
         handoffStatus: "human_required",
@@ -2266,7 +2270,8 @@ async function processInboundMessageCore({
       category: complaintIntent.category,
       businessAccountId,
     });
-    const outbound = complaintReply ? [textMessage(complaintReply)] : [];
+    const suppressCustomerReply = live && await isFlowsOnlyAutoReplyMode(businessAccountId);
+    const outbound = !suppressCustomerReply && complaintReply ? [textMessage(complaintReply)] : [];
     const categoryLabel = complaintCategoryDisplay(complaint.category);
     const updatedCustomer = await store.updateCustomer(from, () => ({
       productId: product.id,
@@ -2321,7 +2326,8 @@ async function processInboundMessageCore({
 
   if (!faqSalesResponse && !initialAdOpening && isDeliveryRescheduleRequest(text)) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
-    const outbound = [textMessage(deliveryRescheduleReply())];
+    const suppressCustomerReply = live && await isFlowsOnlyAutoReplyMode(businessAccountId);
+    const outbound = suppressCustomerReply ? [] : [textMessage(deliveryRescheduleReply())];
     const updatedCustomer = await store.updateCustomer(from, () => ({
       awaitingPackageBInterest: false,
       handoffStatus: "human_required",
@@ -2340,11 +2346,13 @@ async function processInboundMessageCore({
     if (businessAccountId !== DEMO_ACCOUNT_ID) {
       await notifyAdmin(`Delivery reschedule requested for ${from}: ${text}`, { businessAccountId, correlationId });
     }
-    await sendOutbound(from, outbound, {
-      businessAccountId,
-      correlationId,
-      purpose: "delivery_reschedule_handoff",
-    });
+    if (outbound.length) {
+      await sendOutbound(from, outbound, {
+        businessAccountId,
+        correlationId,
+        purpose: "delivery_reschedule_handoff",
+      });
+    }
     return {
       customer: updatedCustomer,
       order: latestOrder,
@@ -2354,38 +2362,33 @@ async function processInboundMessageCore({
     };
   }
 
+  if (!faqSalesResponse && !initialAdOpening && isActiveOrderLookupHandoff(customer)) {
+    const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
+    const statusReplies = await store.getOrderStatusReplies(businessAccountId);
+    return await handleOrderStatusRoute({
+      from,
+      text,
+      customer,
+      latestOrder,
+      statusReplies,
+      businessAccountId,
+      correlationId,
+    });
+  }
+
   const classifiedOrderStatus = routeClassification?.messageType === "order_status" && routeClassification.confidence !== "low";
   if (!faqSalesResponse && !initialAdOpening && (classifiedOrderStatus || (routeAllowsFallback(routeClassification) && await maybeDetectOrderStatusIntent(text, businessAccountId)))) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
     const statusReplies = await store.getOrderStatusReplies(businessAccountId);
-    const outbound = [textMessage(customerOrderStatusReply(latestOrder, statusReplies))];
-    const updatedCustomer = await store.updateCustomer(from, () => ({
-      awaitingPackageBInterest: false,
-      handoffStatus: "",
-      handoffReason: "",
-      lastOrderStatusEnquiryAt: new Date().toISOString(),
-    }), businessAccountId);
-    await store.appendAuditLog({
-      actor: "ai_agent",
-      action: "customer_order_status_reply",
-      customerId: from,
-      result: latestOrder ? `${latestOrder.id}:${latestOrder.status}` : "no_linked_order",
+    return await handleOrderStatusRoute({
+      from,
+      text,
+      customer,
+      latestOrder,
+      statusReplies,
       businessAccountId,
       correlationId,
     });
-    await delayBeforeStatusReply(from, "order status reply");
-    await sendOutbound(from, outbound, {
-      businessAccountId,
-      correlationId,
-      purpose: "order_status_reply",
-    });
-    return {
-      customer: updatedCustomer,
-      order: latestOrder,
-      messages: outbound,
-      handoffRequired: false,
-      handoffReason: "",
-    };
   }
 
   const productResolution = resolveProduct(teamCatalog, text, source, customer.productId);
@@ -2549,6 +2552,28 @@ async function processInboundMessageCore({
       }
     : plan;
 
+  if (live && await shouldSuppressPlanForFlowsOnly(businessAccountId, {
+    effectivePlan,
+    openingFlowDecision,
+    orderWillBeCreated: Boolean(effectivePlan.order),
+  })) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "flows_only_reply_suppressed",
+      customerId: from,
+      result: `${effectivePlan.routingDecision?.category || "unknown"}:${effectivePlan.routingDecision?.rule || "unknown"}`,
+      businessAccountId,
+      correlationId,
+    });
+    return {
+      customer,
+      order: null,
+      messages: [],
+      handoffRequired: false,
+      handoffReason: "Auto Reply Mode is Flows Only; conversational AI reply suppressed.",
+    };
+  }
+
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
     ...(effectivePlan.customerPatch || {}),
@@ -2673,6 +2698,141 @@ async function maybeDetectOrderStatusIntent(customerMessage, businessAccountId =
     await recordSystemError("order_status_intent", error, "Unable to classify order-status enquiry.");
     return isLikelyOrderStatusQuestion(customerMessage);
   }
+}
+
+const ORDER_LOOKUP_HANDOFF_REASON = "Order lookup needs admin check.";
+
+function isActiveOrderLookupHandoff(customer = {}) {
+  return customer?.pendingOrderLookup?.status === "human_required" ||
+    String(customer?.handoffReason || "") === ORDER_LOOKUP_HANDOFF_REASON;
+}
+
+async function handleOrderStatusRoute({
+  from,
+  text,
+  customer = {},
+  latestOrder,
+  statusReplies,
+  businessAccountId = config.accountId,
+  correlationId = "",
+}) {
+  if (await isFlowsOnlyAutoReplyMode(businessAccountId)) {
+    const now = new Date().toISOString();
+    const updatedCustomer = await store.updateCustomer(from, (current) => ({
+      awaitingPackageBInterest: false,
+      pendingOrderLookup: latestOrder
+        ? null
+        : {
+            status: "human_required",
+            startedAt: current.pendingOrderLookup?.startedAt || now,
+            updatedAt: now,
+            lastMessage: text,
+          },
+      handoffStatus: "human_required",
+      handoffReason: ORDER_LOOKUP_HANDOFF_REASON,
+      handoffSeverity: handoffSeverityForReason(ORDER_LOOKUP_HANDOFF_REASON, "order_risk"),
+      lastOrderStatusEnquiryAt: now,
+    }), businessAccountId);
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "flows_only_order_status_handoff",
+      customerId: from,
+      result: latestOrder ? `${latestOrder.id}:${latestOrder.status}` : "no_linked_order",
+      businessAccountId,
+      correlationId,
+    });
+    if (businessAccountId !== DEMO_ACCOUNT_ID) {
+      await notifyAdmin(`Order status request needs admin check for ${from}: ${text}`, { businessAccountId, correlationId });
+    }
+    return {
+      customer: updatedCustomer,
+      order: latestOrder || null,
+      messages: [],
+      handoffRequired: true,
+      handoffReason: ORDER_LOOKUP_HANDOFF_REASON,
+      handoffSeverity: handoffSeverityForReason(ORDER_LOOKUP_HANDOFF_REASON, "order_risk"),
+    };
+  }
+
+  if (latestOrder) {
+    const outbound = [textMessage(customerOrderStatusReply(latestOrder, statusReplies))];
+    const updatedCustomer = await store.updateCustomer(from, () => ({
+      awaitingPackageBInterest: false,
+      pendingOrderLookup: null,
+      handoffStatus: "",
+      handoffReason: "",
+      lastOrderStatusEnquiryAt: new Date().toISOString(),
+    }), businessAccountId);
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "customer_order_status_reply",
+      customerId: from,
+      result: `${latestOrder.id}:${latestOrder.status}`,
+      businessAccountId,
+      correlationId,
+    });
+    await delayBeforeStatusReply(from, "order status reply");
+    await sendOutbound(from, outbound, {
+      businessAccountId,
+      correlationId,
+      purpose: "order_status_reply",
+    });
+    return {
+      customer: updatedCustomer,
+      order: latestOrder,
+      messages: outbound,
+      handoffRequired: false,
+      handoffReason: "",
+    };
+  }
+
+  const now = new Date().toISOString();
+  const alreadyHandedOff = isActiveOrderLookupHandoff(customer);
+  const outbound = [textMessage(alreadyHandedOff
+    ? "Terima kasih kita, saya tambah info ani untuk team check order kita ya."
+    : "Maaf kita, kami belum dapat jumpa order linked dengan nombor WhatsApp ani. Saya forward ke team untuk check ya. Kalau ada nama/nombor telefon masa order, boleh share di sini."
+  )];
+  const updatedCustomer = await store.updateCustomer(from, (current) => ({
+    awaitingPackageBInterest: false,
+    pendingOrderLookup: {
+      status: "human_required",
+      startedAt: current.pendingOrderLookup?.startedAt || now,
+      updatedAt: now,
+      lastMessage: text,
+    },
+    handoffStatus: "human_required",
+    handoffReason: ORDER_LOOKUP_HANDOFF_REASON,
+    handoffSeverity: handoffSeverityForReason(ORDER_LOOKUP_HANDOFF_REASON, "order_risk"),
+    lastOrderStatusEnquiryAt: now,
+  }), businessAccountId);
+  await store.appendAuditLog({
+    actor: "ai_agent",
+    action: alreadyHandedOff ? "order_lookup_additional_info_handoff" : "order_lookup_handoff",
+    customerId: from,
+    result: "no_linked_order",
+    businessAccountId,
+    correlationId,
+  });
+  if (businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(
+      `${alreadyHandedOff ? "Additional order lookup info" : "Order lookup needs admin check"} for ${from}: ${text}`,
+      { businessAccountId, correlationId }
+    );
+  }
+  await delayBeforeStatusReply(from, alreadyHandedOff ? "order lookup update" : "order lookup handoff");
+  await sendOutbound(from, outbound, {
+    businessAccountId,
+    correlationId,
+    purpose: alreadyHandedOff ? "order_lookup_additional_info" : "order_lookup_handoff",
+  });
+  return {
+    customer: updatedCustomer,
+    order: null,
+    messages: outbound,
+    handoffRequired: true,
+    handoffReason: ORDER_LOOKUP_HANDOFF_REASON,
+    handoffSeverity: handoffSeverityForReason(ORDER_LOOKUP_HANDOFF_REASON, "order_risk"),
+  };
 }
 
 async function maybeDetectComplaintIntent(customerMessage, businessAccountId = config.accountId) {
@@ -3090,6 +3250,8 @@ async function maybeSendOrderFormReminder(customer, content, now = new Date()) {
     return null;
   }
   const businessAccountId = customer.businessAccountId || config.accountId;
+  const blocked = await liveAutomationBlock(businessAccountId, "order_form_followup");
+  if (blocked) return { sent: false, customerId: customer.id, businessAccountId, skipped: blocked.code, blocked };
   await sendOutbound(customer.id, [textMessage(due.message)], {
     businessAccountId,
     purpose: "order_form_followup",
@@ -3268,6 +3430,8 @@ async function maybeSendPendingUpsellReminder(customer, product, content, now = 
   );
   const businessAccountId = customer.businessAccountId || config.accountId;
   if (due) {
+    const blocked = await liveAutomationBlock(businessAccountId, "upsell_followup");
+    if (blocked) return { sent: false, customerId: customer.id, businessAccountId, skipped: blocked.code, blocked };
     await sendOutbound(customer.id, [textMessage(due.message)], {
       businessAccountId,
       purpose: "upsell_followup",
@@ -3290,6 +3454,8 @@ async function maybeSendPendingUpsellReminder(customer, product, content, now = 
     return { sent: true, customerId: customer.id, businessAccountId, reminderKey: due.key };
   }
   if (elapsedHours >= 3 && settings.reminders.every((item) => !item.enabled || reminders.sent[item.key])) {
+    const blocked = await liveAutomationBlock(businessAccountId, "upsell_followup");
+    if (blocked) return { finalized: false, customerId: customer.id, businessAccountId, skipped: blocked.code, blocked };
     return finalizePendingUpsell(customer, product, pending.originalOrderDraft, "upsell_no_reply_original", businessAccountId);
   }
   return null;
@@ -3582,7 +3748,7 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
     return { sent: false, customerId: id, skipped: "followup_blocked" };
   }
   if (respectOperationalControl) {
-    const blocked = await liveAutomationBlock(customer.businessAccountId || businessAccountId);
+    const blocked = await liveAutomationBlock(customer.businessAccountId || businessAccountId, "followup");
     if (blocked) {
       return { sent: false, customerId: id, skipped: blocked.code, blocked };
     }
@@ -3754,7 +3920,7 @@ async function filterOperationalFollowups(due = []) {
   for (const item of due) {
     const accountId = item.customer.businessAccountId || config.accountId;
     if (!blockByAccount.has(accountId)) {
-      blockByAccount.set(accountId, await liveAutomationBlock(accountId));
+      blockByAccount.set(accountId, await liveAutomationBlock(accountId, "followup"));
     }
     if (!blockByAccount.get(accountId)) allowed.push(item);
   }
@@ -6879,15 +7045,56 @@ function usableSecretEnv(name) {
   return value;
 }
 
-async function liveAutomationBlock(businessAccountId = config.accountId) {
+async function liveAutomationBlock(businessAccountId = config.accountId, purpose = "conversation") {
   const account = await adminAccounts.getAccount(businessAccountId);
-  if (account?.automationPaused) {
+  const mode = normalizeAutoReplyMode(account?.autoReplyMode || (account?.automationPaused ? "paused" : "full_ai"));
+  if (account?.automationPaused || mode === "paused") {
     return { code: "automation_paused", message: "AI automation paused by super admin." };
+  }
+  if (mode === "flows_only" && !isFlowsOnlyPurpose(purpose)) {
+    return { code: "flows_only", message: "Auto Reply Mode is Flows Only; conversational AI reply suppressed." };
   }
   if (account?.testMode) {
     return { code: "test_mode", message: "Account is in test mode; live AI reply suppressed." };
   }
   return null;
+}
+
+function normalizeAutoReplyMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  return ["full_ai", "flows_only", "paused"].includes(mode) ? mode : "full_ai";
+}
+
+async function isFlowsOnlyAutoReplyMode(businessAccountId = config.accountId) {
+  const account = await adminAccounts.getAccount(businessAccountId);
+  const mode = normalizeAutoReplyMode(account?.autoReplyMode || (account?.automationPaused ? "paused" : "full_ai"));
+  return mode === "flows_only";
+}
+
+function isFlowsOnlyPurpose(purpose) {
+  return [
+    "conversation_planning",
+    "opening_flow",
+    "followup",
+    "order_form_followup",
+    "upsell_followup",
+  ].includes(String(purpose || ""));
+}
+
+async function shouldSuppressPlanForFlowsOnly(businessAccountId = config.accountId, {
+  effectivePlan = {},
+  openingFlowDecision = {},
+  orderWillBeCreated = false,
+} = {}) {
+  const account = await adminAccounts.getAccount(businessAccountId);
+  const mode = normalizeAutoReplyMode(account?.autoReplyMode || (account?.automationPaused ? "paused" : "full_ai"));
+  if (mode !== "flows_only") return false;
+  if (openingFlowDecision?.shouldSend) return false;
+  if (orderWillBeCreated) return false;
+  if (effectivePlan?.order) return false;
+  if (effectivePlan?.customerPatch?.pendingOrder) return false;
+  if (effectivePlan?.customerPatch?.pendingUpsell) return false;
+  return effectivePlan?.routingDecision?.category !== "order";
 }
 
 async function businessAccountIdForPhoneNumber(phoneNumberId) {
@@ -8918,9 +9125,10 @@ function superAdminSystemHtml() {
       return result;
     }
     function mode(account) {
-      if (account.automationPaused) return ["Paused", "pause"];
+      if ((account.autoReplyMode || "") === "paused" || account.automationPaused) return ["Paused", "pause"];
+      if ((account.autoReplyMode || "") === "flows_only") return ["Flows Only", "test"];
       if (account.testMode) return ["Test Mode", "test"];
-      return ["Live", ""];
+      return ["Full AI", ""];
     }
     function retryStatus(message) {
       if (message.status === "retried") return ["Retried", ""];
@@ -9043,7 +9251,8 @@ function superAdminSystemHtml() {
       document.querySelector("#controls").innerHTML = accounts.length ? '<table><thead><tr><th>Account</th><th>Login</th><th>AI Mode</th><th>Last Updated</th><th>Action</th></tr></thead><tbody>' +
         accounts.map(account => {
           const accountMode = mode(account);
-          return '<tr><td><strong>' + esc(account.name) + '</strong><br>' + esc(account.id) + '</td><td>' + (account.active ? 'Enabled' : 'Disabled') + '</td><td><span class="pill ' + accountMode[1] + '">' + accountMode[0] + '</span></td><td>' + esc(fmt(account.updatedAt)) + '</td><td><div class="actions"><button class="' + (account.automationPaused ? '' : 'warn') + '" type="button" data-id="' + esc(account.id) + '" data-pause="' + (!account.automationPaused) + '" data-test="' + account.testMode + '">' + (account.automationPaused ? 'Resume AI' : 'Pause AI') + '</button><button type="button" data-id="' + esc(account.id) + '" data-pause="false" data-test="' + (!account.testMode) + '">' + (account.testMode ? 'Return Live' : 'Test Mode') + '</button></div></td></tr>';
+          const currentMode = account.autoReplyMode || (account.automationPaused ? 'paused' : 'full_ai');
+          return '<tr><td><strong>' + esc(account.name) + '</strong><br>' + esc(account.id) + '</td><td>' + (account.active ? 'Enabled' : 'Disabled') + '</td><td><span class="pill ' + accountMode[1] + '">' + accountMode[0] + '</span></td><td>' + esc(fmt(account.updatedAt)) + '</td><td><div class="actions"><button class="' + (currentMode === 'full_ai' ? 'primary' : '') + '" type="button" data-id="' + esc(account.id) + '" data-mode="full_ai" data-test="' + account.testMode + '">Full AI</button><button class="' + (currentMode === 'flows_only' ? 'primary' : '') + '" type="button" data-id="' + esc(account.id) + '" data-mode="flows_only" data-test="' + account.testMode + '">Flows Only</button><button class="' + (currentMode === 'paused' ? 'primary warn' : 'warn') + '" type="button" data-id="' + esc(account.id) + '" data-mode="paused" data-test="' + account.testMode + '">Paused</button><button type="button" data-id="' + esc(account.id) + '" data-mode="' + esc(currentMode) + '" data-test="' + (!account.testMode) + '">' + (account.testMode ? 'Return Live' : 'Test Mode') + '</button></div></td></tr>';
         }).join("") + '</tbody></table>' : '<div class="empty">No business accounts found.</div>';
 
       const failed = data.failedMessages || [];
@@ -9065,10 +9274,11 @@ function superAdminSystemHtml() {
         '</tbody></table>' : '<div class="empty">No change history recorded.</div>';
       renderTeamSettings();
 
-      document.querySelectorAll("button[data-id][data-pause]").forEach(button => button.addEventListener("click", async () => {
+      document.querySelectorAll("button[data-id][data-mode]").forEach(button => button.addEventListener("click", async () => {
         await request("/superadmin/system/account-control", {
           id: button.dataset.id,
-          automationPaused: button.dataset.pause === "true",
+          autoReplyMode: button.dataset.mode,
+          automationPaused: button.dataset.mode === "paused",
           testMode: button.dataset.test === "true"
         });
         load();
