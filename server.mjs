@@ -5429,6 +5429,14 @@ function followupZonedLocalToDate(parts, timeZone = config.businessTimeZone) {
 }
 
 function productFollowupSequence(product) {
+  const customRows = Array.isArray(product?.followup_schedule) ? product.followup_schedule : [];
+  if (customRows.length) {
+    const firstFollowup = customRows[0] || {};
+    return customRows
+      .map((row, index) => normalizeFollowupScheduleRow(row, index, firstFollowup))
+      .filter((item) => item.enabled !== false && item.followup.messages.length)
+      .sort((a, b) => a.dayOffset - b.dayOffset || a.sortTime - b.sortTime || a.index - b.index);
+  }
   const entries = Object.entries(product?.followups || {});
   const firstFollowup = entries.find(([key]) => key === "first_day_followup")?.[1] || {};
   return entries
@@ -5451,9 +5459,62 @@ function productFollowupSequence(product) {
     .sort((a, b) => a.dayOffset - b.dayOffset || a.index - b.index);
 }
 
+function normalizeFollowupScheduleRow(row = {}, index = 0, firstFollowup = {}) {
+  const messages = normalizeFollowupMessageBlocks(row.messages, row.message);
+  const timingType = String(row.timingType || row.timing_type || "").trim() === "delay_after_opening"
+    ? "delay_after_opening"
+    : "fixed_time";
+  const dayOffset = clampNumber(row.dayOffset ?? row.day_offset, 0, 365, 0);
+  const sendHour = clampNumber(row.sendHour ?? row.send_hour, 0, 23, 20);
+  const delayHours = clampNumber(row.delayHours ?? row.delay_hours, 1, 720, Math.max(1, sendHour));
+  const key = String(row.key || `custom_followup_${index + 1}`).trim() || `custom_followup_${index + 1}`;
+  return {
+    key,
+    label: String(row.label || `Follow-up ${index + 1}`).trim() || `Follow-up ${index + 1}`,
+    enabled: row.enabled !== false,
+    followup: {
+      ...row,
+      message: followupTextSummary(messages, row.message),
+      messages,
+    },
+    firstFollowup,
+    index,
+    customSchedule: true,
+    timingType,
+    dayOffset,
+    sendHour,
+    delayHours,
+    sortTime: timingType === "delay_after_opening" ? delayHours : sendHour,
+    firstChatCutoffEnabled: row.firstChatCutoffEnabled ?? row.first_chat_cutoff_enabled,
+    firstChatCutoffHour: row.firstChatCutoffHour ?? row.first_chat_cutoff_hour,
+  };
+}
+
 function teamFollowupMessages(content = defaultTeamContent) {
   const products = content?.catalog?.products || [];
-  const sourceProduct = products.find((product) => product?.followups && Object.keys(product.followups).length) || products[0] || {};
+  const sourceProduct = products.find((product) =>
+    (Array.isArray(product?.followup_schedule) && product.followup_schedule.length) ||
+    (product?.followups && Object.keys(product.followups).length)
+  ) || products[0] || {};
+  if (Array.isArray(sourceProduct.followup_schedule) && sourceProduct.followup_schedule.length) {
+    return sourceProduct.followup_schedule.map((row, index) => {
+      const item = normalizeFollowupScheduleRow(row, index, sourceProduct.followup_schedule[0] || {});
+      return {
+        key: item.key,
+        label: item.label,
+        enabled: item.enabled,
+        customSchedule: true,
+        timingType: item.timingType,
+        dayOffset: item.dayOffset,
+        sendHour: item.sendHour,
+        delayHours: item.delayHours,
+        message: item.followup.message,
+        messages: item.followup.messages,
+        firstChatCutoffEnabled: index === 0 ? item.firstChatCutoffEnabled !== false : undefined,
+        firstChatCutoffHour: index === 0 ? clampNumber(item.firstChatCutoffHour, 0, 23, 19) : undefined,
+      };
+    });
+  }
   return FOLLOWUP_EDITOR_STAGES.map((stage) => {
     const followup = sourceProduct.followups?.[stage.key] || {};
     const messages = normalizeFollowupMessageBlocks(followup.messages, followup.message);
@@ -5481,9 +5542,25 @@ function teamFollowupMessages(content = defaultTeamContent) {
 }
 
 function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
-  const byKey = new Map((Array.isArray(stages) ? stages : []).map((stage) => [String(stage.key || ""), stage]));
+  const incoming = Array.isArray(stages) ? stages : [];
+  const hasCustomSchedule = incoming.some((stage) =>
+    stage?.customSchedule ||
+    stage?.timingType ||
+    stage?.timing_type ||
+    !FOLLOWUP_EDITOR_STAGES.some((editorStage) => editorStage.key === String(stage?.key || ""))
+  );
   const products = content?.catalog?.products || [];
   let updatedProducts = 0;
+  if (hasCustomSchedule) {
+    for (const product of products) {
+      product.followup_schedule = incoming
+        .map((input, index) => serializeFollowupScheduleRow(input, index))
+        .filter(Boolean);
+      updatedProducts += 1;
+    }
+    return { updatedProducts, stages: teamFollowupMessages(content) };
+  }
+  const byKey = new Map(incoming.map((stage) => [String(stage.key || ""), stage]));
   for (const product of products) {
     product.followups = product.followups && typeof product.followups === "object" ? product.followups : {};
     let changed = false;
@@ -5520,6 +5597,35 @@ function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
     if (changed) updatedProducts += 1;
   }
   return { updatedProducts, stages: teamFollowupMessages(content) };
+}
+
+function serializeFollowupScheduleRow(input = {}, index = 0) {
+  const messages = normalizeFollowupMessageBlocks(input.messages, input.message);
+  if (!messages.length) return null;
+  const timingType = String(input.timingType || input.timing_type || "").trim() === "delay_after_opening"
+    ? "delay_after_opening"
+    : "fixed_time";
+  const keySource = String(input.key || "").trim() || `custom_followup_${index + 1}`;
+  const key = keySource
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "") || `custom_followup_${index + 1}`;
+  const row = {
+    key,
+    label: String(input.label || `Follow-up ${index + 1}`).trim() || `Follow-up ${index + 1}`,
+    enabled: input.enabled !== false,
+    timing_type: timingType,
+    day_offset: clampNumber(input.dayOffset ?? input.day_offset, 0, 365, 0),
+    send_hour: clampNumber(input.sendHour ?? input.send_hour, 0, 23, 20),
+    delay_hours: clampNumber(input.delayHours ?? input.delay_hours, 1, 720, 1),
+    message: followupTextSummary(messages, ""),
+    messages,
+  };
+  if (index === 0) {
+    row.first_chat_cutoff_enabled = input.firstChatCutoffEnabled !== false;
+    row.first_chat_cutoff_hour = clampNumber(input.firstChatCutoffHour ?? input.first_chat_cutoff_hour, 0, 23, 19);
+  }
+  return row;
 }
 
 function normalizeFollowupMessageBlocks(blocks, fallbackMessage = "") {
@@ -5681,6 +5787,23 @@ function followupDayOffset(key, followup, index) {
 }
 
 function followupDueAt(firstSeenAt, item) {
+  if (item.customSchedule && item.timingType === "delay_after_opening") {
+    return new Date(new Date(firstSeenAt).getTime() + Math.max(1, Number(item.delayHours || 1)) * 60 * 60 * 1000);
+  }
+  if (item.customSchedule) {
+    const firstSeenLocal = followupZonedDateParts(new Date(firstSeenAt));
+    let dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, item.dayOffset);
+    if (
+      item.index === 0 &&
+      item.dayOffset === 0 &&
+      item.firstChatCutoffEnabled !== false &&
+      Number.isFinite(Number(item.firstChatCutoffHour)) &&
+      firstSeenLocal.hour >= Number(item.firstChatCutoffHour)
+    ) {
+      dueLocal = addFollowupLocalDays(dueLocal, 1);
+    }
+    return followupZonedLocalToDate(dueLocal);
+  }
   const firstDueAt = firstFollowupDueAt(firstSeenAt, {
     cutoffEnabled: item.firstFollowup?.first_chat_cutoff_enabled !== false,
     cutoffHour: item.firstFollowup?.first_chat_cutoff_hour,
@@ -5726,6 +5849,7 @@ function effectiveFollowupDueAt(customer, item, sequence = []) {
   const scheduledDueAt = followupDueAt(customer.firstSeenAt, item);
   const previousSentAt = previousFollowupSentAt(customer, item, sequence);
   if (!previousSentAt) return scheduledDueAt;
+  if (item.customSchedule && scheduledDueAt > previousSentAt) return scheduledDueAt;
   const previousGateAt = followupDueAfterPreviousSent(previousSentAt, item);
   return scheduledDueAt > previousGateAt ? scheduledDueAt : previousGateAt;
 }
@@ -12259,10 +12383,11 @@ function followupSettingsPageHtml() {
     input, textarea, select { width:100%; border:1px solid #d2d2d7; border-radius:8px; padding:9px 10px; font:inherit; background:#fff; }
     input[type="checkbox"] { width:auto; }
     textarea { min-height:110px; resize:vertical; line-height:1.38; }
-    .stage-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; padding:0 14px 14px; }
+    .stage-grid { display:grid; gap:14px; padding:0 14px 14px; }
     .stage-card { display:grid; gap:10px; border:1px solid #e5e5ea; border-radius:8px; padding:14px; background:#fbfbfd; }
     .stage-head { display:flex; justify-content:space-between; gap:10px; align-items:center; }
     .stage-head strong { font-size:16px; }
+    .schedule-fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; align-items:end; }
     .block { display:grid; gap:8px; border:1px solid #d2d2d7; border-radius:8px; padding:10px; background:#fff; }
     .block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; color:#6e6e73; font-weight:800; text-transform:uppercase; }
     .block-actions { display:flex; gap:8px; flex-wrap:wrap; }
@@ -12275,7 +12400,7 @@ function followupSettingsPageHtml() {
 <body>
   <header>
     <h1 id="page-title">Follow-Up Settings</h1>
-    <p class="muted">Edit team follow-up messages, media, send hours, and first-follow-up cutoff rules.</p>
+    <p class="muted">Build a flexible team follow-up schedule with custom rows, media, send hours, delays, and first-follow-up cutoff rules.</p>
   </header>
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
@@ -12317,8 +12442,11 @@ function followupSettingsPageHtml() {
     </section>
     <section>
       <h2>Follow-Up Messages</h2>
-      <p class="muted">Each stage can contain as many text, image, or video blocks as you need. Empty stages are disabled.</p>
+      <p class="muted">Add as many follow-ups as each team needs. Use fixed time for a calendar day, or delay after opening for same-day sequences. Empty rows are disabled.</p>
       <div class="stage-grid" id="followup-stage-grid"></div>
+      <div class="block-actions">
+        <button id="add-followup-row" type="button">Add Follow-Up</button>
+      </div>
     </section>
     <section>
       <h2>Another Date Purchase Follow-Up</h2>
@@ -12349,8 +12477,11 @@ function followupSettingsPageHtml() {
     const defaultFollowupStages = ${JSON.stringify(FOLLOWUP_EDITOR_STAGES.map((stage) => ({
       key: stage.key,
       label: stage.label,
+      customSchedule: true,
+      timingType: "fixed_time",
       dayOffset: stage.dayOffset,
       sendHour: stage.defaultSendHour,
+      delayHours: Math.max(1, stage.defaultSendHour),
       message: "",
       messages: [],
       firstChatCutoffEnabled: stage.firstChatCutoffHour === undefined ? undefined : true,
@@ -12419,7 +12550,7 @@ function followupSettingsPageHtml() {
       document.querySelector("#another-date-fallback-day").value = anotherDate.fallbackDayOfMonth || 20;
       document.querySelector("#another-date-send-hour").value = anotherDate.sendHour ?? 20;
       document.querySelector("#another-date-message").value = anotherDate.message || "";
-      const first = stages.find(stage => stage.key === "first_day_followup") || {};
+      const first = stages[0] || {};
       document.querySelector("#first-cutoff-enabled").checked = first.firstChatCutoffEnabled !== false;
       document.querySelector("#first-cutoff-hour").value = first.firstChatCutoffHour ?? 19;
       document.querySelector("#followup-stage-grid").innerHTML = stages.map(renderStage).join("");
@@ -12429,8 +12560,17 @@ function followupSettingsPageHtml() {
       const blocks = (stage.messages || (stage.message ? [{ type: "text", body: stage.message }] : [])).map(normalizeBlock).filter(Boolean);
       if (!blocks.length) blocks.push({ id: blockId(), type: "text", body: "" });
       return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '">' +
-        '<div class="stage-head"><strong>' + esc(stage.label) + '</strong><span class="muted">Day offset: ' + esc(stage.dayOffset) + '</span></div>' +
-        '<label>Send Hour<input data-stage-field="sendHour" type="number" min="0" max="23" value="' + esc(stage.sendHour ?? 20) + '" /></label>' +
+        '<div class="stage-head"><strong>' + esc(stage.label || "Follow-Up") + '</strong><button class="danger" type="button" data-remove-stage>Delete Row</button></div>' +
+        '<div class="schedule-fields">' +
+          '<label>Label<input data-stage-field="label" value="' + esc(stage.label || "") + '" /></label>' +
+          '<label>Day<input data-stage-field="dayOffset" type="number" min="0" max="365" value="' + esc(stage.dayOffset ?? 0) + '" /></label>' +
+          '<label>Timing<select data-stage-field="timingType">' +
+            '<option value="fixed_time"' + ((stage.timingType || "fixed_time") === "fixed_time" ? " selected" : "") + '>Fixed time</option>' +
+            '<option value="delay_after_opening"' + (stage.timingType === "delay_after_opening" ? " selected" : "") + '>Delay after opening</option>' +
+          '</select></label>' +
+          '<label>Send Hour<input data-stage-field="sendHour" type="number" min="0" max="23" value="' + esc(stage.sendHour ?? 20) + '" /></label>' +
+          '<label>Delay Hours<input data-stage-field="delayHours" type="number" min="1" max="720" value="' + esc(stage.delayHours ?? 1) + '" /></label>' +
+        '</div>' +
         '<div class="blocks">' + blocks.map(renderBlock).join("") + '</div>' +
         '<div class="block-actions">' +
           '<button type="button" data-add-block="text">Add Text</button>' +
@@ -12468,6 +12608,9 @@ function followupSettingsPageHtml() {
       document.querySelectorAll("[data-remove-block]").forEach(button => {
         button.addEventListener("click", () => button.closest(".block").remove());
       });
+      document.querySelectorAll("[data-remove-stage]").forEach(button => {
+        button.addEventListener("click", () => button.closest(".stage-card").remove());
+      });
     }
     function addBlock(card, type) {
       if (type === "text") {
@@ -12500,9 +12643,16 @@ function followupSettingsPageHtml() {
       mediaInput.click();
     }
     function readStage(card) {
+      const label = card.querySelector('[data-stage-field="label"]').value.trim() || "Follow-Up";
+      const fallbackKey = label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "custom_followup";
       return {
-        key: card.dataset.stageKey,
+        key: card.dataset.stageKey || fallbackKey,
+        label,
+        customSchedule: true,
+        timingType: card.querySelector('[data-stage-field="timingType"]').value,
+        dayOffset: card.querySelector('[data-stage-field="dayOffset"]').value,
         sendHour: card.querySelector('[data-stage-field="sendHour"]').value,
+        delayHours: card.querySelector('[data-stage-field="delayHours"]').value,
         messages: [...card.querySelectorAll(".block")].map(block => {
           const type = block.dataset.blockType;
           if (type === "image" || type === "video") {
@@ -12525,7 +12675,7 @@ function followupSettingsPageHtml() {
       const state = document.querySelector("#save-state");
       state.textContent = "Saving...";
       const followups = [...document.querySelectorAll(".stage-card")].map(readStage);
-      const first = followups.find(stage => stage.key === "first_day_followup");
+      const first = followups[0];
       if (first) {
         first.firstChatCutoffEnabled = document.querySelector("#first-cutoff-enabled").checked;
         first.firstChatCutoffHour = document.querySelector("#first-cutoff-hour").value;
@@ -12572,6 +12722,7 @@ function followupSettingsPageHtml() {
       }
     }
     document.querySelector("#save-followups").addEventListener("click", save);
+    document.querySelector("#add-followup-row").addEventListener("click", addFollowupRow);
     document.querySelector("#refresh").addEventListener("click", load);
     load();
   </script>
@@ -13132,6 +13283,21 @@ function productFlowPageHtml() {
         offers,
         reminders
       };
+    }
+    function addFollowupRow() {
+      const index = document.querySelectorAll(".stage-card").length + 1;
+      const row = {
+        key: "custom_followup_" + Date.now(),
+        label: "Follow-up " + index,
+        customSchedule: true,
+        timingType: "delay_after_opening",
+        dayOffset: 0,
+        sendHour: 20,
+        delayHours: Math.max(1, index * 2),
+        messages: [{ id: blockId(), type: "text", body: "" }]
+      };
+      document.querySelector("#followup-stage-grid").insertAdjacentHTML("beforeend", renderStage(row));
+      bindStageButtons();
     }
 
     function renderOrderForm() {
