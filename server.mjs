@@ -12382,12 +12382,14 @@ function followupSettingsPageHtml() {
     label { display:grid; gap:7px; font-size:13px; font-weight:700; }
     input, textarea, select { width:100%; border:1px solid #d2d2d7; border-radius:8px; padding:9px 10px; font:inherit; background:#fff; }
     input:disabled, select:disabled, textarea:disabled { opacity:.55; background:#f5f5f7; cursor:not-allowed; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
     input[type="checkbox"] { width:auto; }
     textarea { min-height:110px; resize:vertical; line-height:1.38; }
     .stage-grid { display:grid; gap:14px; padding:0 14px 14px; }
     .stage-card { display:grid; gap:10px; border:1px solid #e5e5ea; border-radius:8px; padding:14px; background:#fbfbfd; }
     .stage-head { display:flex; justify-content:space-between; gap:10px; align-items:center; }
     .stage-head strong { font-size:16px; }
+    .stage-tools { display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; }
     .schedule-fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; align-items:end; }
     .schedule-fields label.is-disabled { color:#8a8a8e; }
     .block { display:grid; gap:8px; border:1px solid #d2d2d7; border-radius:8px; padding:10px; background:#fff; }
@@ -12562,7 +12564,11 @@ function followupSettingsPageHtml() {
       const blocks = (stage.messages || (stage.message ? [{ type: "text", body: stage.message }] : [])).map(normalizeBlock).filter(Boolean);
       if (!blocks.length) blocks.push({ id: blockId(), type: "text", body: "" });
       return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '">' +
-        '<div class="stage-head"><strong>' + esc(stage.label || "Follow-Up") + '</strong><button class="danger" type="button" data-remove-stage>Delete Row</button></div>' +
+        '<div class="stage-head"><strong>' + esc(stage.label || "Follow-Up") + '</strong><div class="stage-tools">' +
+          '<button type="button" data-move-stage="up">Move Up</button>' +
+          '<button type="button" data-move-stage="down">Move Down</button>' +
+          '<button class="danger" type="button" data-remove-stage>Delete Row</button>' +
+        '</div></div>' +
         '<div class="schedule-fields">' +
           '<label>Label<input data-stage-field="label" value="' + esc(stage.label || "") + '" /></label>' +
           '<label>Day<input data-stage-field="dayOffset" type="number" min="0" max="365" value="' + esc(stage.dayOffset ?? 0) + '" /></label>' +
@@ -12605,8 +12611,12 @@ function followupSettingsPageHtml() {
     }
     function bindStageButtons() {
       document.querySelectorAll(".stage-card").forEach(updateStageTimingFields);
+      updateStageMoveButtons();
       document.querySelectorAll('[data-stage-field="timingType"]').forEach(select => {
         select.addEventListener("change", () => updateStageTimingFields(select.closest(".stage-card")));
+      });
+      document.querySelectorAll("[data-move-stage]").forEach(button => {
+        button.addEventListener("click", () => moveStage(button.closest(".stage-card"), button.dataset.moveStage));
       });
       document.querySelectorAll("[data-add-block]").forEach(button => {
         button.addEventListener("click", () => addBlock(button.closest(".stage-card"), button.dataset.addBlock));
@@ -12615,8 +12625,29 @@ function followupSettingsPageHtml() {
         button.addEventListener("click", () => button.closest(".block").remove());
       });
       document.querySelectorAll("[data-remove-stage]").forEach(button => {
-        button.addEventListener("click", () => button.closest(".stage-card").remove());
+        button.addEventListener("click", () => {
+          button.closest(".stage-card").remove();
+          updateStageMoveButtons();
+        });
       });
+    }
+    function updateStageMoveButtons() {
+      const cards = [...document.querySelectorAll(".stage-card")];
+      cards.forEach((card, index) => {
+        const up = card.querySelector('[data-move-stage="up"]');
+        const down = card.querySelector('[data-move-stage="down"]');
+        if (up) up.disabled = index === 0;
+        if (down) down.disabled = index === cards.length - 1;
+      });
+    }
+    function moveStage(card, direction) {
+      if (!card) return;
+      if (direction === "up" && card.previousElementSibling) {
+        card.parentNode.insertBefore(card, card.previousElementSibling);
+      } else if (direction === "down" && card.nextElementSibling) {
+        card.parentNode.insertBefore(card.nextElementSibling, card);
+      }
+      updateStageMoveButtons();
     }
     function setFieldDisabled(input, disabled) {
       if (!input) return;
