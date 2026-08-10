@@ -5469,7 +5469,9 @@ function normalizeFollowupScheduleRow(row = {}, index = 0, firstFollowup = {}) {
   const sendParts = parseFollowupSendTime(row.sendTime ?? row.send_time, row.sendHour ?? row.send_hour, row.sendMinute ?? row.send_minute, 20, 0);
   const sendHour = sendParts.hour;
   const sendMinute = sendParts.minute;
-  const delayHours = clampNumber(row.delayHours ?? row.delay_hours, 1, 720, Math.max(1, sendHour));
+  const fallbackDelayMinutes = Math.max(1, sendHour) * 60;
+  const delayMinutes = parseFollowupDelayMinutes(row.delayDuration ?? row.delay_duration, row.delayMinutes ?? row.delay_minutes, row.delayHours ?? row.delay_hours, fallbackDelayMinutes);
+  const delayHours = Math.max(1, Math.ceil(delayMinutes / 60));
   const key = String(row.key || `custom_followup_${index + 1}`).trim() || `custom_followup_${index + 1}`;
   return {
     key,
@@ -5489,7 +5491,9 @@ function normalizeFollowupScheduleRow(row = {}, index = 0, firstFollowup = {}) {
     sendMinute,
     sendTime: formatFollowupSendTime(sendHour, sendMinute),
     delayHours,
-    sortTime: timingType === "delay_after_opening" ? delayHours * 60 : sendHour * 60 + sendMinute,
+    delayMinutes,
+    delayDuration: formatFollowupDuration(delayMinutes),
+    sortTime: timingType === "delay_after_opening" ? delayMinutes : sendHour * 60 + sendMinute,
     firstChatCutoffEnabled: row.firstChatCutoffEnabled ?? row.first_chat_cutoff_enabled,
     firstChatCutoffHour: row.firstChatCutoffHour ?? row.first_chat_cutoff_hour,
   };
@@ -5515,6 +5519,8 @@ function teamFollowupMessages(content = defaultTeamContent) {
         sendMinute: item.sendMinute,
         sendTime: item.sendTime,
         delayHours: item.delayHours,
+        delayMinutes: item.delayMinutes,
+        delayDuration: item.delayDuration,
         message: item.followup.message,
         messages: item.followup.messages,
         firstChatCutoffEnabled: index === 0 ? item.firstChatCutoffEnabled !== false : undefined,
@@ -5623,6 +5629,7 @@ function serializeFollowupScheduleRow(input = {}, index = 0) {
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/^_+|_+$/g, "") || `custom_followup_${index + 1}`;
   const sendParts = parseFollowupSendTime(input.sendTime ?? input.send_time, input.sendHour ?? input.send_hour, input.sendMinute ?? input.send_minute, 20, 0);
+  const delayMinutes = parseFollowupDelayMinutes(input.delayDuration ?? input.delay_duration, input.delayMinutes ?? input.delay_minutes, input.delayHours ?? input.delay_hours, 60);
   const row = {
     key,
     label: String(input.label || `Follow-up ${index + 1}`).trim() || `Follow-up ${index + 1}`,
@@ -5632,7 +5639,9 @@ function serializeFollowupScheduleRow(input = {}, index = 0) {
     send_hour: sendParts.hour,
     send_minute: sendParts.minute,
     send_time: formatFollowupSendTime(sendParts.hour, sendParts.minute),
-    delay_hours: clampNumber(input.delayHours ?? input.delay_hours, 1, 720, 1),
+    delay_hours: Math.max(1, Math.ceil(delayMinutes / 60)),
+    delay_minutes: delayMinutes,
+    delay_duration: formatFollowupDuration(delayMinutes),
     message: followupTextSummary(messages, ""),
     messages,
   };
@@ -5811,6 +5820,23 @@ function formatFollowupSendTime(sendHour, sendMinute = 0) {
   return `${String(clampNumber(sendHour, 0, 23, 20)).padStart(2, "0")}:${String(clampNumber(sendMinute, 0, 59, 0)).padStart(2, "0")}`;
 }
 
+function parseFollowupDelayMinutes(delayDuration, delayMinutes, delayHours, fallbackMinutes = 60) {
+  const durationMatch = String(delayDuration || "").trim().match(/^(\d{1,3}):(\d{2})$/);
+  if (durationMatch) {
+    const hours = clampNumber(durationMatch[1], 0, 720, 0);
+    const minutes = clampNumber(durationMatch[2], 0, 59, 0);
+    return Math.max(1, Math.min(720 * 60, hours * 60 + minutes));
+  }
+  const minutesValue = Number(delayMinutes);
+  if (Number.isFinite(minutesValue)) return Math.max(1, Math.min(720 * 60, Math.trunc(minutesValue)));
+  return clampNumber(delayHours, 1, 720, Math.max(1, Math.ceil(fallbackMinutes / 60))) * 60;
+}
+
+function formatFollowupDuration(totalMinutes = 60) {
+  const minutes = Math.max(1, Math.min(720 * 60, Math.trunc(Number(totalMinutes) || 60)));
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
 function followupDayOffset(key, followup, index) {
   if (Number.isFinite(followup?.day_offset)) return followup.day_offset;
   if (key === "first_day_followup") return 0;
@@ -5821,7 +5847,7 @@ function followupDayOffset(key, followup, index) {
 
 function followupDueAt(firstSeenAt, item) {
   if (item.customSchedule && item.timingType === "delay_after_opening") {
-    return new Date(new Date(firstSeenAt).getTime() + Math.max(1, Number(item.delayHours || 1)) * 60 * 60 * 1000);
+    return new Date(new Date(firstSeenAt).getTime() + Math.max(1, Number(item.delayMinutes || Math.max(1, Number(item.delayHours || 1)) * 60)) * 60 * 1000);
   }
   if (item.customSchedule) {
     const firstSeenLocal = followupZonedDateParts(new Date(firstSeenAt));
@@ -12522,6 +12548,8 @@ function followupSettingsPageHtml() {
       sendMinute: 0,
       sendTime: String(stage.defaultSendHour).padStart(2, "0") + ":00",
       delayHours: Math.max(1, stage.defaultSendHour),
+      delayMinutes: Math.max(1, stage.defaultSendHour) * 60,
+      delayDuration: String(Math.max(1, stage.defaultSendHour)).padStart(2, "0") + ":00",
       message: "",
       messages: [],
       firstChatCutoffEnabled: stage.firstChatCutoffHour === undefined ? undefined : true,
@@ -12613,7 +12641,7 @@ function followupSettingsPageHtml() {
             '<option value="delay_after_opening"' + (stage.timingType === "delay_after_opening" ? " selected" : "") + '>Delay after opening</option>' +
           '</select></label>' +
           '<label>Send Time<input data-stage-field="sendTime" type="time" value="' + esc(stage.sendTime || (String(stage.sendHour ?? 20).padStart(2, "0") + ":" + String(stage.sendMinute ?? 0).padStart(2, "0"))) + '" /></label>' +
-          '<label>Delay Hours<input data-stage-field="delayHours" type="number" min="1" max="720" value="' + esc(stage.delayHours ?? 1) + '" /></label>' +
+          '<label>Delay After Opening<input data-stage-field="delayDuration" type="text" inputmode="numeric" pattern="[0-9]{1,3}:[0-5][0-9]" placeholder="00:30" value="' + esc(stage.delayDuration || (String(stage.delayHours ?? 1).padStart(2, "0") + ":00")) + '" /></label>' +
         '</div>' +
         '<div class="blocks">' + blocks.map(renderBlock).join("") + '</div>' +
         '<div class="block-actions">' +
@@ -12694,7 +12722,7 @@ function followupSettingsPageHtml() {
       if (!card) return;
       const timingType = card.querySelector('[data-stage-field="timingType"]')?.value || "fixed_time";
       setFieldDisabled(card.querySelector('[data-stage-field="sendTime"]'), timingType === "delay_after_opening");
-      setFieldDisabled(card.querySelector('[data-stage-field="delayHours"]'), timingType !== "delay_after_opening");
+      setFieldDisabled(card.querySelector('[data-stage-field="delayDuration"]'), timingType !== "delay_after_opening");
     }
     function addBlock(card, type) {
       if (type === "text") {
@@ -12736,7 +12764,7 @@ function followupSettingsPageHtml() {
         timingType: card.querySelector('[data-stage-field="timingType"]').value,
         dayOffset: card.querySelector('[data-stage-field="dayOffset"]').value,
         sendTime: card.querySelector('[data-stage-field="sendTime"]').value,
-        delayHours: card.querySelector('[data-stage-field="delayHours"]').value,
+        delayDuration: card.querySelector('[data-stage-field="delayDuration"]').value,
         messages: [...card.querySelectorAll(".block")].map(block => {
           const type = block.dataset.blockType;
           if (type === "image" || type === "video") {
@@ -12767,6 +12795,8 @@ function followupSettingsPageHtml() {
         sendMinute: 0,
         sendTime: "20:00",
         delayHours: Math.max(1, index * 2),
+        delayMinutes: Math.max(1, index * 2) * 60,
+        delayDuration: String(Math.max(1, index * 2)).padStart(2, "0") + ":00",
         messages: [{ id: blockId(), type: "text", body: "" }]
       };
       document.querySelector("#followup-stage-grid").insertAdjacentHTML("beforeend", renderStage(row));
