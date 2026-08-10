@@ -5369,8 +5369,9 @@ function firstFollowupDueAt(firstSeenAt, options = {}) {
   const cutoffEnabled = options.cutoffEnabled !== false;
   const cutoffHour = Number.isFinite(options.cutoffHour) ? options.cutoffHour : 19;
   const sendHour = Number.isFinite(options.sendHour) ? options.sendHour : 20;
+  const sendMinute = Number.isFinite(options.sendMinute) ? options.sendMinute : 0;
   const firstSeenLocal = followupZonedDateParts(firstSeen);
-  const dueLocal = { ...firstSeenLocal, hour: sendHour, minute: 0, second: 0, millisecond: 0 };
+  const dueLocal = { ...firstSeenLocal, hour: sendHour, minute: sendMinute, second: 0, millisecond: 0 };
   if (cutoffEnabled && firstSeenLocal.hour >= cutoffHour) {
     const next = addFollowupLocalDays(dueLocal, 1);
     return followupZonedLocalToDate(next);
@@ -5465,7 +5466,9 @@ function normalizeFollowupScheduleRow(row = {}, index = 0, firstFollowup = {}) {
     ? "delay_after_opening"
     : "fixed_time";
   const dayOffset = clampNumber(row.dayOffset ?? row.day_offset, 0, 365, 0);
-  const sendHour = clampNumber(row.sendHour ?? row.send_hour, 0, 23, 20);
+  const sendParts = parseFollowupSendTime(row.sendTime ?? row.send_time, row.sendHour ?? row.send_hour, row.sendMinute ?? row.send_minute, 20, 0);
+  const sendHour = sendParts.hour;
+  const sendMinute = sendParts.minute;
   const delayHours = clampNumber(row.delayHours ?? row.delay_hours, 1, 720, Math.max(1, sendHour));
   const key = String(row.key || `custom_followup_${index + 1}`).trim() || `custom_followup_${index + 1}`;
   return {
@@ -5483,8 +5486,10 @@ function normalizeFollowupScheduleRow(row = {}, index = 0, firstFollowup = {}) {
     timingType,
     dayOffset,
     sendHour,
+    sendMinute,
+    sendTime: formatFollowupSendTime(sendHour, sendMinute),
     delayHours,
-    sortTime: timingType === "delay_after_opening" ? delayHours : sendHour,
+    sortTime: timingType === "delay_after_opening" ? delayHours * 60 : sendHour * 60 + sendMinute,
     firstChatCutoffEnabled: row.firstChatCutoffEnabled ?? row.first_chat_cutoff_enabled,
     firstChatCutoffHour: row.firstChatCutoffHour ?? row.first_chat_cutoff_hour,
   };
@@ -5507,6 +5512,8 @@ function teamFollowupMessages(content = defaultTeamContent) {
         timingType: item.timingType,
         dayOffset: item.dayOffset,
         sendHour: item.sendHour,
+        sendMinute: item.sendMinute,
+        sendTime: item.sendTime,
         delayHours: item.delayHours,
         message: item.followup.message,
         messages: item.followup.messages,
@@ -5523,6 +5530,11 @@ function teamFollowupMessages(content = defaultTeamContent) {
       label: stage.label,
       dayOffset: Number.isFinite(followup.day_offset) ? followup.day_offset : stage.dayOffset,
       sendHour: Number.isFinite(followup.send_hour) ? followup.send_hour : stage.defaultSendHour,
+      sendMinute: Number.isFinite(followup.send_minute) ? followup.send_minute : 0,
+      sendTime: formatFollowupSendTime(
+        Number.isFinite(followup.send_hour) ? followup.send_hour : stage.defaultSendHour,
+        Number.isFinite(followup.send_minute) ? followup.send_minute : 0
+      ),
       message: followupTextSummary(messages, followup.message),
       messages,
       enabled: messages.length > 0,
@@ -5610,13 +5622,16 @@ function serializeFollowupScheduleRow(input = {}, index = 0) {
     .toLowerCase()
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/^_+|_+$/g, "") || `custom_followup_${index + 1}`;
+  const sendParts = parseFollowupSendTime(input.sendTime ?? input.send_time, input.sendHour ?? input.send_hour, input.sendMinute ?? input.send_minute, 20, 0);
   const row = {
     key,
     label: String(input.label || `Follow-up ${index + 1}`).trim() || `Follow-up ${index + 1}`,
     enabled: input.enabled !== false,
     timing_type: timingType,
     day_offset: clampNumber(input.dayOffset ?? input.day_offset, 0, 365, 0),
-    send_hour: clampNumber(input.sendHour ?? input.send_hour, 0, 23, 20),
+    send_hour: sendParts.hour,
+    send_minute: sendParts.minute,
+    send_time: formatFollowupSendTime(sendParts.hour, sendParts.minute),
     delay_hours: clampNumber(input.delayHours ?? input.delay_hours, 1, 720, 1),
     message: followupTextSummary(messages, ""),
     messages,
@@ -5778,6 +5793,24 @@ function clampNumber(value, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.trunc(number)));
 }
 
+function parseFollowupSendTime(sendTime, sendHour, sendMinute, fallbackHour = 20, fallbackMinute = 0) {
+  const timeMatch = String(sendTime || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (timeMatch) {
+    return {
+      hour: clampNumber(timeMatch[1], 0, 23, fallbackHour),
+      minute: clampNumber(timeMatch[2], 0, 59, fallbackMinute),
+    };
+  }
+  return {
+    hour: clampNumber(sendHour, 0, 23, fallbackHour),
+    minute: clampNumber(sendMinute, 0, 59, fallbackMinute),
+  };
+}
+
+function formatFollowupSendTime(sendHour, sendMinute = 0) {
+  return `${String(clampNumber(sendHour, 0, 23, 20)).padStart(2, "0")}:${String(clampNumber(sendMinute, 0, 59, 0)).padStart(2, "0")}`;
+}
+
 function followupDayOffset(key, followup, index) {
   if (Number.isFinite(followup?.day_offset)) return followup.day_offset;
   if (key === "first_day_followup") return 0;
@@ -5792,7 +5825,7 @@ function followupDueAt(firstSeenAt, item) {
   }
   if (item.customSchedule) {
     const firstSeenLocal = followupZonedDateParts(new Date(firstSeenAt));
-    let dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, item.dayOffset);
+    let dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: item.sendMinute || 0, second: 0, millisecond: 0 }, item.dayOffset);
     if (
       item.index === 0 &&
       item.dayOffset === 0 &&
@@ -5808,14 +5841,15 @@ function followupDueAt(firstSeenAt, item) {
     cutoffEnabled: item.firstFollowup?.first_chat_cutoff_enabled !== false,
     cutoffHour: item.firstFollowup?.first_chat_cutoff_hour,
     sendHour: Number.isFinite(item.firstFollowup?.send_hour) ? item.firstFollowup.send_hour : item.sendHour,
+    sendMinute: Number.isFinite(item.firstFollowup?.send_minute) ? item.firstFollowup.send_minute : item.sendMinute,
   });
   if (item.key === "first_day_followup") return firstDueAt;
 
   const firstSeenLocal = followupZonedDateParts(new Date(firstSeenAt));
-  const dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, item.dayOffset);
+  const dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: item.sendMinute || 0, second: 0, millisecond: 0 }, item.dayOffset);
   let due = followupZonedLocalToDate(dueLocal);
   if (due <= firstDueAt) {
-    due = followupZonedLocalToDate(addFollowupLocalDays({ ...followupZonedDateParts(firstDueAt), hour: item.sendHour, minute: 0, second: 0, millisecond: 0 }, 1));
+    due = followupZonedLocalToDate(addFollowupLocalDays({ ...followupZonedDateParts(firstDueAt), hour: item.sendHour, minute: item.sendMinute || 0, second: 0, millisecond: 0 }, 1));
   }
   return due;
 }
@@ -5835,7 +5869,7 @@ function previousFollowupSentAt(customer, item, sequence = []) {
 function followupDueAfterPreviousSent(previousSentAt, item) {
   const previousLocal = followupZonedDateParts(previousSentAt);
   const nextLocal = addFollowupLocalDays(
-    { ...previousLocal, hour: item.sendHour, minute: 0, second: 0, millisecond: 0 },
+    { ...previousLocal, hour: item.sendHour, minute: item.sendMinute || 0, second: 0, millisecond: 0 },
     1
   );
   let due = followupZonedLocalToDate(nextLocal);
@@ -12404,7 +12438,7 @@ function followupSettingsPageHtml() {
 <body>
   <header>
     <h1 id="page-title">Follow-Up Settings</h1>
-    <p class="muted">Build a flexible team follow-up schedule with custom rows, media, send hours, delays, and first-follow-up cutoff rules.</p>
+    <p class="muted">Build a flexible team follow-up schedule with custom rows, media, send times, delays, and first-follow-up cutoff rules.</p>
   </header>
   <nav>
     <a href="/admin/dashboard">Dashboard</a>
@@ -12485,6 +12519,8 @@ function followupSettingsPageHtml() {
       timingType: "fixed_time",
       dayOffset: stage.dayOffset,
       sendHour: stage.defaultSendHour,
+      sendMinute: 0,
+      sendTime: String(stage.defaultSendHour).padStart(2, "0") + ":00",
       delayHours: Math.max(1, stage.defaultSendHour),
       message: "",
       messages: [],
@@ -12576,7 +12612,7 @@ function followupSettingsPageHtml() {
             '<option value="fixed_time"' + ((stage.timingType || "fixed_time") === "fixed_time" ? " selected" : "") + '>Fixed time</option>' +
             '<option value="delay_after_opening"' + (stage.timingType === "delay_after_opening" ? " selected" : "") + '>Delay after opening</option>' +
           '</select></label>' +
-          '<label>Send Hour<input data-stage-field="sendHour" type="number" min="0" max="23" value="' + esc(stage.sendHour ?? 20) + '" /></label>' +
+          '<label>Send Time<input data-stage-field="sendTime" type="time" value="' + esc(stage.sendTime || (String(stage.sendHour ?? 20).padStart(2, "0") + ":" + String(stage.sendMinute ?? 0).padStart(2, "0"))) + '" /></label>' +
           '<label>Delay Hours<input data-stage-field="delayHours" type="number" min="1" max="720" value="' + esc(stage.delayHours ?? 1) + '" /></label>' +
         '</div>' +
         '<div class="blocks">' + blocks.map(renderBlock).join("") + '</div>' +
@@ -12657,7 +12693,7 @@ function followupSettingsPageHtml() {
     function updateStageTimingFields(card) {
       if (!card) return;
       const timingType = card.querySelector('[data-stage-field="timingType"]')?.value || "fixed_time";
-      setFieldDisabled(card.querySelector('[data-stage-field="sendHour"]'), timingType === "delay_after_opening");
+      setFieldDisabled(card.querySelector('[data-stage-field="sendTime"]'), timingType === "delay_after_opening");
       setFieldDisabled(card.querySelector('[data-stage-field="delayHours"]'), timingType !== "delay_after_opening");
     }
     function addBlock(card, type) {
@@ -12699,7 +12735,7 @@ function followupSettingsPageHtml() {
         customSchedule: true,
         timingType: card.querySelector('[data-stage-field="timingType"]').value,
         dayOffset: card.querySelector('[data-stage-field="dayOffset"]').value,
-        sendHour: card.querySelector('[data-stage-field="sendHour"]').value,
+        sendTime: card.querySelector('[data-stage-field="sendTime"]').value,
         delayHours: card.querySelector('[data-stage-field="delayHours"]').value,
         messages: [...card.querySelectorAll(".block")].map(block => {
           const type = block.dataset.blockType;
@@ -12728,6 +12764,8 @@ function followupSettingsPageHtml() {
         timingType: "delay_after_opening",
         dayOffset: 0,
         sendHour: 20,
+        sendMinute: 0,
+        sendTime: "20:00",
         delayHours: Math.max(1, index * 2),
         messages: [{ id: blockId(), type: "text", body: "" }]
       };
