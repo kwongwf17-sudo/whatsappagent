@@ -12381,6 +12381,7 @@ function followupSettingsPageHtml() {
     .settings-grid .wide { grid-column:1 / -1; }
     label { display:grid; gap:7px; font-size:13px; font-weight:700; }
     input, textarea, select { width:100%; border:1px solid #d2d2d7; border-radius:8px; padding:9px 10px; font:inherit; background:#fff; }
+    input:disabled, select:disabled, textarea:disabled { opacity:.55; background:#f5f5f7; cursor:not-allowed; }
     input[type="checkbox"] { width:auto; }
     textarea { min-height:110px; resize:vertical; line-height:1.38; }
     .stage-grid { display:grid; gap:14px; padding:0 14px 14px; }
@@ -12388,6 +12389,7 @@ function followupSettingsPageHtml() {
     .stage-head { display:flex; justify-content:space-between; gap:10px; align-items:center; }
     .stage-head strong { font-size:16px; }
     .schedule-fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; align-items:end; }
+    .schedule-fields label.is-disabled { color:#8a8a8e; }
     .block { display:grid; gap:8px; border:1px solid #d2d2d7; border-radius:8px; padding:10px; background:#fff; }
     .block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; color:#6e6e73; font-weight:800; text-transform:uppercase; }
     .block-actions { display:flex; gap:8px; flex-wrap:wrap; }
@@ -12602,6 +12604,10 @@ function followupSettingsPageHtml() {
       '</div>';
     }
     function bindStageButtons() {
+      document.querySelectorAll(".stage-card").forEach(updateStageTimingFields);
+      document.querySelectorAll('[data-stage-field="timingType"]').forEach(select => {
+        select.addEventListener("change", () => updateStageTimingFields(select.closest(".stage-card")));
+      });
       document.querySelectorAll("[data-add-block]").forEach(button => {
         button.addEventListener("click", () => addBlock(button.closest(".stage-card"), button.dataset.addBlock));
       });
@@ -12611,6 +12617,17 @@ function followupSettingsPageHtml() {
       document.querySelectorAll("[data-remove-stage]").forEach(button => {
         button.addEventListener("click", () => button.closest(".stage-card").remove());
       });
+    }
+    function setFieldDisabled(input, disabled) {
+      if (!input) return;
+      input.disabled = disabled;
+      input.closest("label")?.classList.toggle("is-disabled", disabled);
+    }
+    function updateStageTimingFields(card) {
+      if (!card) return;
+      const timingType = card.querySelector('[data-stage-field="timingType"]')?.value || "fixed_time";
+      setFieldDisabled(card.querySelector('[data-stage-field="sendHour"]'), timingType === "delay_after_opening");
+      setFieldDisabled(card.querySelector('[data-stage-field="delayHours"]'), timingType !== "delay_after_opening");
     }
     function addBlock(card, type) {
       if (type === "text") {
