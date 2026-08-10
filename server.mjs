@@ -12671,6 +12671,21 @@ function followupSettingsPageHtml() {
         }),
       };
     }
+    function addFollowupRow() {
+      const index = document.querySelectorAll(".stage-card").length + 1;
+      const row = {
+        key: "custom_followup_" + Date.now(),
+        label: "Follow-up " + index,
+        customSchedule: true,
+        timingType: "delay_after_opening",
+        dayOffset: 0,
+        sendHour: 20,
+        delayHours: Math.max(1, index * 2),
+        messages: [{ id: blockId(), type: "text", body: "" }]
+      };
+      document.querySelector("#followup-stage-grid").insertAdjacentHTML("beforeend", renderStage(row));
+      bindStageButtons();
+    }
     async function save() {
       const state = document.querySelector("#save-state");
       state.textContent = "Saving...";
@@ -13284,22 +13299,6 @@ function productFlowPageHtml() {
         reminders
       };
     }
-    function addFollowupRow() {
-      const index = document.querySelectorAll(".stage-card").length + 1;
-      const row = {
-        key: "custom_followup_" + Date.now(),
-        label: "Follow-up " + index,
-        customSchedule: true,
-        timingType: "delay_after_opening",
-        dayOffset: 0,
-        sendHour: 20,
-        delayHours: Math.max(1, index * 2),
-        messages: [{ id: blockId(), type: "text", body: "" }]
-      };
-      document.querySelector("#followup-stage-grid").insertAdjacentHTML("beforeend", renderStage(row));
-      bindStageButtons();
-    }
-
     function renderOrderForm() {
       const form = selectedProduct.orderForm || {};
       document.querySelector("#orderFormIntro").value = form.intro || "";
