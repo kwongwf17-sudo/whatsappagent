@@ -19,6 +19,7 @@ import {
   isProductNameMessage,
   findSalesReplyExactMatch,
   normalizeCustomerMessage,
+  productIntro,
   salesReplyRecordsForProduct,
   formatStockArrivalMessage,
   getOpeningFlowDecision,
@@ -2551,17 +2552,26 @@ async function processInboundMessageCore({
         handoffReason: "",
       }
     : plan;
+  const openingFlowGate = openingFlowDecision.shouldSend
+    ? await maybeGateOpeningFlow({
+        businessAccountId,
+        customer,
+        plan: effectivePlan,
+        openingFlowDecision,
+      })
+    : { plan: effectivePlan, queued: false };
+  const sendPlan = openingFlowGate.plan;
 
   if (live && await shouldSuppressPlanForFlowsOnly(businessAccountId, {
-    effectivePlan,
+    effectivePlan: sendPlan,
     openingFlowDecision,
-    orderWillBeCreated: Boolean(effectivePlan.order),
+    orderWillBeCreated: Boolean(sendPlan.order),
   })) {
     await store.appendAuditLog({
       actor: "ai_agent",
       action: "flows_only_reply_suppressed",
       customerId: from,
-      result: `${effectivePlan.routingDecision?.category || "unknown"}:${effectivePlan.routingDecision?.rule || "unknown"}`,
+      result: `${sendPlan.routingDecision?.category || "unknown"}:${sendPlan.routingDecision?.rule || "unknown"}`,
       businessAccountId,
       correlationId,
     });
@@ -2576,39 +2586,41 @@ async function processInboundMessageCore({
 
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
-    ...(effectivePlan.customerPatch || {}),
-    ...(effectivePlan.handoffRequired || repeatHandoffRequired
-      ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || effectivePlan.handoffReason || "", effectivePlan.handoffSeverity) }
+    ...(sendPlan.customerPatch || {}),
+    ...(sendPlan.handoffRequired || repeatHandoffRequired
+      ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || sendPlan.handoffReason || "", sendPlan.handoffSeverity) }
       : {}),
     ...anotherDatePatch,
     ...repeatPatch,
   }), businessAccountId);
   let order = null;
-  if (effectivePlan.order) {
-    order = await store.addOrder({ ...effectivePlan.order, businessAccountId, inboundMessageId: id || "", correlationId });
+  if (sendPlan.order) {
+    order = await store.addOrder({ ...sendPlan.order, businessAccountId, inboundMessageId: id || "", correlationId });
   }
 
-  if (effectivePlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(effectivePlan.adminMessage, { businessAccountId, correlationId });
+  if (sendPlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(sendPlan.adminMessage, { businessAccountId, correlationId });
   }
 
-  if ((effectivePlan.handoffRequired || repeatHandoffRequired) && !effectivePlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
-    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || effectivePlan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
+  if ((sendPlan.handoffRequired || repeatHandoffRequired) && !sendPlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+    await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || sendPlan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
   }
 
-  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? effectivePlan.messages));
-  if (!order && openingFlowDecision.shouldSend) {
+  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? sendPlan.messages));
+  if (!order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
     await delayBeforeNewCustomerOpeningFlow(customer, "opening flow");
   }
-  await sendOutbound(from, outbound, { businessAccountId, correlationId });
+  if (outbound.length) {
+    await sendOutbound(from, outbound, { businessAccountId, correlationId });
+  }
 
   return {
     customer: updatedCustomer,
     order,
     messages: outbound,
-    handoffRequired: Boolean(effectivePlan.handoffRequired || repeatHandoffRequired),
-    handoffReason: repeatHandoffReason || effectivePlan.handoffReason || "",
-    handoffSeverity: handoffSeverityForReason(repeatHandoffReason || effectivePlan.handoffReason || "", effectivePlan.handoffSeverity),
+    handoffRequired: Boolean(sendPlan.handoffRequired || repeatHandoffRequired),
+    handoffReason: repeatHandoffReason || sendPlan.handoffReason || "",
+    handoffSeverity: handoffSeverityForReason(repeatHandoffReason || sendPlan.handoffReason || "", sendPlan.handoffSeverity),
   };
 }
 
@@ -3808,8 +3820,108 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
   };
 }
 
+async function maybeGateOpeningFlow({ businessAccountId = config.accountId, customer = {}, plan = {}, openingFlowDecision = {} } = {}) {
+  const settings = await adminAccounts.getTeamSettings(businessAccountId);
+  const windowState = openingFlowWindowState(settings, new Date());
+  if (!windowState.enabled || windowState.isOpen || plan.order) {
+    return { plan, queued: false };
+  }
+  const openingMessages = Array.isArray(openingFlowDecision.messages) ? openingFlowDecision.messages : [];
+  if (!openingMessages.length) return { plan, queued: false };
+  const remainingMessages = Array.isArray(plan.messages) ? plan.messages.slice(openingMessages.length) : [];
+  const customerPatch = removeOpeningFlowSentPatch(plan.customerPatch || {}, openingFlowDecision.productId);
+  return {
+    queued: true,
+    queuedUntil: windowState.nextOpenAt.toISOString(),
+    plan: {
+      ...plan,
+      customerPatch: {
+        ...customerPatch,
+        productId: openingFlowDecision.productId || customer.productId || customerPatch.productId || "",
+        pendingOpeningFlow: {
+          productId: openingFlowDecision.productId || "",
+          queuedAt: new Date().toISOString(),
+          dueAt: windowState.nextOpenAt.toISOString(),
+          reason: "opening_flow_window_closed",
+        },
+      },
+      messages: remainingMessages,
+    },
+  };
+}
+
+function removeOpeningFlowSentPatch(patch = {}, productId = "") {
+  const next = { ...(patch || {}) };
+  delete next.openingFlowSentAt;
+  delete next.openingFlowProductId;
+  if (productId && next.openingFlowsSent && typeof next.openingFlowsSent === "object") {
+    const sent = { ...next.openingFlowsSent };
+    delete sent[productId];
+    next.openingFlowsSent = sent;
+  }
+  return next;
+}
+
+async function runPendingOpeningFlows(now = new Date(), { respectOperationalControl = true } = {}) {
+  const customers = await store.listCustomers(now);
+  const contentByAccount = new Map();
+  const settingsByAccount = new Map();
+  const result = { sent: [], skipped: [] };
+  for (const customer of customers) {
+    const pending = customer.pendingOpeningFlow;
+    if (!pending?.productId) continue;
+    const accountId = customer.businessAccountId || config.accountId;
+    if (respectOperationalControl) {
+      const blocked = await liveAutomationBlock(accountId, "opening_flow");
+      if (blocked) {
+        result.skipped.push({ customerId: customer.id, productId: pending.productId, skipped: blocked.code });
+        continue;
+      }
+    }
+    if (!settingsByAccount.has(accountId)) settingsByAccount.set(accountId, await adminAccounts.getTeamSettings(accountId));
+    const windowState = openingFlowWindowState(settingsByAccount.get(accountId), now);
+    if (windowState.enabled && !windowState.isOpen) continue;
+    const dueAt = validDateOrNull(pending.dueAt);
+    if (dueAt && now < dueAt) continue;
+    if (customer.orderIds?.length || customer.optedOut || customer.handoffStatus === "human_required") {
+      await store.updateCustomer(customer.id, () => ({ pendingOpeningFlow: null }), accountId);
+      result.skipped.push({ customerId: customer.id, productId: pending.productId, skipped: "customer_no_longer_eligible" });
+      continue;
+    }
+    if (!contentByAccount.has(accountId)) contentByAccount.set(accountId, await getTeamContent(accountId));
+    const teamContent = contentByAccount.get(accountId);
+    const product = teamContent.catalog.products.find((item) => item.id === pending.productId);
+    if (!product) {
+      await store.updateCustomer(customer.id, () => ({ pendingOpeningFlow: null }), accountId);
+      result.skipped.push({ customerId: customer.id, productId: pending.productId, skipped: "product_not_found" });
+      continue;
+    }
+    const messages = product.opening_flow?.length
+      ? product.opening_flow
+      : [textMessage(productIntro(product))];
+    await sendOutbound(customer.id, messages, {
+      businessAccountId: accountId,
+      purpose: "opening_flow",
+    });
+    const sentAt = now.toISOString();
+    await store.updateCustomer(customer.id, () => ({
+      pendingOpeningFlow: null,
+      openingFlowsSent: {
+        ...(customer.openingFlowsSent && typeof customer.openingFlowsSent === "object" ? customer.openingFlowsSent : {}),
+        [product.id]: { sentAt },
+      },
+      openingFlowSentAt: sentAt,
+      openingFlowProductId: product.id,
+      productId: product.id,
+    }), accountId);
+    result.sent.push({ customerId: customer.id, businessAccountId: accountId, productId: product.id });
+  }
+  return result;
+}
+
 async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
   const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
+  const pendingOpeningFlows = await runPendingOpeningFlows(now, { respectOperationalControl });
   const pendingOrderAutomations = await runPendingOrderAutomations(now);
   const due = await getDueFollowupsForTeams(now);
   const operationalDue = respectOperationalControl
@@ -3842,6 +3954,7 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
   return {
     sent: dispatched.sent.length,
     queued: queued.length,
+    pendingOpeningFlows,
     queueFailed: dispatched.failed.length,
     queueCancelled: dispatched.cancelled.length,
     queuePaused: dispatched.paused.length,
@@ -4606,6 +4719,9 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
       followupIntervalMinutes: Number(settings.followupIntervalMinutes || 0) || config.followupIntervalMinutes,
       followupActiveWindowMinutes: Number(settings.followupActiveWindowMinutes || 0) || config.followupActiveWindowMinutes,
       followupPauseWindowMinutes: Number(settings.followupPauseWindowMinutes || 0) || config.followupPauseWindowMinutes,
+      openingFlowWindowEnabled: Boolean(settings.openingFlowWindowEnabled),
+      openingFlowWindowStart: validTimeString(settings.openingFlowWindowStart, "08:00"),
+      openingFlowWindowEnd: validTimeString(settings.openingFlowWindowEnd, "22:00"),
     },
   };
 }
@@ -4617,6 +4733,9 @@ async function saveFollowupRuntimeSettings(businessAccountId = config.accountId,
     followupIntervalMinutes: settings.followupIntervalMinutes,
     followupActiveWindowMinutes: settings.followupActiveWindowMinutes,
     followupPauseWindowMinutes: settings.followupPauseWindowMinutes,
+    openingFlowWindowEnabled: settings.openingFlowWindowEnabled,
+    openingFlowWindowStart: settings.openingFlowWindowStart,
+    openingFlowWindowEnd: settings.openingFlowWindowEnd,
   };
   try {
     return await adminAccounts.updateTeamSettings(businessAccountId, runtimeSettings);
@@ -5835,6 +5954,47 @@ function parseFollowupDelayMinutes(delayDuration, delayMinutes, delayHours, fall
 function formatFollowupDuration(totalMinutes = 60) {
   const minutes = Math.max(1, Math.min(720 * 60, Math.trunc(Number(totalMinutes) || 60)));
   return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+function validTimeString(value, fallback = "00:00") {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{2}):(\d{2})$/);
+  if (!match) return fallback;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 ? text : fallback;
+}
+
+function timeStringToMinutes(value, fallback = 0) {
+  const text = validTimeString(value, "");
+  if (!text) return fallback;
+  const [hour, minute] = text.split(":").map((part) => Number(part));
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return fallback;
+  return Math.min(23 * 60 + 59, Math.max(0, hour * 60 + minute));
+}
+
+function openingFlowWindowState(settings = {}, now = new Date()) {
+  const enabled = Boolean(settings.openingFlowWindowEnabled);
+  const start = validTimeString(settings.openingFlowWindowStart, "08:00");
+  const end = validTimeString(settings.openingFlowWindowEnd, "22:00");
+  if (!enabled) return { enabled: false, isOpen: true, nextOpenAt: now, start, end };
+  const startMinutes = timeStringToMinutes(start, 8 * 60);
+  const endMinutes = timeStringToMinutes(end, 22 * 60);
+  const local = followupZonedDateParts(now);
+  const currentMinutes = local.hour * 60 + local.minute;
+  const isOpen = startMinutes === endMinutes
+    ? true
+    : startMinutes < endMinutes
+      ? currentMinutes >= startMinutes && currentMinutes < endMinutes
+      : currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  if (isOpen) return { enabled, isOpen, nextOpenAt: now, start, end };
+  const startHour = Math.floor(startMinutes / 60);
+  const startMinute = startMinutes % 60;
+  const startToday = followupZonedLocalToDate({ ...local, hour: startHour, minute: startMinute, second: 0, millisecond: 0 });
+  const nextOpenAt = currentMinutes < startMinutes
+    ? startToday
+    : followupZonedLocalToDate(addFollowupLocalDays({ ...local, hour: startHour, minute: startMinute, second: 0, millisecond: 0 }, 1));
+  return { enabled, isOpen, nextOpenAt, start, end };
 }
 
 function followupDayOffset(key, followup, index) {
@@ -12502,6 +12662,16 @@ function followupSettingsPageHtml() {
         <label>First Follow-Up Cutoff Hour
           <input id="first-cutoff-hour" type="number" min="0" max="23" />
         </label>
+        <label>
+          <span><input id="opening-flow-window-enabled" type="checkbox" /> Limit opening flow send time</span>
+          <span class="muted">When enabled, new customer opening flows outside this window are queued until the next start time.</span>
+        </label>
+        <label>Opening Flow Start Time
+          <input id="opening-flow-window-start" type="time" />
+        </label>
+        <label>Opening Flow End Time
+          <input id="opening-flow-window-end" type="time" />
+        </label>
       </div>
     </section>
     <section>
@@ -12559,7 +12729,10 @@ function followupSettingsPageHtml() {
       followupSendsPerMinute: ${JSON.stringify(Math.max(config.followupSendsPerMinute, 1))},
       followupIntervalMinutes: ${JSON.stringify(Math.max(config.followupIntervalMinutes, 1))},
       followupActiveWindowMinutes: ${JSON.stringify(Math.max(config.followupActiveWindowMinutes, 1))},
-      followupPauseWindowMinutes: ${JSON.stringify(Math.max(config.followupPauseWindowMinutes, 0))}
+      followupPauseWindowMinutes: ${JSON.stringify(Math.max(config.followupPauseWindowMinutes, 0))},
+      openingFlowWindowEnabled: false,
+      openingFlowWindowStart: "08:00",
+      openingFlowWindowEnd: "22:00"
     };
     const defaultAnotherDatePurchaseFollowup = ${JSON.stringify(defaultAnotherDatePurchaseFollowupSettings())};
     let data = null;
@@ -12610,6 +12783,9 @@ function followupSettingsPageHtml() {
       document.querySelector("#followup-interval-minutes").value = settings.followupIntervalMinutes || "";
       document.querySelector("#followup-active-window-minutes").value = settings.followupActiveWindowMinutes || "";
       document.querySelector("#followup-pause-window-minutes").value = settings.followupPauseWindowMinutes ?? "";
+      document.querySelector("#opening-flow-window-enabled").checked = Boolean(settings.openingFlowWindowEnabled);
+      document.querySelector("#opening-flow-window-start").value = settings.openingFlowWindowStart || "08:00";
+      document.querySelector("#opening-flow-window-end").value = settings.openingFlowWindowEnd || "22:00";
       const stages = Array.isArray(data.followupMessages) && data.followupMessages.length
         ? data.followupMessages
         : defaultFollowupStages;
@@ -12817,7 +12993,10 @@ function followupSettingsPageHtml() {
             followupSendsPerMinute: document.querySelector("#followup-sends-per-minute").value,
             followupIntervalMinutes: document.querySelector("#followup-interval-minutes").value,
             followupActiveWindowMinutes: document.querySelector("#followup-active-window-minutes").value,
-            followupPauseWindowMinutes: document.querySelector("#followup-pause-window-minutes").value
+            followupPauseWindowMinutes: document.querySelector("#followup-pause-window-minutes").value,
+            openingFlowWindowEnabled: document.querySelector("#opening-flow-window-enabled").checked,
+            openingFlowWindowStart: document.querySelector("#opening-flow-window-start").value,
+            openingFlowWindowEnd: document.querySelector("#opening-flow-window-end").value
           },
           followups,
           anotherDatePurchaseFollowup: {
