@@ -4153,6 +4153,14 @@ async function dispatchFollowupQueue(now = new Date()) {
       productId: item.productId,
       message: item.message,
     };
+    if (!(await adminAccounts.isActive(itemAccountId, "business_admin"))) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "cancelled",
+        lastError: "Business account is disabled.",
+      });
+      result.cancelled.push(sentItem);
+      continue;
+    }
     const specialAnotherDateFollowup = item.followupKey === "another_date_purchase_followup";
     if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.handoffStatus === "human_required" || (customer.followupBlocked && !specialAnotherDateFollowup)) {
       await operations.updateFollowupDispatch(item.id, {
@@ -6328,6 +6336,10 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
   if (config.transportMode === "web") {
     if (!webTransportManager) throw new Error("WhatsApp Web transport is not initialized.");
     const accountId = meta.businessAccountId || config.accountId;
+    const account = await adminAccounts.getAccount(accountId);
+    if (account?.active === false) {
+      throw new Error("Business account is disabled.");
+    }
     const messageId = await webTransportManager.send(accountId, to, await messageForWebTransport(message, accountId));
     console.log(`Sent WhatsApp Web ${message.type} to ${to}`);
     return messageId || `web_${Date.now()}`;
@@ -7486,6 +7498,9 @@ function usableSecretEnv(name) {
 async function liveAutomationBlock(businessAccountId = config.accountId, purpose = "conversation") {
   const account = await adminAccounts.getAccount(businessAccountId);
   const mode = normalizeAutoReplyMode(account?.autoReplyMode || (account?.automationPaused ? "paused" : "full_ai"));
+  if (account?.active === false) {
+    return { code: "account_disabled", message: "Business account is disabled." };
+  }
   if (account?.automationPaused || mode === "paused") {
     return { code: "automation_paused", message: "AI automation paused by super admin." };
   }
