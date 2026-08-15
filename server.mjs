@@ -133,6 +133,7 @@ const config = {
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   webLogRawInbound: parseBool(getEnv("WHATSAPP_WEB_LOG_RAW_INBOUND", "false")),
   webRawInboundLogMaxChars: Number(getEnv("WHATSAPP_WEB_RAW_INBOUND_LOG_MAX_CHARS", "12000")),
+  webQrTimeoutMinutes: Number(getEnv("WHATSAPP_WEB_QR_TIMEOUT_MINUTES", "10")),
   outboxRetentionDays: Number(getEnv("OUTBOX_RETENTION_DAYS", "5")),
   processedMessageRetentionDays: Number(getEnv("PROCESSED_MESSAGE_RETENTION_DAYS", "5")),
   auditLogMaxRows: Number(getEnv("AUDIT_LOG_MAX_ROWS", "200")),
@@ -235,6 +236,7 @@ const webTransportManager = config.transportMode === "web"
       processFromMeMessages: config.webProcessFromMeMessages,
       logRawInbound: config.webLogRawInbound,
       rawInboundLogMaxChars: config.webRawInboundLogMaxChars,
+      qrTimeoutMs: Math.max(0, config.webQrTimeoutMinutes) * 60 * 1000,
     })
   : null;
 await adminAccounts.ensureInitialAccount({
@@ -7519,6 +7521,7 @@ function summarizeTransportStatuses(statuses = []) {
     if (status?.started) parts.push("started");
     if (status?.hasSocket) parts.push("socket");
     if (status?.hasReconnectTimer) parts.push("reconnect_timer");
+    if (status?.hasQrTimeoutTimer) parts.push("qr_timeout");
     if (Number.isFinite(status?.sentMessageIds)) parts.push(`sent_ids=${status.sentMessageIds}`);
     accounts.push(parts.join(":"));
   }
