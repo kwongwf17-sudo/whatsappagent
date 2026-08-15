@@ -583,6 +583,9 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       try {
         const account = await adminAccounts.setActive(String(body.id || ""), Boolean(body.active));
+        if (!account.active && webTransportManager) {
+          await webTransportManager.disconnect(account.id, { reconnect: false });
+        }
         await store.appendAuditLog({
           actor: "super_admin",
           action: account.active ? "admin_account_enabled" : "admin_account_disabled",
@@ -973,6 +976,9 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
       }
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      if (!(await adminAccounts.isActive(adminSession.accountId, "business_admin"))) {
+        return sendJson(res, 403, { error: "This account is disabled." });
+      }
       const body = await readJsonBody(req);
       try {
         const code = await webTransportManager.requestPairingCode(adminSession.accountId, body.phoneNumber || "");
@@ -988,7 +994,7 @@ const server = http.createServer(async (req, res) => {
       }
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       try {
-        await webTransportManager.disconnect(adminSession.accountId, { reconnect: true });
+        await webTransportManager.disconnect(adminSession.accountId, { reconnect: false });
         return sendJson(res, 200, { ok: true, status: webTransportManager.getStatus(adminSession.accountId) });
       } catch (error) {
         return sendJson(res, 500, { error: error.message, status: webTransportManager.getStatus(adminSession.accountId) });
@@ -7560,7 +7566,7 @@ function startMemoryDiagnostics() {
 }
 
 async function businessAdminAccounts() {
-  return (await adminAccounts.listAccounts()).filter((account) => (account.role || "business_admin") === "business_admin");
+  return (await adminAccounts.listAccounts()).filter((account) => (account.role || "business_admin") === "business_admin" && account.active !== false);
 }
 
 async function webTransportStatusForAccount(accountId) {
@@ -7571,6 +7577,15 @@ async function webTransportStatusForAccount(accountId) {
       processFromMeMessages: config.webProcessFromMeMessages,
       demoMode: config.demoMode,
       status: config.transportMode === "web" ? "not_initialized" : "disabled",
+      qr: "",
+    };
+  }
+  if (!(await adminAccounts.isActive(accountId, "business_admin"))) {
+    return {
+      ...webTransportManager.getStatus(accountId),
+      demoMode: config.demoMode,
+      transportMode: config.transportMode,
+      status: "disabled",
       qr: "",
     };
   }
