@@ -2139,11 +2139,20 @@ async function processInboundMessageCore({
   const explicitTextMatchedProduct = findProductMatch(teamCatalog, text, {});
   const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, {}, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
+  const earlyProductResolution = resolveProduct(teamCatalog, text, source, customer.productId);
+  const earlyOpeningFlowDecision = getOpeningFlowDecision({
+    customer,
+    productResolution: earlyProductResolution,
+    customerMessage: text,
+    source,
+    isFirstEligibleInbound: firstEligibleInbound,
+  });
   const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
   const shouldPrioritizeOpeningFlow =
     !activeState &&
     !customer.pendingOrder &&
     (
+      earlyOpeningFlowDecision.shouldSend ||
       isProductNameOnlyOpening ||
       (contextMatchedProduct && (firstEligibleInbound || contextStartsNewProductJourney))
     );
@@ -2435,15 +2444,17 @@ async function processInboundMessageCore({
     });
   }
 
-  const productResolution = resolveProduct(teamCatalog, text, source, customer.productId);
+  const productResolution = earlyProductResolution;
   const product = productResolution.product || routedProduct;
-  const openingFlowDecision = getOpeningFlowDecision({
-    customer,
-    productResolution: { ...productResolution, product },
-    customerMessage: text,
-    source,
-    isFirstEligibleInbound: firstEligibleInbound,
-  });
+  const openingFlowDecision = earlyOpeningFlowDecision.product?.id === product?.id
+    ? earlyOpeningFlowDecision
+    : getOpeningFlowDecision({
+        customer,
+        productResolution: { ...productResolution, product },
+        customerMessage: text,
+        source,
+        isFirstEligibleInbound: firstEligibleInbound,
+      });
   const messageSource = openingFlowDecision.shouldSend ? { ...source, productNameMatch: true } : source;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
   const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
