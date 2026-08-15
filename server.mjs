@@ -122,6 +122,7 @@ const config = {
   followupActiveWindowMinutes: Number(getEnv("FOLLOWUP_ACTIVE_WINDOW_MINUTES", "10")),
   followupPauseWindowMinutes: Number(getEnv("FOLLOWUP_PAUSE_WINDOW_MINUTES", "5")),
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
+  memoryDiagnosticsIntervalMinutes: Number(getEnv("MEMORY_DIAGNOSTICS_INTERVAL_MINUTES", "0")),
   businessTimeZone: getEnv("BUSINESS_TIME_ZONE", "Asia/Kuala_Lumpur"),
   openingFlowInitialDelayMs: Number(getEnv("OPENING_FLOW_INITIAL_DELAY_MS", "5000")),
   statusReplyDelayMs: Number(getEnv("STATUS_REPLY_DELAY_MS", "5000")),
@@ -1637,6 +1638,7 @@ if (!config.skipHttpServer) {
     console.log(`Webhook endpoint: ${config.webhookPath}`);
   });
   void recoverPendingCustomerBuffers();
+  startMemoryDiagnostics();
 }
 
 if (!config.skipHttpServer && webTransportManager) {
@@ -7486,6 +7488,75 @@ async function shouldSuppressPlanForFlowsOnly(businessAccountId = config.account
 async function businessAccountIdForPhoneNumber(phoneNumberId) {
   const account = await adminAccounts.findBusinessAccountByPhoneNumberId(phoneNumberId);
   return account?.id || config.accountId;
+}
+
+function formatDiagnosticBytes(value) {
+  if (!Number.isFinite(value)) return "0 B";
+  if (Math.abs(value) < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB"];
+  let size = value / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && Math.abs(size) >= 1024; index += 1) {
+    size /= 1024;
+    unit = units[index];
+  }
+  return `${size.toFixed(size >= 100 ? 0 : 1)} ${unit}`;
+}
+
+function summarizeTransportStatuses(statuses = []) {
+  const counts = {};
+  const accounts = [];
+  for (const status of statuses) {
+    const state = status?.status || "unknown";
+    counts[state] = (counts[state] || 0) + 1;
+    const parts = [status?.accountId || "unknown", state];
+    if (status?.started) parts.push("started");
+    if (status?.hasSocket) parts.push("socket");
+    if (status?.hasReconnectTimer) parts.push("reconnect_timer");
+    if (Number.isFinite(status?.sentMessageIds)) parts.push(`sent_ids=${status.sentMessageIds}`);
+    accounts.push(parts.join(":"));
+  }
+  return {
+    countText: Object.entries(counts).map(([state, count]) => `${state}=${count}`).join(",") || "none",
+    accountText: accounts.slice(0, 20).join(",") || "none",
+  };
+}
+
+async function logMemoryDiagnostics() {
+  const memory = process.memoryUsage();
+  let transportSummary = { countText: "unavailable", accountText: "unavailable" };
+  try {
+    const health = await webTransportHealthData();
+    transportSummary = summarizeTransportStatuses(health?.accounts || []);
+  } catch (error) {
+    transportSummary = { countText: "error", accountText: error?.message || "unknown" };
+  }
+
+  console.log(
+    [
+      "[memory_diag]",
+      `rss=${formatDiagnosticBytes(memory.rss)}`,
+      `heapUsed=${formatDiagnosticBytes(memory.heapUsed)}`,
+      `heapTotal=${formatDiagnosticBytes(memory.heapTotal)}`,
+      `external=${formatDiagnosticBytes(memory.external)}`,
+      `arrayBuffers=${formatDiagnosticBytes(memory.arrayBuffers)}`,
+      `pendingMergeBuffers=${pendingMessageMergeBuffers.size}`,
+      `pendingOrderBuffers=${pendingOrderDetailBuffers.size}`,
+      `transports=${transportSummary.countText}`,
+      `transportAccounts=${transportSummary.accountText}`,
+    ].join(" "),
+  );
+}
+
+function startMemoryDiagnostics() {
+  const intervalMinutes = config.memoryDiagnosticsIntervalMinutes;
+  if (!Number.isFinite(intervalMinutes) || intervalMinutes <= 0) return;
+  const intervalMs = Math.max(1, intervalMinutes) * 60 * 1000;
+  console.log(`[memory_diag] enabled intervalMinutes=${intervalMinutes}`);
+  void logMemoryDiagnostics();
+  setInterval(() => {
+    void logMemoryDiagnostics();
+  }, intervalMs).unref?.();
 }
 
 async function businessAdminAccounts() {
