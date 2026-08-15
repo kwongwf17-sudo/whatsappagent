@@ -963,6 +963,22 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, await webTransportStatusForAccount(adminSession.accountId));
     }
 
+    if (req.method === "POST" && url.pathname === "/admin/whatsapp-web/start") {
+      if (!webTransportManager) {
+        return sendJson(res, 400, { error: "WhatsApp Web transport is not enabled." });
+      }
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      if (!(await adminAccounts.isActive(adminSession.accountId, "business_admin"))) {
+        return sendJson(res, 403, { error: "This account is disabled." });
+      }
+      try {
+        await webTransportManager.startAccount(adminSession.accountId);
+        return sendJson(res, 200, { ok: true, status: webTransportManager.getStatus(adminSession.accountId) });
+      } catch (error) {
+        return sendJson(res, 500, { error: error.message, status: webTransportManager.getStatus(adminSession.accountId) });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/admin/whatsapp-web/qr.svg") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       return sendQrSvg(res, adminSession.accountId);
@@ -7099,6 +7115,8 @@ function whatsappWebStatusHtml() {
     .pairing input { border: 1px solid #cfd4dc; border-radius: 8px; padding: 10px 12px; min-width: 260px; font: inherit; }
     .pairing button { border: 0; border-radius: 8px; padding: 11px 14px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
     .pairing-code { display: none; margin-top: 14px; font-size: 30px; font-weight: 800; letter-spacing: 3px; }
+    .connect-actions { margin: 12px 0 8px; }
+    .connect-actions button { border: 0; border-radius: 8px; padding: 11px 14px; background: var(--accent); color: #fff; font-weight: 800; cursor: pointer; }
     .danger { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
     .danger button { border: 1px solid #fecaca; border-radius: 8px; padding: 11px 14px; background: #fee2e2; color: #991b1b; font-weight: 800; cursor: pointer; }
     main { padding: 22px; }
@@ -7130,6 +7148,10 @@ function whatsappWebStatusHtml() {
       <p id="account" class="muted"></p>
       <p>Status: <span id="status" class="status">Loading...</span></p>
       <p id="details" class="muted"></p>
+      <div class="connect-actions">
+        <button id="start-qr" type="button">Generate QR</button>
+        <span id="start-state" class="muted"></span>
+      </div>
       <img id="qr" alt="WhatsApp Web QR code">
       <p class="muted">If QR is shown: open WhatsApp Business on the main phone, go to Linked devices, then scan this QR.</p>
       <p><a href="/admin/whatsapp-web/qr-only" target="_blank" rel="noopener">Open large QR scan page</a></p>
@@ -7260,10 +7282,23 @@ function whatsappWebStatusHtml() {
         state.textContent = data.error || "Could not disconnect WhatsApp.";
         return;
       }
-      state.textContent = "Disconnected. A fresh QR session is starting; scan the new QR with the new phone.";
+      state.textContent = "Disconnected. Click Generate QR when you are ready to scan again.";
+      loadStatus();
+    }
+    async function startQr() {
+      const state = document.querySelector("#start-state");
+      state.textContent = "Generating QR...";
+      const response = await fetch("/admin/whatsapp-web/start", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        state.textContent = data.error || "Could not generate QR.";
+        return;
+      }
+      state.textContent = "QR session started. Scan within the expiry window.";
       loadStatus();
     }
     document.querySelector("#refresh").addEventListener("click", loadStatus);
+    document.querySelector("#start-qr").addEventListener("click", startQr);
     document.querySelector("#pair").addEventListener("click", requestPairingCode);
     document.querySelector("#disconnect").addEventListener("click", disconnectWhatsApp);
     loadStatus();
@@ -7592,7 +7627,6 @@ async function webTransportStatusForAccount(accountId) {
       qr: "",
     };
   }
-  await webTransportManager.startAccount(accountId);
   return {
     ...webTransportManager.getStatus(accountId),
     demoMode: config.demoMode,
