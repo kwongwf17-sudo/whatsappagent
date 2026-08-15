@@ -2121,7 +2121,8 @@ async function processInboundMessageCore({
       isProductNameOnlyOpening ||
       (contextMatchedProduct && (firstEligibleInbound || contextStartsNewProductJourney))
     );
-  if (!shouldPrioritizeOpeningFlow && !skipOrderDetailBuffer && shouldBufferIncompleteOrderDetails(customer, text, bufferProduct)) {
+  const flowsOnlyMode = live && await isFlowsOnlyAutoReplyMode(businessAccountId);
+  if (!flowsOnlyMode && !shouldPrioritizeOpeningFlow && !skipOrderDetailBuffer && shouldBufferIncompleteOrderDetails(customer, text, bufferProduct)) {
     return bufferIncompleteOrderDetails({
       id,
       from,
@@ -2142,6 +2143,22 @@ async function processInboundMessageCore({
       shouldPrioritizeOpeningFlow ? "opening_flow" : "conversation_planning"
     );
     if (blocked) {
+      if (blocked.code === "flows_only") {
+        await store.appendAuditLog({
+          action: "flows_only_reply_suppressed",
+          customerId: from,
+          result: shouldPrioritizeOpeningFlow ? "opening_flow" : "conversation_planning",
+          businessAccountId,
+          correlationId,
+        });
+        return {
+          customer,
+          order: null,
+          messages: [],
+          handoffRequired: false,
+          handoffReason: blocked.message,
+        };
+      }
       const updatedCustomer = await store.updateCustomer(from, () => ({
         handoffStatus: "human_required",
         handoffReason: blocked.message,
@@ -2560,7 +2577,9 @@ async function processInboundMessageCore({
         openingFlowDecision,
       })
     : { plan: effectivePlan, queued: false };
-  const sendPlan = openingFlowGate.plan;
+  const sendPlan = flowsOnlyMode && openingFlowDecision.shouldSend
+    ? flowsOnlyOpeningPlan(openingFlowGate.plan, openingFlowDecision, openingFlowGate)
+    : openingFlowGate.plan;
 
   if (live && await shouldSuppressPlanForFlowsOnly(businessAccountId, {
     effectivePlan: sendPlan,
@@ -2587,11 +2606,11 @@ async function processInboundMessageCore({
   const updatedCustomer = await store.updateCustomer(from, () => ({
     ...newProductJourneyPatch(customer, product),
     ...(sendPlan.customerPatch || {}),
-    ...(sendPlan.handoffRequired || repeatHandoffRequired
+    ...(!flowsOnlyMode && (sendPlan.handoffRequired || repeatHandoffRequired)
       ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || sendPlan.handoffReason || "", sendPlan.handoffSeverity) }
       : {}),
-    ...anotherDatePatch,
-    ...repeatPatch,
+    ...(flowsOnlyMode ? {} : anotherDatePatch),
+    ...(flowsOnlyMode ? {} : repeatPatch),
   }), businessAccountId);
   let order = null;
   if (sendPlan.order) {
@@ -2602,11 +2621,11 @@ async function processInboundMessageCore({
     await notifyAdmin(sendPlan.adminMessage, { businessAccountId, correlationId });
   }
 
-  if ((sendPlan.handoffRequired || repeatHandoffRequired) && !sendPlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
+  if (!flowsOnlyMode && (sendPlan.handoffRequired || repeatHandoffRequired) && !sendPlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
     await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || sendPlan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
   }
 
-  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? sendPlan.messages));
+  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (flowsOnlyMode ? sendPlan.messages : (repeatMessages ?? sendPlan.messages)));
   if (!order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
     await delayBeforeNewCustomerOpeningFlow(customer, "opening flow");
   }
@@ -3862,6 +3881,34 @@ function removeOpeningFlowSentPatch(patch = {}, productId = "") {
   return next;
 }
 
+function flowsOnlyOpeningPlan(plan = {}, openingFlowDecision = {}, openingFlowGate = {}) {
+  const productId = openingFlowDecision.productId || "";
+  const patch = plan.customerPatch && typeof plan.customerPatch === "object" ? plan.customerPatch : {};
+  const customerPatch = {
+    productId: productId || patch.productId || "",
+  };
+  if (openingFlowGate.queued && patch.pendingOpeningFlow) {
+    customerPatch.pendingOpeningFlow = patch.pendingOpeningFlow;
+  } else {
+    if (patch.openingFlowSentAt) customerPatch.openingFlowSentAt = patch.openingFlowSentAt;
+    if (patch.openingFlowProductId) customerPatch.openingFlowProductId = patch.openingFlowProductId;
+    if (patch.openingFlowsSent && typeof patch.openingFlowsSent === "object") {
+      customerPatch.openingFlowsSent = patch.openingFlowsSent;
+    }
+  }
+  return {
+    ...plan,
+    order: null,
+    adminMessage: "",
+    handoffRequired: false,
+    handoffReason: "",
+    customerPatch,
+    messages: openingFlowGate.queued
+      ? []
+      : (Array.isArray(openingFlowDecision.messages) ? openingFlowDecision.messages : []),
+  };
+}
+
 async function runPendingOpeningFlows(now = new Date(), { respectOperationalControl = true } = {}) {
   const customers = await store.listCustomers(now);
   const contentByAccount = new Map();
@@ -4720,8 +4767,8 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
       followupActiveWindowMinutes: Number(settings.followupActiveWindowMinutes || 0) || config.followupActiveWindowMinutes,
       followupPauseWindowMinutes: Number(settings.followupPauseWindowMinutes || 0) || config.followupPauseWindowMinutes,
       openingFlowWindowEnabled: Boolean(settings.openingFlowWindowEnabled),
-      openingFlowWindowStart: validTimeString(settings.openingFlowWindowStart, "08:00"),
-      openingFlowWindowEnd: validTimeString(settings.openingFlowWindowEnd, "22:00"),
+      openingFlowWindowStart: validTimeString(settings.openingFlowWindowStart, "01:00"),
+      openingFlowWindowEnd: validTimeString(settings.openingFlowWindowEnd, "07:00"),
     },
   };
 }
@@ -5975,25 +6022,27 @@ function timeStringToMinutes(value, fallback = 0) {
 
 function openingFlowWindowState(settings = {}, now = new Date()) {
   const enabled = Boolean(settings.openingFlowWindowEnabled);
-  const start = validTimeString(settings.openingFlowWindowStart, "08:00");
-  const end = validTimeString(settings.openingFlowWindowEnd, "22:00");
+  const start = validTimeString(settings.openingFlowWindowStart, "01:00");
+  const end = validTimeString(settings.openingFlowWindowEnd, "07:00");
   if (!enabled) return { enabled: false, isOpen: true, nextOpenAt: now, start, end };
-  const startMinutes = timeStringToMinutes(start, 8 * 60);
-  const endMinutes = timeStringToMinutes(end, 22 * 60);
+  const startMinutes = timeStringToMinutes(start, 60);
+  const endMinutes = timeStringToMinutes(end, 7 * 60);
   const local = followupZonedDateParts(now);
   const currentMinutes = local.hour * 60 + local.minute;
-  const isOpen = startMinutes === endMinutes
-    ? true
-    : startMinutes < endMinutes
+  const inQuietHours = startMinutes !== endMinutes && (
+    startMinutes < endMinutes
       ? currentMinutes >= startMinutes && currentMinutes < endMinutes
-      : currentMinutes >= startMinutes || currentMinutes < endMinutes;
+      : currentMinutes >= startMinutes || currentMinutes < endMinutes
+  );
+  const isOpen = !inQuietHours;
   if (isOpen) return { enabled, isOpen, nextOpenAt: now, start, end };
-  const startHour = Math.floor(startMinutes / 60);
-  const startMinute = startMinutes % 60;
-  const startToday = followupZonedLocalToDate({ ...local, hour: startHour, minute: startMinute, second: 0, millisecond: 0 });
-  const nextOpenAt = currentMinutes < startMinutes
-    ? startToday
-    : followupZonedLocalToDate(addFollowupLocalDays({ ...local, hour: startHour, minute: startMinute, second: 0, millisecond: 0 }, 1));
+  const endHour = Math.floor(endMinutes / 60);
+  const endMinute = endMinutes % 60;
+  const endTodayLocal = { ...local, hour: endHour, minute: endMinute, second: 0, millisecond: 0 };
+  const endToday = followupZonedLocalToDate(endTodayLocal);
+  const nextOpenAt = startMinutes < endMinutes || currentMinutes < endMinutes
+    ? endToday
+    : followupZonedLocalToDate(addFollowupLocalDays(endTodayLocal, 1));
   return { enabled, isOpen, nextOpenAt, start, end };
 }
 
@@ -7396,7 +7445,7 @@ async function liveAutomationBlock(businessAccountId = config.accountId, purpose
     return { code: "automation_paused", message: "AI automation paused by super admin." };
   }
   if (mode === "flows_only" && !isFlowsOnlyPurpose(purpose)) {
-    return { code: "flows_only", message: "Auto Reply Mode is Flows Only; conversational AI reply suppressed." };
+    return { code: "flows_only", message: "Auto Reply Mode is Flows Only; only opening flow and normal scheduled follow-ups are allowed." };
   }
   if (account?.testMode) {
     return { code: "test_mode", message: "Account is in test mode; live AI reply suppressed." };
@@ -7417,11 +7466,8 @@ async function isFlowsOnlyAutoReplyMode(businessAccountId = config.accountId) {
 
 function isFlowsOnlyPurpose(purpose) {
   return [
-    "conversation_planning",
     "opening_flow",
     "followup",
-    "order_form_followup",
-    "upsell_followup",
   ].includes(String(purpose || ""));
 }
 
@@ -7434,11 +7480,7 @@ async function shouldSuppressPlanForFlowsOnly(businessAccountId = config.account
   const mode = normalizeAutoReplyMode(account?.autoReplyMode || (account?.automationPaused ? "paused" : "full_ai"));
   if (mode !== "flows_only") return false;
   if (openingFlowDecision?.shouldSend) return false;
-  if (orderWillBeCreated) return false;
-  if (effectivePlan?.order) return false;
-  if (effectivePlan?.customerPatch?.pendingOrder) return false;
-  if (effectivePlan?.customerPatch?.pendingUpsell) return false;
-  return effectivePlan?.routingDecision?.category !== "order";
+  return true;
 }
 
 async function businessAccountIdForPhoneNumber(phoneNumberId) {
@@ -12663,13 +12705,13 @@ function followupSettingsPageHtml() {
           <input id="first-cutoff-hour" type="number" min="0" max="23" />
         </label>
         <label>
-          <span><input id="opening-flow-window-enabled" type="checkbox" /> Limit opening flow send time</span>
-          <span class="muted">When enabled, new customer opening flows outside this window are queued until the next start time.</span>
+          <span><input id="opening-flow-window-enabled" type="checkbox" /> Enable opening flow quiet hours</span>
+          <span class="muted">When enabled, new customer opening flows during this quiet window are queued until the quiet window ends.</span>
         </label>
-        <label>Opening Flow Start Time
+        <label>Quiet Start Time
           <input id="opening-flow-window-start" type="time" />
         </label>
-        <label>Opening Flow End Time
+        <label>Quiet End Time
           <input id="opening-flow-window-end" type="time" />
         </label>
       </div>
@@ -12731,8 +12773,8 @@ function followupSettingsPageHtml() {
       followupActiveWindowMinutes: ${JSON.stringify(Math.max(config.followupActiveWindowMinutes, 1))},
       followupPauseWindowMinutes: ${JSON.stringify(Math.max(config.followupPauseWindowMinutes, 0))},
       openingFlowWindowEnabled: false,
-      openingFlowWindowStart: "08:00",
-      openingFlowWindowEnd: "22:00"
+      openingFlowWindowStart: "01:00",
+      openingFlowWindowEnd: "07:00"
     };
     const defaultAnotherDatePurchaseFollowup = ${JSON.stringify(defaultAnotherDatePurchaseFollowupSettings())};
     let data = null;
@@ -12784,8 +12826,8 @@ function followupSettingsPageHtml() {
       document.querySelector("#followup-active-window-minutes").value = settings.followupActiveWindowMinutes || "";
       document.querySelector("#followup-pause-window-minutes").value = settings.followupPauseWindowMinutes ?? "";
       document.querySelector("#opening-flow-window-enabled").checked = Boolean(settings.openingFlowWindowEnabled);
-      document.querySelector("#opening-flow-window-start").value = settings.openingFlowWindowStart || "08:00";
-      document.querySelector("#opening-flow-window-end").value = settings.openingFlowWindowEnd || "22:00";
+      document.querySelector("#opening-flow-window-start").value = settings.openingFlowWindowStart || "01:00";
+      document.querySelector("#opening-flow-window-end").value = settings.openingFlowWindowEnd || "07:00";
       const stages = Array.isArray(data.followupMessages) && data.followupMessages.length
         ? data.followupMessages
         : defaultFollowupStages;
