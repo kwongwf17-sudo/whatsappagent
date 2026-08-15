@@ -133,7 +133,7 @@ const config = {
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   webLogRawInbound: parseBool(getEnv("WHATSAPP_WEB_LOG_RAW_INBOUND", "false")),
   webRawInboundLogMaxChars: Number(getEnv("WHATSAPP_WEB_RAW_INBOUND_LOG_MAX_CHARS", "12000")),
-  webQrTimeoutMinutes: Number(getEnv("WHATSAPP_WEB_QR_TIMEOUT_MINUTES", "10")),
+  webQrTimeoutMinutes: Number(getEnv("WHATSAPP_WEB_QR_TIMEOUT_MINUTES", "1")),
   outboxRetentionDays: Number(getEnv("OUTBOX_RETENTION_DAYS", "5")),
   processedMessageRetentionDays: Number(getEnv("PROCESSED_MESSAGE_RETENTION_DAYS", "5")),
   auditLogMaxRows: Number(getEnv("AUDIT_LOG_MAX_ROWS", "200")),
