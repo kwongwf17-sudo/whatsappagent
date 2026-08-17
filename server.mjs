@@ -3637,7 +3637,10 @@ async function maybeClassifyUpsellDecision({ customerMessage, currentOption, tar
 }
 
 function followupTemplateName(followupKey) {
-  return FOLLOWUP_TEMPLATE_BY_KEY[String(followupKey || "")] || "";
+  const key = String(followupKey || "");
+  if (FOLLOWUP_TEMPLATE_BY_KEY[key]) return FOLLOWUP_TEMPLATE_BY_KEY[key];
+  const scheduledDay = key.match(/^day_(\d+)_scheduled_followup$/)?.[1];
+  return scheduledDay ? FOLLOWUP_TEMPLATE_BY_KEY[`day_${scheduledDay}_followup`] || "" : "";
 }
 
 function templateMessage(name, languageCode = FOLLOWUP_TEMPLATE_LANGUAGE, components = []) {
@@ -3772,19 +3775,20 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
   }
   const sequence = productFollowupSequence(product);
   let item = followupKey
-    ? sequence.find((entry) => entry.key === followupKey)
-    : sequence.find((entry) => !customer.followupsSent?.[entry.key]);
+    ? findFollowupSequenceItem(sequence, followupKey)
+    : sequence.find((entry) => !hasFollowupSent(customer, entry));
   if (!item && allowAlreadySent) item = sequence[0];
   if (!item) {
     return { sent: false, customerId: id, skipped: "all_followups_already_sent" };
   }
-  if (customer.followupsSent?.[item.key] && !allowAlreadySent) {
+  const existingSentAt = followupSentAt(customer, item);
+  if (existingSentAt && !allowAlreadySent) {
     return {
       sent: false,
       customerId: id,
       followupKey: item.key,
       skipped: "followup_already_sent",
-      sentAt: customer.followupsSent[item.key],
+      sentAt: existingSentAt,
     };
   }
   const outsideCustomerServiceWindow =
@@ -3808,7 +3812,7 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
     templateName,
     skipFailureRecord: true,
   });
-  await store.markFollowupSent(id, item.key, now, customer.businessAccountId || businessAccountId);
+  await store.markFollowupSent(id, item.key, now, customer.businessAccountId || businessAccountId, followupSentMetadata(item));
   return {
     sent: true,
     customerId: id,
@@ -4019,7 +4023,7 @@ async function getDueFollowupsForTeams(now = new Date()) {
     if (customer.pendingOrder && !isPendingOrderReminderExhausted(customer)) continue;
     const sequence = productFollowupSequence(product);
     const item = currentFollowupStage(customer, sequence, now);
-    if (!item || customer.followupsSent?.[item.key]) continue;
+    if (!item || hasFollowupSent(customer, item)) continue;
     if (isCurrentFollowupSendWindow(customer, item, sequence, now)) {
       due.push({ customer, product, followup: item.followup, followupKey: item.key });
     }
@@ -4089,8 +4093,9 @@ async function dispatchFollowupQueue(now = new Date()) {
       result.cancelled.push(sentItem);
       continue;
     }
-    if (customer.followupsSent?.[item.followupKey]) {
-      await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: customer.followupsSent[item.followupKey] });
+    const queuedSentAt = followupSentAt(customer, { key: item.followupKey });
+    if (queuedSentAt) {
+      await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: queuedSentAt });
       continue;
     }
     if (!contentByAccount.has(itemAccountId)) {
@@ -4132,7 +4137,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       continue;
     }
     const followupSequence = productFollowupSequence(product);
-    const sequenceItem = followupSequence.find((entry) => entry.key === item.followupKey);
+    const sequenceItem = findFollowupSequenceItem(followupSequence, item.followupKey);
     const currentStage = currentFollowupStage(customer, followupSequence, now);
     if (!sequenceItem || currentStage?.key !== sequenceItem.key || !isCurrentFollowupSendWindow(customer, sequenceItem, followupSequence, now)) {
       await operations.updateFollowupDispatch(item.id, {
@@ -4168,7 +4173,7 @@ async function dispatchFollowupQueue(now = new Date()) {
         templateName,
         skipFailureRecord: true,
       });
-      await store.markFollowupSent(item.customerId, item.followupKey, now, itemAccountId);
+      await store.markFollowupSent(item.customerId, sequenceItem.key, now, itemAccountId, followupSentMetadata(sequenceItem));
       await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
       result.sent.push(sentItem);
     } catch (error) {
@@ -5162,7 +5167,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
 
     if (!nextItem) {
       status = "completed";
-    } else if (sent[nextItem.key]) {
+    } else if (hasFollowupSent(customer, nextItem)) {
       status = "completed";
     }
     const guardrail = followupGuardrailStatus(customer, now);
@@ -5286,11 +5291,11 @@ function buildFollowupPerformance(customers, now, activeCatalog = catalog) {
   const product = activeCatalog.products.find((item) => item.id === activeCatalog.default_product_id) || activeCatalog.products[0];
   return productFollowupSequence(product).map((stage) => {
     const sentCustomers = customers.filter((customer) => {
-      const sentAt = customer.followupsSent?.[stage.key];
+      const sentAt = followupSentAt(customer, stage);
       return sentAt && isSameLocalDate(sentAt, now);
     });
     const replies = sentCustomers.filter((customer) => {
-      const sentAt = new Date(customer.followupsSent?.[stage.key] || 0).getTime();
+      const sentAt = new Date(followupSentAt(customer, stage) || 0).getTime();
       const lastInbound = new Date(customer.lastInboundAt || customer.lastMessageAt || 0).getTime();
       return Number.isFinite(sentAt) && lastInbound > sentAt;
     }).length;
@@ -5594,6 +5599,7 @@ function normalizeFollowupScheduleRow(row = {}, index = 0, firstFollowup = {}) {
   const key = String(row.key || `custom_followup_${index + 1}`).trim() || `custom_followup_${index + 1}`;
   return {
     key,
+    legacyKeys: normalizeFollowupLegacyKeys(row),
     label: String(row.label || `Follow-up ${index + 1}`).trim() || `Follow-up ${index + 1}`,
     enabled: row.enabled !== false,
     followup: {
@@ -5629,6 +5635,7 @@ function teamFollowupMessages(content = defaultTeamContent) {
       const item = normalizeFollowupScheduleRow(row, index, sourceProduct.followup_schedule[0] || {});
       return {
         key: item.key,
+        legacyKeys: item.legacyKeys,
         label: item.label,
         enabled: item.enabled,
         customSchedule: true,
@@ -5742,19 +5749,18 @@ function serializeFollowupScheduleRow(input = {}, index = 0) {
   const timingType = String(input.timingType || input.timing_type || "").trim() === "delay_after_opening"
     ? "delay_after_opening"
     : "fixed_time";
-  const keySource = String(input.key || "").trim() || `custom_followup_${index + 1}`;
-  const key = keySource
-    .toLowerCase()
-    .replace(/[^a-z0-9_]+/g, "_")
-    .replace(/^_+|_+$/g, "") || `custom_followup_${index + 1}`;
+  const dayOffset = clampNumber(input.dayOffset ?? input.day_offset, 0, 365, 0);
+  const key = canonicalFollowupScheduleKey({ ...input, timingType, dayOffset }, index);
+  const legacyKeys = followupLegacyKeys(input, key);
   const sendParts = parseFollowupSendTime(input.sendTime ?? input.send_time, input.sendHour ?? input.send_hour, input.sendMinute ?? input.send_minute, 20, 0);
   const delayMinutes = parseFollowupDelayMinutes(input.delayDuration ?? input.delay_duration, input.delayMinutes ?? input.delay_minutes, input.delayHours ?? input.delay_hours, 60);
   const row = {
     key,
+    ...(legacyKeys.length ? { legacy_keys: legacyKeys } : {}),
     label: String(input.label || `Follow-up ${index + 1}`).trim() || `Follow-up ${index + 1}`,
     enabled: input.enabled !== false,
     timing_type: timingType,
-    day_offset: clampNumber(input.dayOffset ?? input.day_offset, 0, 365, 0),
+    day_offset: dayOffset,
     send_hour: sendParts.hour,
     send_minute: sendParts.minute,
     send_time: formatFollowupSendTime(sendParts.hour, sendParts.minute),
@@ -5769,6 +5775,76 @@ function serializeFollowupScheduleRow(input = {}, index = 0) {
     row.first_chat_cutoff_hour = clampNumber(input.firstChatCutoffHour ?? input.first_chat_cutoff_hour, 0, 23, 19);
   }
   return row;
+}
+
+function normalizeFollowupLegacyKeys(row = {}) {
+  return Array.isArray(row.legacy_keys)
+    ? row.legacy_keys.map((key) => String(key || "").trim()).filter(Boolean)
+    : [];
+}
+
+function followupSentKeys(item = {}) {
+  return [item.key, ...(Array.isArray(item.legacyKeys) ? item.legacyKeys : [])]
+    .map((key) => String(key || "").trim())
+    .filter(Boolean);
+}
+
+function findFollowupSequenceItem(sequence = [], key = "") {
+  const target = String(key || "").trim();
+  return sequence.find((item) => followupSentKeys(item).includes(target)) || null;
+}
+
+function followupSentAt(customer = {}, item = {}) {
+  const sent = customer.followupsSent && typeof customer.followupsSent === "object"
+    ? customer.followupsSent
+    : {};
+  for (const key of followupSentKeys(item)) {
+    const value = sent[key];
+    if (!value) continue;
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object" && value.sentAt) return value.sentAt;
+  }
+  return "";
+}
+
+function hasFollowupSent(customer = {}, item = {}) {
+  return Boolean(followupSentAt(customer, item));
+}
+
+function followupSentMetadata(item = {}) {
+  return {
+    label: item.label || item.followup?.label || "",
+    timingType: item.timingType || "",
+    delayDuration: item.delayDuration || "",
+    delayMinutes: Number(item.delayMinutes || 0) || 0,
+    dayOffset: Number(item.dayOffset || 0) || 0,
+    sendTime: item.sendTime || "",
+    message: item.followup?.message || "",
+    messages: Array.isArray(item.followup?.messages) ? item.followup.messages : [],
+  };
+}
+
+function canonicalFollowupScheduleKey(input = {}, index = 0) {
+  const dayOffset = clampNumber(input.dayOffset ?? input.day_offset, 0, 365, 0);
+  const timingType = String(input.timingType || input.timing_type || "").trim();
+  if (dayOffset === 0 && timingType === "delay_after_opening") {
+    return `first_day_followup_${index + 1}`;
+  }
+  if (dayOffset > 0) {
+    return `day_${dayOffset}_scheduled_followup`;
+  }
+  return `same_day_followup_${index + 1}`;
+}
+
+function followupLegacyKeys(input = {}, key = "") {
+  const keys = [
+    String(input.key || "").trim(),
+    ...(Array.isArray(input.legacyKeys) ? input.legacyKeys : []),
+    ...(Array.isArray(input.legacy_keys) ? input.legacy_keys : []),
+  ]
+    .map((value) => String(value || "").trim())
+    .filter((value) => value && value !== key);
+  return [...new Set(keys)];
 }
 
 function normalizeFollowupMessageBlocks(blocks, fallbackMessage = "") {
@@ -6044,7 +6120,7 @@ function previousFollowupSentAt(customer, item, sequence = []) {
   const itemIndex = sequence.findIndex((entry) => entry.key === item.key);
   if (itemIndex <= 0) return null;
   for (let index = itemIndex - 1; index >= 0; index -= 1) {
-    const sentAt = customer.followupsSent?.[sequence[index].key];
+    const sentAt = followupSentAt(customer, sequence[index]);
     if (!sentAt) continue;
     const date = new Date(sentAt);
     if (!Number.isNaN(date.getTime())) return date;
@@ -6088,7 +6164,7 @@ function customerAgeDays(customer, now = new Date()) {
 
 function currentFollowupStage(customer, sequence = [], now = new Date()) {
   return sequence.find((item) => {
-    if (customer.followupsSent?.[item.key]) return false;
+    if (hasFollowupSent(customer, item)) return false;
     const dueAt = effectiveFollowupDueAt(customer, item, sequence);
     if (!dueAt) return false;
     const nowLocal = followupZonedDateParts(now);
@@ -12803,7 +12879,7 @@ function followupSettingsPageHtml() {
     function renderStage(stage) {
       const blocks = (stage.messages || (stage.message ? [{ type: "text", body: stage.message }] : [])).map(normalizeBlock).filter(Boolean);
       if (!blocks.length) blocks.push({ id: blockId(), type: "text", body: "" });
-      return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '">' +
+      return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '" data-legacy-keys="' + esc((stage.legacyKeys || []).join(",")) + '">' +
         '<div class="stage-head"><strong>' + esc(stage.label || "Follow-Up") + '</strong><div class="stage-tools">' +
           '<button type="button" data-move-stage="up">Move Up</button>' +
           '<button type="button" data-move-stage="down">Move Down</button>' +
@@ -12811,6 +12887,7 @@ function followupSettingsPageHtml() {
         '</div></div>' +
         '<div class="schedule-fields">' +
           '<label>Label<input data-stage-field="label" value="' + esc(stage.label || "") + '" /></label>' +
+          '<label>Follow-Up ID<input readonly value="' + esc(stage.key || "") + '" /></label>' +
           '<label>Day<input data-stage-field="dayOffset" type="number" min="0" max="365" value="' + esc(stage.dayOffset ?? 0) + '" /></label>' +
           '<label>Timing<select data-stage-field="timingType">' +
             '<option value="fixed_time"' + ((stage.timingType || "fixed_time") === "fixed_time" ? " selected" : "") + '>Fixed time</option>' +
@@ -12935,6 +13012,7 @@ function followupSettingsPageHtml() {
       const fallbackKey = label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "custom_followup";
       return {
         key: card.dataset.stageKey || fallbackKey,
+        legacyKeys: (card.dataset.legacyKeys || "").split(",").map(key => key.trim()).filter(Boolean),
         label,
         customSchedule: true,
         timingType: card.querySelector('[data-stage-field="timingType"]').value,
