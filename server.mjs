@@ -48,6 +48,9 @@ import { OperationsStore } from "./lib/operations.mjs";
 import { TeamContentStore } from "./lib/team_content.mjs";
 import { WebWhatsAppManager } from "./lib/web_whatsapp_manager.mjs";
 import {
+  hasOpeningFlowAlreadySent,
+} from "./lib/opening_flow_handler.mjs";
+import {
   customerOrderStatusReply,
   deliveryRescheduleReply,
   isDeliveryRescheduleRequest,
@@ -2584,15 +2587,22 @@ async function processInboundMessageCore({
     };
   }
 
-  const updatedCustomer = await store.updateCustomer(from, () => ({
-    ...newProductJourneyPatch(customer, product),
-    ...(sendPlan.customerPatch || {}),
-    ...(sendPlan.handoffRequired || repeatHandoffRequired
-      ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || sendPlan.handoffReason || "", sendPlan.handoffSeverity) }
-      : {}),
-    ...anotherDatePatch,
-    ...repeatPatch,
-  }), businessAccountId);
+  let openingFlowAlreadyReserved = false;
+  const updatedCustomer = await store.updateCustomer(from, (currentCustomer) => {
+    openingFlowAlreadyReserved = openingFlowDecision.shouldSend && hasOpeningFlowReserved(currentCustomer, openingFlowDecision.product);
+    if (openingFlowAlreadyReserved) {
+      return {};
+    }
+    return {
+      ...newProductJourneyPatch(customer, product),
+      ...(sendPlan.customerPatch || {}),
+      ...(sendPlan.handoffRequired || repeatHandoffRequired
+        ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || sendPlan.handoffReason || "", sendPlan.handoffSeverity) }
+        : {}),
+      ...anotherDatePatch,
+      ...repeatPatch,
+    };
+  }, businessAccountId);
   let order = null;
   if (sendPlan.order) {
     order = await store.addOrder({ ...sendPlan.order, businessAccountId, inboundMessageId: id || "", correlationId });
@@ -2606,8 +2616,10 @@ async function processInboundMessageCore({
     await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || sendPlan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
   }
 
-  const outbound = clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? sendPlan.messages));
-  if (!order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
+  const outbound = openingFlowAlreadyReserved
+    ? []
+    : clampMessages(order ? orderSubmittedCustomerMessages(product) : (repeatMessages ?? sendPlan.messages));
+  if (!openingFlowAlreadyReserved && !order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
     await delayBeforeNewCustomerOpeningFlow(customer, "opening flow");
   }
   if (outbound.length) {
@@ -3866,6 +3878,11 @@ function removeOpeningFlowSentPatch(patch = {}, productId = "") {
   return next;
 }
 
+function hasOpeningFlowReserved(customer = {}, product = null) {
+  if (hasOpeningFlowAlreadySent(customer, product)) return true;
+  if (!product?.id) return false;
+  return String(customer.pendingOpeningFlow?.productId || "") === String(product.id);
+}
 async function runPendingOpeningFlows(now = new Date(), { respectOperationalControl = true } = {}) {
   const customers = await store.listCustomers(now);
   const contentByAccount = new Map();
@@ -4649,11 +4666,14 @@ async function appendSimDueFollowups({
   const baseCustomer = {
     firstSeenAt: firstSeenAt.toISOString(),
     lastInboundAt: firstSeenAt.toISOString(),
+    openingFlowSentAt: firstSeenAt.toISOString(),
+    followupsSent,
   };
+  const sequence = productFollowupSequence(product);
 
-  for (const item of productFollowupSequence(product)) {
+  for (const item of sequence) {
     if (sent >= maxMessages) break;
-    const dueAt = followupDueAt(firstSeenAt, item);
+    const dueAt = effectiveFollowupDueAt(baseCustomer, item, sequence);
     if (dueAt > now) continue;
     if (!simulateTemplateWindow && !isWithinCustomerServiceWindow(baseCustomer, dueAt)) continue;
     await appendSimOutbound(customerId, dueAt, item.followup?.message || "");
@@ -6142,12 +6162,20 @@ function followupDueAfterPreviousSent(previousSentAt, item) {
 }
 
 function effectiveFollowupDueAt(customer, item, sequence = []) {
-  const scheduledDueAt = followupDueAt(customer.firstSeenAt, item);
+  const scheduledDueAt = followupDueAt(followupAnchorAt(customer, item), item);
   const previousSentAt = previousFollowupSentAt(customer, item, sequence);
   if (!previousSentAt) return scheduledDueAt;
   if (item.customSchedule && scheduledDueAt > previousSentAt) return scheduledDueAt;
   const previousGateAt = followupDueAfterPreviousSent(previousSentAt, item);
   return scheduledDueAt > previousGateAt ? scheduledDueAt : previousGateAt;
+}
+
+function followupAnchorAt(customer = {}, item = {}) {
+  if (item.customSchedule && item.timingType === "delay_after_opening") {
+    const openingSentAt = validDateOrNull(customer.openingFlowSentAt);
+    if (openingSentAt) return openingSentAt.toISOString();
+  }
+  return customer.firstSeenAt;
 }
 
 function localCalendarDayDiff(start, end) {
