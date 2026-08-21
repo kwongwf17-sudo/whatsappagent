@@ -6121,12 +6121,14 @@ function followupDayOffset(key, followup, index) {
 }
 
 function followupDueAt(firstSeenAt, item) {
+  const anchorAt = new Date(firstSeenAt);
   if (item.customSchedule && item.timingType === "delay_after_opening") {
-    return new Date(new Date(firstSeenAt).getTime() + Math.max(1, Number(item.delayMinutes || Math.max(1, Number(item.delayHours || 1)) * 60)) * 60 * 1000);
+    return new Date(anchorAt.getTime() + Math.max(1, Number(item.delayMinutes || Math.max(1, Number(item.delayHours || 1)) * 60)) * 60 * 1000);
   }
   if (item.customSchedule) {
-    const firstSeenLocal = followupZonedDateParts(new Date(firstSeenAt));
+    const firstSeenLocal = followupZonedDateParts(anchorAt);
     let dueLocal = addFollowupLocalDays({ ...firstSeenLocal, hour: item.sendHour, minute: item.sendMinute || 0, second: 0, millisecond: 0 }, item.dayOffset);
+    let due = followupZonedLocalToDate(dueLocal);
     if (
       item.index === 0 &&
       item.dayOffset === 0 &&
@@ -6135,8 +6137,11 @@ function followupDueAt(firstSeenAt, item) {
       firstSeenLocal.hour >= Number(item.firstChatCutoffHour)
     ) {
       dueLocal = addFollowupLocalDays(dueLocal, 1);
+      due = followupZonedLocalToDate(dueLocal);
+    } else if (item.dayOffset === 0 && due <= anchorAt) {
+      due = followupZonedLocalToDate(addFollowupLocalDays(dueLocal, 1));
     }
-    return followupZonedLocalToDate(dueLocal);
+    return due;
   }
   const firstDueAt = firstFollowupDueAt(firstSeenAt, {
     cutoffEnabled: item.firstFollowup?.first_chat_cutoff_enabled !== false,
@@ -6190,7 +6195,7 @@ function effectiveFollowupDueAt(customer, item, sequence = []) {
 }
 
 function followupAnchorAt(customer = {}, item = {}) {
-  if (item.customSchedule && item.timingType === "delay_after_opening") {
+  if (item.customSchedule) {
     const openingSentAt = validDateOrNull(customer.openingFlowSentAt);
     if (openingSentAt) return openingSentAt.toISOString();
   }
