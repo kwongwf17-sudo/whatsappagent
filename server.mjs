@@ -2678,12 +2678,32 @@ async function processInboundMessageCore({
   if (!openingFlowAlreadyReserved && !order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
     await delayBeforeNewCustomerOpeningFlow(customer, "opening flow");
   }
+  let finalCustomer = updatedCustomer;
   if (outbound.length) {
     await sendOutbound(from, outbound, { businessAccountId, correlationId });
   }
+  if (!openingFlowAlreadyReserved && !order && openingFlowDecision.shouldSend && !openingFlowGate.queued && outbound.length) {
+    const openingFlowSentAt = new Date().toISOString();
+    const customerAfterOpeningFlow = await store.updateCustomer(from, (currentCustomer) => ({
+      openingFlowsSent: {
+        ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
+        [product.id]: { sentAt: openingFlowSentAt },
+      },
+      openingFlowSentAt,
+      openingFlowProductId: product.id,
+      productId: product.id,
+    }), businessAccountId);
+    finalCustomer = customerAfterOpeningFlow;
+    await enqueueOpeningFlowFollowups({
+      customer: customerAfterOpeningFlow,
+      product,
+      businessAccountId,
+      openingFlowSentAt,
+    });
+  }
 
   return {
-    customer: updatedCustomer,
+    customer: finalCustomer,
     order,
     messages: outbound,
     handoffRequired: Boolean(sendPlan.handoffRequired || repeatHandoffRequired),
@@ -4016,9 +4036,52 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       openingFlowProductId: product.id,
       productId: product.id,
     }), accountId);
+    await enqueueOpeningFlowFollowups({
+      customer: { ...customer, openingFlowSentAt: sentAt, openingFlowProductId: product.id, productId: product.id },
+      product,
+      businessAccountId: accountId,
+      openingFlowSentAt: sentAt,
+      queuedAt: now,
+    });
     result.sent.push({ customerId: customer.id, businessAccountId: accountId, productId: product.id });
   }
   return result;
+}
+
+async function enqueueOpeningFlowFollowups({
+  customer,
+  product,
+  businessAccountId = config.accountId,
+  openingFlowSentAt = new Date().toISOString(),
+  queuedAt = new Date(),
+} = {}) {
+  if (!customer?.id || !product?.id) return [];
+  if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked || customer.handoffStatus === "human_required") {
+    return [];
+  }
+  const sequence = productFollowupSequence(product);
+  const scheduleCustomer = {
+    ...customer,
+    businessAccountId,
+    productId: product.id,
+    openingFlowSentAt,
+  };
+  const rows = sequence
+    .filter((item) => !scheduleCustomer.followupsSent?.[item.key])
+    .map((item) => {
+      const dueAt = effectiveFollowupDueAt(scheduleCustomer, item, sequence);
+      if (!dueAt || Number.isNaN(dueAt.getTime())) return null;
+      return {
+        businessAccountId,
+        customerId: scheduleCustomer.id,
+        productId: product.id,
+        labelDisplay: scheduleCustomer.labelDisplay,
+        followupKey: item.key,
+        dueAt: dueAt.toISOString(),
+      };
+    })
+    .filter(Boolean);
+  return operations.enqueueFollowups(rows, queuedAt);
 }
 
 async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
@@ -4175,9 +4238,15 @@ async function dispatchFollowupQueue(now = new Date()) {
       continue;
     }
     const customer = customerById.get(customerKey(itemAccountId, item.customerId));
+    const customerInAnotherAccount = customer
+      ? null
+      : customers.find((entry) =>
+          entry.id === item.customerId &&
+          (entry.businessAccountId || config.accountId) !== itemAccountId
+        );
     const sentItem = {
       customerId: item.customerId,
-      labelDisplay: customer?.labelDisplay || item.labelDisplay,
+      labelDisplay: customer?.labelDisplay || customerInAnotherAccount?.labelDisplay || item.labelDisplay,
       followupKey: item.followupKey,
       productId: item.productId,
       message: item.message,
@@ -4191,12 +4260,32 @@ async function dispatchFollowupQueue(now = new Date()) {
       continue;
     }
     const specialAnotherDateFollowup = item.followupKey === "another_date_purchase_followup";
+    if (!customer && customerInAnotherAccount) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "cancelled",
+        lastError: "Follow-up business account does not match customer business account.",
+      });
+      result.cancelled.push({
+        ...sentItem,
+        skipped: "business_account_mismatch",
+        customerBusinessAccountId: customerInAnotherAccount.businessAccountId || config.accountId,
+      });
+      continue;
+    }
     if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.handoffStatus === "human_required" || (customer.followupBlocked && !specialAnotherDateFollowup)) {
       await operations.updateFollowupDispatch(item.id, {
         status: "cancelled",
         lastError: !customer ? "Customer no longer exists." : "Customer no longer eligible for follow-up.",
       });
       result.cancelled.push(sentItem);
+      continue;
+    }
+    if (item.productId && customer.productId && item.productId !== customer.productId) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "cancelled",
+        lastError: "Follow-up product does not match customer product.",
+      });
+      result.cancelled.push({ ...sentItem, skipped: "product_mismatch", customerProductId: customer.productId });
       continue;
     }
     if (customer.followupsSent?.[item.followupKey]) {
@@ -4208,6 +4297,14 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     const teamContent = contentByAccount.get(itemAccountId);
     const product = teamContent.catalog.products.find((entry) => entry.id === customer.productId);
+    if (!product) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "cancelled",
+        lastError: "Customer product is not available for this business account.",
+      });
+      result.cancelled.push({ ...sentItem, skipped: "product_not_found", productId: customer.productId || item.productId });
+      continue;
+    }
     if (specialAnotherDateFollowup) {
       const specialItem = anotherDatePurchaseFollowupItem(customer, product, teamContent, now);
       if (!specialItem || customer.followupsSent?.[item.followupKey]) {
@@ -4220,7 +4317,8 @@ async function dispatchFollowupQueue(now = new Date()) {
       }
       try {
         await wait(randomFollowupDelayMs());
-        const outboundMessages = followupOutboundMessages({ message: item.message, messages: item.messages });
+        sentItem.message = specialItem.followup?.message || item.message;
+        const outboundMessages = followupOutboundMessages(specialItem.followup || { message: item.message, messages: item.messages });
         await sendOutbound(item.customerId, Array.isArray(outboundMessages) ? outboundMessages : [outboundMessages], {
           businessAccountId: itemAccountId,
           purpose: "another_date_purchase_followup",
@@ -4243,13 +4341,40 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     const followupSequence = productFollowupSequence(product);
     const sequenceItem = followupSequence.find((entry) => entry.key === item.followupKey);
-    const currentStage = currentFollowupStage(customer, followupSequence, now);
-    if (!sequenceItem || currentStage?.key !== sequenceItem.key || !isCurrentFollowupSendWindow(customer, sequenceItem, followupSequence, now)) {
+    if (!sequenceItem) {
       await operations.updateFollowupDispatch(item.id, {
         status: "cancelled",
-        lastError: "Follow-up send window missed or customer moved to another stage.",
+        lastError: "Follow-up row is no longer available for this product.",
       });
       result.cancelled.push(sentItem);
+      continue;
+    }
+    const queueDueAt = validDateOrNull(item.dueAt || item.availableAt);
+    if (queueDueAt && now < queueDueAt) {
+      await operations.updateFollowupDispatch(item.id, {
+        status: "queued",
+        availableAt: queueDueAt.toISOString(),
+        lastError: "",
+      });
+      continue;
+    }
+    const sequenceIndex = followupSequence.findIndex((entry) => entry.key === item.followupKey);
+    const previousUnsent = followupSequence
+      .slice(0, Math.max(sequenceIndex, 0))
+      .find((entry) => !customer.followupsSent?.[entry.key]);
+    if (previousUnsent) {
+      const retryAt = new Date(now.getTime() + Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
+      await operations.updateFollowupDispatch(item.id, {
+        status: "queued",
+        availableAt: retryAt.toISOString(),
+        lastError: `Waiting for earlier follow-up ${previousUnsent.key}.`,
+      });
+      result.paused.push({
+        customerId: item.customerId,
+        followupKey: item.followupKey,
+        productId: product.id,
+        pausedUntil: retryAt.toISOString(),
+      });
       continue;
     }
     const outsideCustomerServiceWindow = config.transportMode === "cloud" && !config.demoMode && !isWithinCustomerServiceWindow(customer, now);
@@ -4268,9 +4393,11 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     try {
       await wait(randomFollowupDelayMs());
+      sentItem.message = sequenceItem.followup?.message || "";
+      sentItem.productId = product.id;
       const outboundMessages = templateName
         ? templateMessage(templateName, FOLLOWUP_TEMPLATE_LANGUAGE)
-        : followupOutboundMessages({ message: item.message, messages: item.messages });
+        : followupOutboundMessages(sequenceItem.followup);
       await sendOutbound(item.customerId, Array.isArray(outboundMessages) ? outboundMessages : [outboundMessages], {
         businessAccountId: itemAccountId,
         purpose: "followup",
