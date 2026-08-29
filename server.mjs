@@ -1326,7 +1326,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       const name = String(body.name || "").trim();
       if (!name) return sendJson(res, 400, { error: "Product name is required." });
       const content = await getTeamContent(adminSession.accountId);
-      const product = createCatalogProduct(name);
+      const product = createCatalogProduct(name, content.catalog);
       content.catalog.products.push(product);
       await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 201, { product: productFlowEditorData(product) });
@@ -5976,6 +5976,21 @@ function updateTeamFollowupMessages(content = defaultTeamContent, stages = []) {
   return { updatedProducts, stages: teamFollowupMessages(content) };
 }
 
+function inheritTeamFollowupSchedule(content = defaultTeamContent) {
+  const products = content?.catalog?.products || [];
+  const sourceProduct = products.find((product) =>
+    Array.isArray(product?.followup_schedule) && product.followup_schedule.length
+  );
+  if (!sourceProduct) return 0;
+  let updatedProducts = 0;
+  for (const product of products) {
+    if (Array.isArray(product.followup_schedule) && product.followup_schedule.length) continue;
+    product.followup_schedule = structuredClone(sourceProduct.followup_schedule);
+    updatedProducts += 1;
+  }
+  return updatedProducts;
+}
+
 function serializeFollowupScheduleRow(input = {}, index = 0) {
   const messages = normalizeFollowupMessageBlocks(input.messages, input.message);
   if (!messages.length) return null;
@@ -7945,7 +7960,12 @@ async function buildSystemBackup() {
 }
 
 async function getTeamContent(accountId) {
-  return teamContentStore.getContent(accountId || config.accountId, defaultTeamContent);
+  const resolvedAccountId = accountId || config.accountId;
+  const content = await teamContentStore.getContent(resolvedAccountId, defaultTeamContent);
+  if (inheritTeamFollowupSchedule(content)) {
+    await teamContentStore.saveContent(resolvedAccountId, content);
+  }
+  return content;
 }
 
 async function saveTeamContent(accountId, content) {
@@ -9053,16 +9073,24 @@ function safeAssetSegment(value) {
   return String(value || "product").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "product";
 }
 
-function createCatalogProduct(name) {
+function createCatalogProduct(name, activeCatalog = catalog) {
   const baseId = safeAssetSegment(name);
   let id = baseId;
   let suffix = 2;
-  while (findCatalogProduct(id)) {
+  while (findCatalogProduct(id, activeCatalog)) {
     id = `${baseId}-${suffix}`;
     suffix += 1;
   }
-  const followupTemplate = catalog.products.find((product) => product.id === catalog.default_product_id)?.followups || {};
-  const closingTemplate = catalog.products.find((product) => product.id === catalog.default_product_id)?.order_closing_messages || DEFAULT_ORDER_CLOSING_MESSAGES;
+  const sourceProducts = Array.isArray(activeCatalog?.products) ? activeCatalog.products : [];
+  const defaultProduct = sourceProducts.find((product) => product.id === activeCatalog?.default_product_id) || sourceProducts[0] || {};
+  const followupSource = sourceProducts.find((product) =>
+    Array.isArray(product?.followup_schedule) && product.followup_schedule.length
+  ) || defaultProduct;
+  const followupScheduleTemplate = Array.isArray(followupSource?.followup_schedule)
+    ? followupSource.followup_schedule
+    : [];
+  const followupTemplate = followupSource?.followups || defaultProduct.followups || {};
+  const closingTemplate = defaultProduct.order_closing_messages || DEFAULT_ORDER_CLOSING_MESSAGES;
   const emptyFlow = {
     greeting: "",
     description: "",
@@ -9093,6 +9121,9 @@ function createCatalogProduct(name) {
     sales_replies: [],
     standard_replies: [],
     followups: structuredClone(followupTemplate),
+    ...(followupScheduleTemplate.length
+      ? { followup_schedule: structuredClone(followupScheduleTemplate) }
+      : {}),
     order_closing_messages: structuredClone(closingTemplate),
   };
   return product;
