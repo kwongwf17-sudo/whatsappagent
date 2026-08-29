@@ -8,12 +8,15 @@ console.log(`Follow-up worker started. Interval: ${Math.round(intervalMs / 1000)
 
 async function runOnce() {
   try {
-    const result = await requestFollowupRun();
+    const result = await requestFollowupRun(new Date(), {
+      dispatchQueued: process.env.FOLLOWUP_WORKER_DISPATCH === "true",
+    });
     console.log(
       JSON.stringify({
         checkedAt: result.checkedAt,
         sent: result.sent,
         queued: result.queued,
+        dispatchQueued: result.dispatchQueued,
         queueFailed: result.queueFailed,
         queueCancelled: result.queueCancelled,
         heldForApprovedTemplate: result.heldForApprovedTemplate + result.queueHeldForApprovedTemplate,

@@ -4084,7 +4084,7 @@ async function enqueueOpeningFlowFollowups({
   return operations.enqueueFollowups(rows, queuedAt);
 }
 
-async function runDueFollowups(now = new Date(), { respectOperationalControl = true } = {}) {
+async function runDueFollowups(now = new Date(), { respectOperationalControl = true, dispatchQueued = true } = {}) {
   const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
   const pendingOpeningFlows = await runPendingOpeningFlows(now, { respectOperationalControl });
   const pendingOrderAutomations = await runPendingOrderAutomations(now);
@@ -4115,8 +4115,11 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
     })),
     now
   );
-  const dispatched = await dispatchFollowupQueue(now);
+  const dispatched = dispatchQueued
+    ? await dispatchFollowupQueue(now)
+    : { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], paused: [] };
   return {
+    dispatchQueued,
     sent: dispatched.sent.length,
     queued: queued.length,
     pendingOpeningFlows,
