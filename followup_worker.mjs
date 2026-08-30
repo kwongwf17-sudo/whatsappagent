@@ -10,7 +10,7 @@ async function runOnce() {
   try {
     const result = await requestFollowupRun(new Date(), {
       dispatchQueued: process.env.FOLLOWUP_WORKER_DISPATCH === "true",
-      queueOnly: true,
+      queueOnly: process.env.FOLLOWUP_WORKER_DISPATCH !== "true",
     });
     console.log(
       JSON.stringify({
