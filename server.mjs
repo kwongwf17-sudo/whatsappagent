@@ -46,7 +46,6 @@ import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
 import { AdminAccountStore } from "./lib/admin_accounts.mjs";
 import { OperationsStore } from "./lib/operations.mjs";
 import { TeamContentStore } from "./lib/team_content.mjs";
-import { WebWhatsAppManager } from "./lib/web_whatsapp_manager.mjs";
 import {
   hasOpeningFlowAlreadySent,
 } from "./lib/opening_flow_handler.mjs";
@@ -232,16 +231,18 @@ const operations = new OperationsStore(config.dataDir, {
   completedFollowupRetentionDays: config.followupQueueCompletedRetentionDays,
 });
 const teamContentStore = new TeamContentStore(config.dataDir, { adapter: storageAdapter });
-const webTransportManager = config.transportMode === "web"
-  ? new WebWhatsAppManager({
+let webTransportManager = null;
+if (config.transportMode === "web" && !config.skipHttpServer) {
+  const { WebWhatsAppManager } = await import("./lib/web_whatsapp_manager.mjs");
+  webTransportManager = new WebWhatsAppManager({
       sessionRootDir: config.webSessionDir,
       logger: console,
       processFromMeMessages: config.webProcessFromMeMessages,
       logRawInbound: config.webLogRawInbound,
       rawInboundLogMaxChars: config.webRawInboundLogMaxChars,
       qrTimeoutMs: Math.max(0, config.webQrTimeoutMinutes) * 60 * 1000,
-    })
-  : null;
+    });
+}
 await adminAccounts.ensureInitialAccount({
   id: config.accountId,
   name: config.businessName,
@@ -1395,9 +1396,13 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       await writeFile(path.join(targetDirectory, filename), image.bytes);
       const assetUrl = `/assets/${accountAssetId}/${productAssetId}/${filename}`;
       const durableUrl = persistedProductImageUrl(adminSession.accountId, product.id, slot.key, image.extension);
-      persistProductFlowImage(product, slot, {
-        dataUrl: body.dataUrl,
+      const mediaKey = await savePersistedProductImageAsset(adminSession.accountId, product.id, slot.key, {
         image,
+        originalName,
+      });
+      persistProductFlowImage(product, slot, {
+        image,
+        mediaKey,
         originalName,
         assetUrl,
         durableUrl,
@@ -3728,6 +3733,15 @@ function followupTemplateName(followupKey) {
   return FOLLOWUP_TEMPLATE_BY_KEY[String(followupKey || "")] || "";
 }
 
+function followupRequiresApprovedTemplate(customer, followupKey = "", now = new Date()) {
+  return (
+    config.transportMode === "cloud" &&
+    !config.demoMode &&
+    !isWithinCustomerServiceWindow(customer, now) &&
+    !followupTemplateName(followupKey)
+  );
+}
+
 function templateMessage(name, languageCode = FOLLOWUP_TEMPLATE_LANGUAGE, components = []) {
   return {
     type: "template",
@@ -4084,24 +4098,26 @@ async function enqueueOpeningFlowFollowups({
   return operations.enqueueFollowups(rows, queuedAt);
 }
 
-async function runDueFollowups(now = new Date(), { respectOperationalControl = true, dispatchQueued = true } = {}) {
-  const deletedCustomers = await store.deleteStaleUnresponsiveCustomers(now);
-  const pendingOpeningFlows = await runPendingOpeningFlows(now, { respectOperationalControl });
-  const pendingOrderAutomations = await runPendingOrderAutomations(now);
+async function runDueFollowups(
+  now = new Date(),
+  { respectOperationalControl = true, dispatchQueued = true, queueOnly = false } = {}
+) {
+  const deletedCustomers = queueOnly ? [] : await store.deleteStaleUnresponsiveCustomers(now);
+  const pendingOpeningFlows = queueOnly ? 0 : await runPendingOpeningFlows(now, { respectOperationalControl });
+  const pendingOrderAutomations = queueOnly ? 0 : await runPendingOrderAutomations(now);
   const due = await getDueFollowupsForTeams(now);
   const operationalDue = respectOperationalControl
     ? await filterOperationalFollowups(due)
     : due;
   const sendable = due.filter((item) =>
     config.demoMode ||
+    config.transportMode !== "cloud" ||
     isWithinCustomerServiceWindow(item.customer, now) ||
     Boolean(followupTemplateName(item.followupKey))
   );
   const operationalSendable = sendable.filter((item) => operationalDue.includes(item));
   const templateRequired = operationalDue.filter((item) =>
-    !config.demoMode &&
-    !isWithinCustomerServiceWindow(item.customer, now) &&
-    !followupTemplateName(item.followupKey)
+    followupRequiresApprovedTemplate(item.customer, item.followupKey, now)
   );
   const queued = await operations.enqueueFollowups(
     operationalSendable.map((item) => ({
@@ -4115,11 +4131,12 @@ async function runDueFollowups(now = new Date(), { respectOperationalControl = t
     })),
     now
   );
-  const dispatched = dispatchQueued
+  const shouldDispatchQueued = dispatchQueued && !queueOnly;
+  const dispatched = shouldDispatchQueued
     ? await dispatchFollowupQueue(now)
     : { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], paused: [] };
   return {
-    dispatchQueued,
+    dispatchQueued: shouldDispatchQueued,
     sent: dispatched.sent.length,
     queued: queued.length,
     pendingOpeningFlows,
@@ -5338,6 +5355,7 @@ function conversationStatus(customer, customerOrders) {
 function buildGuardrailSummary(customers, now = new Date()) {
   const rows = customers.map((customer) => followupGuardrailStatus(customer, now));
   const blockedReasons = rows.filter((row) => row.blocked);
+  const cloudTemplateRequired = config.transportMode === "cloud" && !config.demoMode;
   return {
     optedOut: rows.filter((row) => row.reason === "opted_out").length,
     blockedFollowups: blockedReasons.length,
@@ -5345,7 +5363,9 @@ function buildGuardrailSummary(customers, now = new Date()) {
     humanRequired: customers.filter((customer) => customer.handoffStatus === "human_required").length,
     followupCap: "follow-ups continue until order details are submitted, customer opts out, or sequence ends",
     optOutHandling: "enabled",
-    windowRule: "outside the 24-hour customer service window, production WhatsApp follow-ups must use approved templates",
+    windowRule: cloudTemplateRequired
+      ? "outside the 24-hour customer service window, WhatsApp Cloud API follow-ups must use approved templates"
+      : "web/demo transport can queue configured follow-ups without approved Cloud API templates",
   };
 }
 
@@ -5356,7 +5376,9 @@ function guardrailDisplay(customer, now = new Date()) {
   if (status.reason === "sales_conversation_closed") return "sales closed: no follow-up";
   if (status.reason === "complaint_handoff") return "complaint: human required";
   if (status.reason === "human_handoff") return "human handoff: no follow-up";
-  if (status.reason === "outside_24_hour_window") return "template follow-up required";
+  if (status.reason === "outside_24_hour_window" && config.transportMode === "cloud" && !config.demoMode) {
+    return "template follow-up required";
+  }
   if (status.reason === "order_submitted") return "order submitted";
   if (customer.followupBlockedReason === "another_date_purchase") return "another date purchase";
   return status.reason;
@@ -5415,14 +5437,17 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
     if (guardrail.reason === "human_handoff") status = "blocked: human handoff";
     if (guardrail.reason === "complaint_handoff") status = "blocked: complaint";
     if (guardrail.reason === "followup_blocked") status = "blocked";
-    if (guardrail.reason === "outside_24_hour_window") {
+    if (guardrail.reason === "outside_24_hour_window" && config.transportMode === "cloud" && !config.demoMode) {
       status = status === "due" ? "due: send approved template" : `${status}: approved template`;
     }
     if (
       queuedItem &&
       ["queued", "processing", "retry_pending"].includes(queuedItem.status) &&
       !hasOrder &&
-      (config.demoMode || guardrail.reason === "ok" || Boolean(followupTemplateName(nextFollowup)))
+      (config.demoMode ||
+        config.transportMode !== "cloud" ||
+        guardrail.reason === "ok" ||
+        Boolean(followupTemplateName(nextFollowup)))
     ) {
       status =
         queuedItem.status === "processing"
@@ -8642,10 +8667,10 @@ function persistedProductFlowImage(product, slotKey) {
   return saved && typeof saved === "object" ? saved : null;
 }
 
-function persistProductFlowImage(product, slot, { dataUrl, image, originalName = "", assetUrl = "", durableUrl = "" }) {
+function persistProductFlowImage(product, slot, { image, mediaKey = "", originalName = "", assetUrl = "", durableUrl = "" }) {
   const images = ensureProductPersistedImages(product);
   images[slot.key] = {
-    dataUrl: String(dataUrl || ""),
+    mediaKey: String(mediaKey || ""),
     mimeType: image.mimeType,
     extension: image.extension,
     originalName: String(originalName || ""),
@@ -8848,6 +8873,62 @@ function persistedProductImageUrl(accountId, productId, slotKey, extension = "jp
   return `/persisted-assets/${encodeURIComponent(accountId || config.accountId)}/${encodeURIComponent(productId || "product")}/${encodeURIComponent(slotKey || "image")}.${ext}`;
 }
 
+function mediaAssetKey(accountId, productId, slotKey) {
+  return [
+    "media_asset",
+    safeAssetSegment(accountId || config.accountId),
+    safeAssetSegment(productId || "product"),
+    safeAssetSegment(slotKey || "image"),
+  ].join("_");
+}
+
+function mediaAssetPath(mediaKey) {
+  return path.join(config.dataDir, "media_assets", `${safeAssetSegment(mediaKey)}.json`);
+}
+
+async function savePersistedProductImageAsset(accountId, productId, slotKey, { image, originalName = "" }) {
+  const key = mediaAssetKey(accountId, productId, slotKey);
+  const asset = {
+    key,
+    mimeType: image.mimeType,
+    extension: image.extension,
+    originalName: String(originalName || ""),
+    base64: image.bytes.toString("base64"),
+    updatedAt: new Date().toISOString(),
+  };
+  const filePath = mediaAssetPath(key);
+  if (storageAdapter) {
+    await storageAdapter.writeJson(filePath, asset);
+  } else {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, `${JSON.stringify(asset, null, 2)}\n`, "utf8");
+  }
+  return key;
+}
+
+async function persistedProductImageAsset(mediaKey = "") {
+  const key = String(mediaKey || "").trim();
+  if (!key) return null;
+  const filePath = mediaAssetPath(key);
+  let asset = null;
+  if (storageAdapter?.readJsonIfExists) {
+    asset = await storageAdapter.readJsonIfExists(filePath);
+  } else {
+    try {
+      asset = JSON.parse(await readFile(filePath, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (!asset?.base64 || !asset?.mimeType) return null;
+  const extension = asset.extension || { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[asset.mimeType] || "jpg";
+  return {
+    mimeType: asset.mimeType,
+    extension,
+    bytes: Buffer.from(String(asset.base64 || "").replace(/\s/g, ""), "base64"),
+  };
+}
+
 function parsePersistedAssetPath(pathname = "") {
   const prefix = "/persisted-assets/";
   if (!String(pathname || "").startsWith(prefix)) return null;
@@ -8879,7 +8960,8 @@ async function persistedAssetFromUrl(pathname = "") {
   const content = await getTeamContent(parsed.accountId);
   const product = findCatalogProduct(parsed.productId, content.catalog || catalog);
   const saved = product ? persistedProductFlowImage(product, parsed.slotKey) : null;
-  const image = decodePersistedImageDataUrl(saved?.dataUrl);
+  const image = decodePersistedImageDataUrl(saved?.dataUrl) ||
+    await persistedProductImageAsset(saved?.mediaKey || mediaAssetKey(parsed.accountId, parsed.productId, parsed.slotKey));
   return image ? { ...image, product, saved, ...parsed } : null;
 }
 
@@ -10574,7 +10656,7 @@ function adminDashboardHtml() {
     </section>
     <section id="followups" class="panel">
       <h2>Follow-Up Monitor</h2>
-      <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are queued, rotated by stage, delayed ${escapeHtml(Math.round(config.followupSendDelayMinMs / 1000))}-${escapeHtml(Math.round(config.followupSendDelayMaxMs / 1000))} second(s) before each send, and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute for ${escapeHtml(Math.max(config.followupActiveWindowMinutes, 1))} minutes, then paused for ${escapeHtml(Math.max(config.followupPauseWindowMinutes, 0))} minutes. In live WhatsApp mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
+      <p class="note">Follow-ups continue until the customer submits order details, opts out, or has an unresolved complaint. Due follow-ups are queued, rotated by stage, delayed ${escapeHtml(Math.round(config.followupSendDelayMinMs / 1000))}-${escapeHtml(Math.round(config.followupSendDelayMaxMs / 1000))} second(s) before each send, and sent at up to ${escapeHtml(Math.max(config.followupSendsPerMinute, 1))} customer(s) per minute for ${escapeHtml(Math.max(config.followupActiveWindowMinutes, 1))} minutes, then paused for ${escapeHtml(Math.max(config.followupPauseWindowMinutes, 0))} minutes. In WhatsApp Cloud API mode, follow-ups outside the 24-hour customer service window are held until an approved template is configured.</p>
       <p class="note"><a href="/admin/follow-up-settings">Edit follow-up messages and schedule settings</a></p>
       <div class="subtabs" id="followup-label-tabs"></div>
       <div class="table-wrap"></div>

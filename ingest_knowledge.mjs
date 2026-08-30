@@ -50,6 +50,14 @@ const manualKnowledgeDir = getCliValue("--knowledge-dir");
 const dryRun = hasCliFlag("--dry-run");
 const appendMode = hasCliFlag("--append");
 const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
+const vectorIndexTimeoutMs = Math.max(
+  120000,
+  Number(getEnv("OPENAI_VECTOR_INDEX_TIMEOUT_MS", "600000")) || 600000
+);
+const vectorIndexPollMs = Math.max(
+  2000,
+  Number(getEnv("OPENAI_VECTOR_INDEX_POLL_MS", "5000")) || 5000
+);
 const vectorStoreName = getEnv(
   "OPENAI_VECTOR_STORE_NAME",
   teamAccountId ? `whatsapp_${teamAccountId}_knowledge` : "whatsapp_customer_service_knowledge"
@@ -107,13 +115,13 @@ try {
     await clearVectorStore(apiKey, vectorStoreId);
   }
 
-  for (const filePath of filePaths) {
-    console.log(`Uploading ${path.relative(process.cwd(), filePath)}`);
-    const file = await uploadFile(apiKey, filePath);
-    const attached = await attachFileToVectorStore(apiKey, vectorStoreId, file.id);
-    await waitForVectorStoreFile(apiKey, vectorStoreId, file.id, attached.status);
-    console.log(`Ready: ${path.basename(filePath)} (${file.id})`);
-  }
+  const attachedFiles = await Promise.all(filePaths.map((filePath) =>
+    uploadAndAttachKnowledgeFile(apiKey, vectorStoreId, filePath)
+  ));
+  await Promise.all(attachedFiles.map(({ filePath, file, attached }) =>
+    waitForVectorStoreFile(apiKey, vectorStoreId, file.id, attached.status)
+      .then(() => console.log(`Ready: ${path.basename(filePath)} (${file.id})`))
+  ));
 
   console.log("Knowledge ingestion complete.");
 } finally {
@@ -437,7 +445,10 @@ async function listKnowledgeFiles(dir) {
 async function clearVectorStore(apiKey, vectorStoreId) {
   let totalRemoved = 0;
   for (let pass = 1; pass <= 10; pass += 1) {
-    const files = await listVectorStoreFiles(apiKey, vectorStoreId);
+    const files = await withOpenAiRetries(
+      () => listVectorStoreFiles(apiKey, vectorStoreId),
+      "list vector store files"
+    );
     if (!files.length) {
       if (totalRemoved) console.log(`Vector store cleanup complete. Removed ${totalRemoved} file(s).`);
       return;
@@ -453,7 +464,10 @@ async function clearVectorStore(apiKey, vectorStoreId) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 
-  const remaining = await listVectorStoreFiles(apiKey, vectorStoreId);
+  const remaining = await withOpenAiRetries(
+    () => listVectorStoreFiles(apiKey, vectorStoreId),
+    "list remaining vector store files"
+  );
   if (remaining.length) {
     throw new Error(`Vector store cleanup did not finish. ${remaining.length} old file row(s) still attached. Please delete the old rows in OpenAI Storage, then sync again.`);
   }
@@ -464,7 +478,10 @@ async function detachVectorStoreFile(apiKey, vectorStoreId, file) {
   let lastError = null;
   for (const id of ids) {
     try {
-      await deleteVectorStoreFile(apiKey, vectorStoreId, id);
+      await withOpenAiRetries(
+        () => deleteVectorStoreFile(apiKey, vectorStoreId, id),
+        `delete vector store file ${id}`
+      );
       return;
     } catch (error) {
       lastError = error;
@@ -473,16 +490,55 @@ async function detachVectorStoreFile(apiKey, vectorStoreId, file) {
   throw lastError || new Error(`Unable to detach vector store file ${file.id}`);
 }
 
+async function uploadAndAttachKnowledgeFile(apiKey, vectorStoreId, filePath) {
+  console.log(`Uploading ${path.relative(process.cwd(), filePath)}`);
+  const file = await withOpenAiRetries(() => uploadFile(apiKey, filePath), `upload ${path.basename(filePath)}`);
+  const attached = await withOpenAiRetries(
+    () => attachFileToVectorStore(apiKey, vectorStoreId, file.id),
+    `attach ${path.basename(filePath)}`
+  );
+  return { filePath, file, attached };
+}
+
 async function waitForVectorStoreFile(apiKey, vectorStoreId, fileId, initialStatus) {
   let status = initialStatus;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < vectorIndexTimeoutMs) {
     if (status === "completed") return;
     if (status === "failed" || status === "cancelled") {
       throw new Error(`Vector store indexing failed for ${fileId}: ${status}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    const current = await getVectorStoreFile(apiKey, vectorStoreId, fileId);
+    await sleep(vectorIndexPollMs);
+    const current = await withOpenAiRetries(
+      () => getVectorStoreFile(apiKey, vectorStoreId, fileId),
+      `poll vector store indexing ${fileId}`
+    );
     status = current.status;
   }
-  throw new Error(`Timed out waiting for vector store indexing: ${fileId}`);
+  throw new Error(`Timed out waiting for vector store indexing after ${Math.round(vectorIndexTimeoutMs / 1000)}s: ${fileId} (last status: ${status || "unknown"})`);
+}
+
+async function withOpenAiRetries(operation, label, maxAttempts = 5) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isRetryableOpenAiError(error)) break;
+      const delayMs = Math.min(30000, 1000 * (2 ** (attempt - 1)));
+      console.log(`Retrying ${label} after OpenAI error (${attempt}/${maxAttempts}): ${error.message}`);
+      await sleep(delayMs);
+    }
+  }
+  throw lastError;
+}
+
+function isRetryableOpenAiError(error) {
+  const message = String(error?.message || "");
+  return /\b(429|500|502|503|504|rate limit|server had|temporar|timeout|timed out|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\b/i.test(message);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
