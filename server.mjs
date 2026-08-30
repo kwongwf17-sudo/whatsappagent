@@ -4232,6 +4232,10 @@ async function dispatchFollowupQueue(now = new Date()) {
   const contentByAccount = new Map();
   const accountSettingsById = new Map();
   const result = { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], paused: [] };
+  const dispatchUpdates = [];
+  const updateDispatch = (id, patch) => {
+    dispatchUpdates.push({ id, patch });
+  };
 
   for (const item of batch) {
     const itemAccountId = item.businessAccountId || config.accountId;
@@ -4244,7 +4248,7 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     const pauseUntil = followupPauseUntilForSettings(now, accountSettingsById.get(itemAccountId));
     if (pauseUntil) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "queued",
         availableAt: pauseUntil.toISOString(),
         lastError: "Follow-up pacing cooldown is active.",
@@ -4272,7 +4276,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       message: item.message,
     };
     if (!(await adminAccounts.isActive(itemAccountId, "business_admin"))) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "cancelled",
         lastError: "Business account is disabled.",
       });
@@ -4281,7 +4285,7 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     const specialAnotherDateFollowup = item.followupKey === "another_date_purchase_followup";
     if (!customer && customerInAnotherAccount) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "cancelled",
         lastError: "Follow-up business account does not match customer business account.",
       });
@@ -4293,7 +4297,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       continue;
     }
     if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.handoffStatus === "human_required" || (customer.followupBlocked && !specialAnotherDateFollowup)) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "cancelled",
         lastError: !customer ? "Customer no longer exists." : "Customer no longer eligible for follow-up.",
       });
@@ -4301,7 +4305,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       continue;
     }
     if (item.productId && customer.productId && item.productId !== customer.productId) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "cancelled",
         lastError: "Follow-up product does not match customer product.",
       });
@@ -4309,7 +4313,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       continue;
     }
     if (customer.followupsSent?.[item.followupKey]) {
-      await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: customer.followupsSent[item.followupKey] });
+      updateDispatch(item.id, { status: "sent", sentAt: customer.followupsSent[item.followupKey] });
       continue;
     }
     if (!contentByAccount.has(itemAccountId)) {
@@ -4318,7 +4322,7 @@ async function dispatchFollowupQueue(now = new Date()) {
     const teamContent = contentByAccount.get(itemAccountId);
     const product = teamContent.catalog.products.find((entry) => entry.id === customer.productId);
     if (!product) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "cancelled",
         lastError: "Customer product is not available for this business account.",
       });
@@ -4328,7 +4332,7 @@ async function dispatchFollowupQueue(now = new Date()) {
     if (specialAnotherDateFollowup) {
       const specialItem = anotherDatePurchaseFollowupItem(customer, product, teamContent, now);
       if (!specialItem || customer.followupsSent?.[item.followupKey]) {
-        await operations.updateFollowupDispatch(item.id, {
+        updateDispatch(item.id, {
           status: "cancelled",
           lastError: "Another-date purchase follow-up is no longer due.",
         });
@@ -4346,11 +4350,11 @@ async function dispatchFollowupQueue(now = new Date()) {
           skipFailureRecord: true,
         });
         await store.markFollowupSent(item.customerId, item.followupKey, now, itemAccountId);
-        await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
+        updateDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
         result.sent.push(sentItem);
       } catch (error) {
         const retryAt = new Date(now.getTime() + Math.max(config.followupRetryMinutes, 1) * 60 * 1000);
-        await operations.updateFollowupDispatch(item.id, {
+        updateDispatch(item.id, {
           status: "retry_pending",
           availableAt: retryAt.toISOString(),
           lastError: error.message,
@@ -4362,7 +4366,7 @@ async function dispatchFollowupQueue(now = new Date()) {
     const followupSequence = productFollowupSequence(product);
     const sequenceItem = followupSequence.find((entry) => entry.key === item.followupKey);
     if (!sequenceItem) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "cancelled",
         lastError: "Follow-up row is no longer available for this product.",
       });
@@ -4371,7 +4375,7 @@ async function dispatchFollowupQueue(now = new Date()) {
     }
     const queueDueAt = validDateOrNull(item.dueAt || item.availableAt);
     if (queueDueAt && now < queueDueAt) {
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "queued",
         availableAt: queueDueAt.toISOString(),
         lastError: "",
@@ -4384,7 +4388,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       .find((entry) => !customer.followupsSent?.[entry.key]);
     if (previousUnsent) {
       const retryAt = new Date(now.getTime() + Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "queued",
         availableAt: retryAt.toISOString(),
         lastError: `Waiting for earlier follow-up ${previousUnsent.key}.`,
@@ -4403,7 +4407,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       if (templateName) {
         sentItem.templateName = templateName;
       } else {
-        await operations.updateFollowupDispatch(item.id, {
+        updateDispatch(item.id, {
           status: "held_template",
           lastError: "Approved WhatsApp template required outside the 24-hour customer service window.",
         });
@@ -4426,11 +4430,11 @@ async function dispatchFollowupQueue(now = new Date()) {
         skipFailureRecord: true,
       });
       await store.markFollowupSent(item.customerId, item.followupKey, now, itemAccountId);
-      await operations.updateFollowupDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
+      updateDispatch(item.id, { status: "sent", sentAt: now.toISOString(), lastError: "" });
       result.sent.push(sentItem);
     } catch (error) {
       const retryAt = new Date(now.getTime() + Math.max(config.followupRetryMinutes, 1) * 60 * 1000);
-      await operations.updateFollowupDispatch(item.id, {
+      updateDispatch(item.id, {
         status: "retry_pending",
         availableAt: retryAt.toISOString(),
         lastError: error.message,
@@ -4438,6 +4442,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       result.failed.push(sentItem);
     }
   }
+  await operations.updateFollowupDispatches(dispatchUpdates);
   return result;
 }
 
