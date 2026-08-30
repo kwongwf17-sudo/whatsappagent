@@ -4447,7 +4447,7 @@ async function dispatchFollowupQueue(now = new Date()) {
 }
 
 async function claimFollowupDispatchBatch(now = new Date()) {
-  const claimed = [];
+  const accountLimits = [];
   const seenAccounts = new Set();
   try {
     const accounts = await adminAccounts.listAccounts();
@@ -4456,15 +4456,15 @@ async function claimFollowupDispatchBatch(now = new Date()) {
       if (!accountId || seenAccounts.has(accountId)) continue;
       seenAccounts.add(accountId);
       const limit = Number(account.settings?.followupSendsPerMinute || 0) || config.followupSendsPerMinute;
-      claimed.push(...await operations.claimFollowupBatch(Math.max(limit, 1), now, accountId));
+      accountLimits.push({ businessAccountId: accountId, limit: Math.max(limit, 1) });
     }
   } catch (error) {
     await recordSystemError("followup_batch_settings", error);
   }
   if (!seenAccounts.has(config.accountId)) {
-    claimed.push(...await operations.claimFollowupBatch(Math.max(config.followupSendsPerMinute, 1), now, config.accountId));
+    accountLimits.push({ businessAccountId: config.accountId, limit: Math.max(config.followupSendsPerMinute, 1) });
   }
-  return claimed;
+  return operations.claimFollowupBatches(accountLimits, now);
 }
 
 function customerKey(businessAccountId, customerId) {
