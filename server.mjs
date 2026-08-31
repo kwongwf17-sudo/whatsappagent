@@ -1860,6 +1860,26 @@ function shouldStartNewProductJourney(customer = {}, product = null) {
   );
 }
 
+function productDetectionSource(customer = {}, source = {}) {
+  return {
+    ...(customer?.leadSource && typeof customer.leadSource === "object" ? customer.leadSource : {}),
+    ...(customer?.source && typeof customer.source === "object" ? customer.source : {}),
+    ...(customer?.lastInboundSource && typeof customer.lastInboundSource === "object" ? customer.lastInboundSource : {}),
+    ...(source && typeof source === "object" ? source : {}),
+  };
+}
+
+function hasConfidentProductResolution(productResolution = null) {
+  if (!productResolution?.matched || !productResolution.product?.id) return false;
+  if (["default_fallback", "ambiguous_product"].includes(String(productResolution.matchSource || ""))) return false;
+  return Number(productResolution.confidence || 0) >= 0.75;
+}
+
+function hasOpeningFlowProductClue(productResolution = null) {
+  if (!hasConfidentProductResolution(productResolution)) return false;
+  return String(productResolution.matchSource || "") !== "existing_customer_product";
+}
+
 function newProductJourneyPatch(customer = {}, product = null, now = new Date()) {
   if (!shouldStartNewProductJourney(customer, product)) return {};
   const nowIso = now.toISOString();
@@ -2096,6 +2116,24 @@ async function processInboundMessageCore({
   const firstEligibleInbound = typeof isFirstEligibleInbound === "boolean"
     ? isFirstEligibleInbound
     : !existingCustomer || Number(existingCustomer.inboundCount || 0) === 0;
+  const initialDetectionSource = productDetectionSource(existingCustomer, source);
+  const initialProductResolution = resolveProduct(teamCatalog, text, initialDetectionSource, existingCustomer?.productId || "");
+  const initialActiveState = conversationActiveState(existingCustomer || {});
+  const initialOpeningFlowDecision = getOpeningFlowDecision({
+    customer: existingCustomer || {},
+    productResolution: initialProductResolution,
+    customerMessage: text,
+    source: initialDetectionSource,
+    isFirstEligibleInbound: firstEligibleInbound,
+  });
+  const initialTextMatchedProduct = findProductMatch(teamCatalog, text, {});
+  const initialIsProductNameOnlyOpening = isProductNameMessage(initialTextMatchedProduct || initialProductResolution.product, text);
+  const shouldBypassMessageMergeBuffer = Boolean(
+    initialOpeningFlowDecision.shouldSend ||
+      initialIsProductNameOnlyOpening ||
+      hasOpeningFlowProductClue(initialProductResolution)
+  );
+  const shouldLockInitialProduct = !initialActiveState && hasOpeningFlowProductClue(initialProductResolution);
   if (!skipInboundRecord) {
     await store.appendOutbox({
       ...(id ? { id } : {}),
@@ -2119,10 +2157,27 @@ async function processInboundMessageCore({
         recordInbound: true,
         businessAccountId,
         source,
+        ...(shouldLockInitialProduct
+          ? { productId: initialProductResolution.product.id }
+          : {}),
         ...contactPatch,
       });
+  if (
+    !skipInboundRecord &&
+    shouldLockInitialProduct &&
+    (!existingCustomer?.productId || existingCustomer.productId !== initialProductResolution.product.id)
+  ) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_product_locked",
+      customerId: from,
+      result: `${initialProductResolution.product.id}:${initialProductResolution.matchSource}`,
+      businessAccountId,
+      correlationId,
+    });
+  }
 
-  if (!skipInboundRecord && !skipMessageMergeBuffer && businessAccountId !== DEMO_ACCOUNT_ID && shouldBufferMergedCustomerMessage(text)) {
+  if (!skipInboundRecord && !skipMessageMergeBuffer && businessAccountId !== DEMO_ACCOUNT_ID && !shouldBypassMessageMergeBuffer && shouldBufferMergedCustomerMessage(text)) {
     return bufferMergedCustomerMessage({
       id,
       from,
@@ -2139,20 +2194,21 @@ async function processInboundMessageCore({
 
   const conversationContext = await recentConversationContext(from, businessAccountId);
   const activeState = conversationActiveState(customer);
-  const sourceMatchedProduct = findProductMatch(teamCatalog, "", source);
+  const detectionSource = productDetectionSource(customer, source);
+  const sourceMatchedProduct = findProductMatch(teamCatalog, "", detectionSource);
   const contextMatchedProduct = customer.productId
     ? sourceMatchedProduct
-    : await recentProductContextMatch(from, businessAccountId, teamCatalog, source);
-  const bufferProduct = findProduct(teamCatalog, text, source, customer.productId);
+    : await recentProductContextMatch(from, businessAccountId, teamCatalog, detectionSource);
+  const bufferProduct = findProduct(teamCatalog, text, detectionSource, customer.productId);
   const explicitTextMatchedProduct = findProductMatch(teamCatalog, text, {});
-  const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, {}, "");
+  const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, detectionSource, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
-  const earlyProductResolution = resolveProduct(teamCatalog, text, source, customer.productId);
+  const earlyProductResolution = resolveProduct(teamCatalog, text, detectionSource, customer.productId);
   const earlyOpeningFlowDecision = getOpeningFlowDecision({
     customer,
     productResolution: earlyProductResolution,
     customerMessage: text,
-    source,
+    source: detectionSource,
     isFirstEligibleInbound: firstEligibleInbound,
   });
   const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
@@ -2202,6 +2258,13 @@ async function processInboundMessageCore({
           handoffReason: blocked.message,
         };
       }
+      await store.appendAuditLog({
+        action: "live_automation_blocked",
+        customerId: from,
+        result: blocked.code,
+        businessAccountId,
+        correlationId,
+      });
       const updatedCustomer = await store.updateCustomer(from, () => ({
         handoffStatus: "human_required",
         handoffReason: blocked.message,
@@ -2294,7 +2357,7 @@ async function processInboundMessageCore({
 
   const routedProduct = shouldStartNewProductJourney(customer, explicitTextMatchedProduct)
     ? explicitTextMatchedProduct
-    : findProduct(teamCatalog, text, source, customer.productId);
+    : findProduct(teamCatalog, text, detectionSource, customer.productId);
   const routeClassification = await maybeClassifyCustomerMessageRoute({
     customerMessage: text,
     customerId: from,
@@ -2460,10 +2523,10 @@ async function processInboundMessageCore({
         customer,
         productResolution: { ...productResolution, product },
         customerMessage: text,
-        source,
+        source: detectionSource,
         isFirstEligibleInbound: firstEligibleInbound,
       });
-  const messageSource = openingFlowDecision.shouldSend ? { ...source, productNameMatch: true } : source;
+  const messageSource = openingFlowDecision.shouldSend ? { ...detectionSource, productNameMatch: true } : detectionSource;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
   const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
   const exactSalesReply = faqSalesResponse
@@ -2625,12 +2688,37 @@ async function processInboundMessageCore({
   const sendPlan = flowsOnlyMode && openingFlowDecision.shouldSend
     ? flowsOnlyOpeningPlan(openingFlowGate.plan, openingFlowDecision, openingFlowGate)
     : openingFlowGate.plan;
+  const sendPlanCustomerPatch = openingFlowDecision.shouldSend && !openingFlowGate.queued
+    ? {
+        ...removeOpeningFlowSentPatch(sendPlan.customerPatch || {}, openingFlowDecision.productId),
+        productId: openingFlowDecision.productId || product.id,
+        pendingOpeningFlow: {
+          productId: openingFlowDecision.productId || product.id,
+          queuedAt: new Date().toISOString(),
+          dueAt: "",
+          reason: "opening_flow_send_in_progress",
+        },
+        openingFlowInProgressAt: new Date().toISOString(),
+        openingFlowFailedAt: "",
+        openingFlowFailureReason: "",
+      }
+    : (sendPlan.customerPatch || {});
 
   if (live && await shouldSuppressPlanForFlowsOnly(businessAccountId, {
     effectivePlan: sendPlan,
     openingFlowDecision,
     orderWillBeCreated: Boolean(sendPlan.order),
   })) {
+    if (!hasConfidentProductResolution(productResolution)) {
+      await store.appendAuditLog({
+        actor: "ai_agent",
+        action: "opening_flow_skipped_no_confident_product",
+        customerId: from,
+        result: `${productResolution.matchSource || "unknown"}:${productResolution.confidence || 0}`,
+        businessAccountId,
+        correlationId,
+      });
+    }
     await store.appendAuditLog({
       actor: "ai_agent",
       action: "flows_only_reply_suppressed",
@@ -2656,7 +2744,7 @@ async function processInboundMessageCore({
     }
     return {
       ...newProductJourneyPatch(customer, product),
-      ...(sendPlan.customerPatch || {}),
+      ...sendPlanCustomerPatch,
       ...(!flowsOnlyMode && (sendPlan.handoffRequired || repeatHandoffRequired)
         ? { handoffSeverity: handoffSeverityForReason(repeatHandoffReason || sendPlan.handoffReason || "", sendPlan.handoffSeverity) }
         : {}),
@@ -2664,6 +2752,25 @@ async function processInboundMessageCore({
       ...(flowsOnlyMode ? {} : repeatPatch),
     };
   }, businessAccountId);
+  if (openingFlowAlreadyReserved) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_skipped_already_reserved",
+      customerId: from,
+      result: openingFlowDecision.productId || product.id,
+      businessAccountId,
+      correlationId,
+    });
+  } else if (openingFlowDecision.shouldSend && openingFlowGate.queued) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_queued",
+      customerId: from,
+      result: `${openingFlowDecision.productId || product.id}:${openingFlowGate.queuedUntil || ""}`,
+      businessAccountId,
+      correlationId,
+    });
+  }
   let order = null;
   if (sendPlan.order) {
     order = await store.addOrder({ ...sendPlan.order, businessAccountId, inboundMessageId: id || "", correlationId });
@@ -2685,11 +2792,48 @@ async function processInboundMessageCore({
   }
   let finalCustomer = updatedCustomer;
   if (outbound.length) {
-    await sendOutbound(from, outbound, { businessAccountId, correlationId });
+    try {
+      await sendOutbound(from, outbound, { businessAccountId, correlationId });
+    } catch (error) {
+      if (!order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
+        const failedAt = new Date().toISOString();
+        const unsentCount = Array.isArray(error.unsentMessages) ? error.unsentMessages.length : outbound.length;
+        const sentCount = Math.max(0, outbound.length - unsentCount);
+        await store.updateCustomer(from, () => ({
+          pendingOpeningFlow: {
+            productId: product.id,
+            queuedAt: updatedCustomer.pendingOpeningFlow?.queuedAt || failedAt,
+            dueAt: "",
+            reason: "opening_flow_send_failed",
+            failedAt,
+            sentCount,
+            totalCount: outbound.length,
+          },
+          openingFlowInProgressAt: "",
+          openingFlowFailedAt: failedAt,
+          openingFlowFailureReason: error.message,
+          productId: product.id,
+        }), businessAccountId).catch(() => {});
+        await store.appendAuditLog({
+          actor: "ai_agent",
+          action: "opening_flow_send_failed",
+          customerId: from,
+          result: `${product.id}:${sentCount}/${outbound.length}`,
+          reason: error.message,
+          businessAccountId,
+          correlationId,
+        }).catch(() => {});
+      }
+      throw error;
+    }
   }
   if (!openingFlowAlreadyReserved && !order && openingFlowDecision.shouldSend && !openingFlowGate.queued && outbound.length) {
     const openingFlowSentAt = new Date().toISOString();
     const customerAfterOpeningFlow = await store.updateCustomer(from, (currentCustomer) => ({
+      pendingOpeningFlow: null,
+      openingFlowInProgressAt: "",
+      openingFlowFailedAt: "",
+      openingFlowFailureReason: "",
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt: openingFlowSentAt },
@@ -2699,6 +2843,14 @@ async function processInboundMessageCore({
       productId: product.id,
     }), businessAccountId);
     finalCustomer = customerAfterOpeningFlow;
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_sent",
+      customerId: from,
+      result: `${product.id}:${outbound.length}`,
+      businessAccountId,
+      correlationId,
+    });
     await enqueueOpeningFlowFollowups({
       customer: customerAfterOpeningFlow,
       product,
@@ -4035,13 +4187,55 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
     const messages = product.opening_flow?.length
       ? product.opening_flow
       : [textMessage(productIntro(product))];
-    await sendOutbound(customer.id, messages, {
-      businessAccountId: accountId,
-      purpose: "opening_flow",
-    });
+    await store.updateCustomer(customer.id, () => ({
+      pendingOpeningFlow: {
+        ...pending,
+        reason: "opening_flow_send_in_progress",
+      },
+      openingFlowInProgressAt: now.toISOString(),
+      openingFlowFailedAt: "",
+      openingFlowFailureReason: "",
+      productId: product.id,
+    }), accountId);
+    try {
+      await sendOutbound(customer.id, messages, {
+        businessAccountId: accountId,
+        purpose: "opening_flow",
+      });
+    } catch (error) {
+      const failedAt = new Date().toISOString();
+      const unsentCount = Array.isArray(error.unsentMessages) ? error.unsentMessages.length : messages.length;
+      const sentCount = Math.max(0, messages.length - unsentCount);
+      await store.updateCustomer(customer.id, () => ({
+        pendingOpeningFlow: {
+          ...pending,
+          reason: "opening_flow_send_failed",
+          failedAt,
+          sentCount,
+          totalCount: messages.length,
+        },
+        openingFlowInProgressAt: "",
+        openingFlowFailedAt: failedAt,
+        openingFlowFailureReason: error.message,
+        productId: product.id,
+      }), accountId);
+      await store.appendAuditLog({
+        actor: "ai_agent",
+        action: "opening_flow_send_failed",
+        customerId: customer.id,
+        result: `${product.id}:${sentCount}/${messages.length}`,
+        reason: error.message,
+        businessAccountId: accountId,
+      });
+      result.skipped.push({ customerId: customer.id, productId: product.id, skipped: "send_failed" });
+      continue;
+    }
     const sentAt = now.toISOString();
     await store.updateCustomer(customer.id, () => ({
       pendingOpeningFlow: null,
+      openingFlowInProgressAt: "",
+      openingFlowFailedAt: "",
+      openingFlowFailureReason: "",
       openingFlowsSent: {
         ...(customer.openingFlowsSent && typeof customer.openingFlowsSent === "object" ? customer.openingFlowsSent : {}),
         [product.id]: { sentAt },
@@ -4056,6 +4250,13 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       businessAccountId: accountId,
       openingFlowSentAt: sentAt,
       queuedAt: now,
+    });
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_sent",
+      customerId: customer.id,
+      result: `${product.id}:${messages.length}`,
+      businessAccountId: accountId,
     });
     result.sent.push({ customerId: customer.id, businessAccountId: accountId, productId: product.id });
   }
@@ -5097,6 +5298,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       latestOrderCreatedAt: latestOrder.createdAt || "",
       inboundCount: Number(customer.inboundCount || 0),
       status: conversationStatus(customer, customerOrders),
+      openingFlowStatus: openingFlowStatusDisplay(customer),
       handoffReason: customer.handoffReason || "",
       guardrail: guardrailDisplay(customer, now),
       optedOut: Boolean(customer.optedOut),
@@ -5355,6 +5557,15 @@ function conversationStatus(customer, customerOrders) {
   if (customer.handoffStatus === "human_required") return "human required";
   if (Number(customer.inboundCount || 0) <= 1) return "new lead";
   return "engaged";
+}
+
+function openingFlowStatusDisplay(customer = {}) {
+  if (customer.openingFlowFailedAt) return "failed";
+  if (customer.openingFlowInProgressAt || customer.pendingOpeningFlow?.reason === "opening_flow_send_in_progress") return "sending";
+  if (customer.pendingOpeningFlow?.productId) return "pending";
+  if (customer.openingFlowSentAt || customer.openingFlowProductId) return "sent";
+  if (customer.productId) return "product locked";
+  return "not sent";
 }
 
 function buildGuardrailSummary(customers, now = new Date()) {
@@ -11393,6 +11604,7 @@ function adminDashboardHtml() {
         { label: 'SKU', key: 'skuCode' },
         { label: 'Label', key: 'labelDisplay', render: r => pill(r.labelDisplay) },
         { label: 'Status', key: 'status', render: r => pill(r.status) },
+        { label: 'Opening Flow', key: 'openingFlowStatus', render: r => pill(r.openingFlowStatus) },
         { label: 'Guardrail', key: 'guardrail', render: r => pill(r.guardrail) },
         { label: 'Last Message', key: 'lastMessageAt', render: r => fmtTime(r.lastMessageAt) },
         { label: 'Order', key: 'whatsappId', render: r => '<button type="button" data-manual-order-customer="' + esc(r.whatsappId) + '">Mark Order Submitted</button>' },
