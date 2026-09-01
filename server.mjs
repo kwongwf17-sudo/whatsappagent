@@ -110,6 +110,8 @@ const config = {
   sqlitePath: getEnv("WHATSAPP_SQLITE_PATH", "agent.sqlite"),
   postgresUrl: getEnv("WHATSAPP_POSTGRES_URL", getEnv("DATABASE_URL", "")),
   postgresTable: getEnv("WHATSAPP_POSTGRES_TABLE", "json_documents"),
+  followupQueueTableEnabled: parseBool(getEnv("WHATSAPP_FOLLOWUP_QUEUE_TABLE_ENABLED", "false")),
+  followupQueueTableName: getEnv("WHATSAPP_FOLLOWUP_QUEUE_TABLE", "followup_dispatch_queue_rows"),
   assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
   webSessionDir: path.resolve(getEnv("WHATSAPP_WEB_SESSION_DIR", path.join(__dirname, "data", "whatsapp-web-session"))),
   catalogPath: resolveSeedPath("PRODUCT_CATALOG_PATH", "product_catalog.json"),
@@ -213,6 +215,8 @@ const postgresAdapter = config.storeBackend === "postgres"
   ? new PostgresJsonAdapter(config.dataDir, {
       connectionString: config.postgresUrl,
       tableName: config.postgresTable,
+      followupQueueTableEnabled: config.followupQueueTableEnabled,
+      followupQueueTableName: config.followupQueueTableName,
     })
   : null;
 const storageAdapter = sqliteAdapter || postgresAdapter;
@@ -252,9 +256,11 @@ await operations.ensureState({ version: config.appVersion });
 let catalogWriteQueue = Promise.resolve();
 const pendingOrderDetailBuffers = new Map();
 const pendingMessageMergeBuffers = new Map();
+const pendingOpeningFlowInboundBuffers = new Map();
 const PENDING_BUFFER_TYPE = {
   MESSAGE_MERGE: "message_merge",
   ORDER_DETAIL: "order_detail",
+  OPENING_FLOW_INBOUND: "opening_flow_inbound",
 };
 const deliveredOutboundMessages = new Map();
 const submittedOutboundMessages = new Map();
@@ -2177,6 +2183,30 @@ async function processInboundMessageCore({
     });
   }
 
+  if (live && isOpeningFlowSendInProgress(customer)) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_inbound_deferred",
+      customerId: from,
+      result: customer.pendingOpeningFlow?.productId || customer.openingFlowProductId || customer.productId || "",
+      reason: "Inbound message received while opening flow send is still in progress.",
+      businessAccountId,
+      correlationId,
+    });
+    return bufferOpeningFlowInboundMessage({
+      id,
+      from,
+      text,
+      source,
+      live,
+      businessAccountId,
+      contentAccountId,
+      knowledgeAccountId,
+      isFirstEligibleInbound: firstEligibleInbound,
+      correlationId,
+    }, customer);
+  }
+
   if (!skipInboundRecord && !skipMessageMergeBuffer && businessAccountId !== DEMO_ACCOUNT_ID && !shouldBypassMessageMergeBuffer && shouldBufferMergedCustomerMessage(text)) {
     return bufferMergedCustomerMessage({
       id,
@@ -2793,7 +2823,21 @@ async function processInboundMessageCore({
   let finalCustomer = updatedCustomer;
   if (outbound.length) {
     try {
-      await sendOutbound(from, outbound, { businessAccountId, correlationId });
+      const openingFlowMessageCount = Array.isArray(openingFlowDecision.messages)
+        ? openingFlowDecision.messages.length
+        : 0;
+      const outboundMeta = {
+        businessAccountId,
+        correlationId,
+        ...(!order &&
+          openingFlowDecision.shouldSend &&
+          !openingFlowGate.queued &&
+          openingFlowMessageCount > 0 &&
+          outbound.length === openingFlowMessageCount
+          ? { purpose: "opening_flow" }
+          : {}),
+      };
+      await sendOutbound(from, outbound, outboundMeta);
     } catch (error) {
       if (!order && openingFlowDecision.shouldSend && !openingFlowGate.queued) {
         const failedAt = new Date().toISOString();
@@ -4122,6 +4166,18 @@ function hasOpeningFlowReserved(customer = {}, product = null) {
   return String(customer.pendingOpeningFlow?.productId || "") === String(product.id);
 }
 
+function isOpeningFlowSendInProgress(customer = {}) {
+  if (!customer || typeof customer !== "object") return false;
+  if (customer.openingFlowInProgressAt) {
+    const startedAt = Date.parse(customer.openingFlowInProgressAt);
+    if (!Number.isFinite(startedAt)) return true;
+    return Date.now() - startedAt <= 10 * 60 * 1000;
+  }
+  if (customer.pendingOpeningFlow?.reason !== "opening_flow_send_in_progress") return false;
+  const pendingAt = Date.parse(customer.pendingOpeningFlow.queuedAt || customer.pendingOpeningFlow.dueAt || "");
+  return !Number.isFinite(pendingAt) || Date.now() - pendingAt <= 10 * 60 * 1000;
+}
+
 function flowsOnlyOpeningPlan(plan = {}, openingFlowDecision = {}, openingFlowGate = {}) {
   const productId = openingFlowDecision.productId || "";
   const patch = plan.customerPatch && typeof plan.customerPatch === "object" ? plan.customerPatch : {};
@@ -4184,19 +4240,52 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       result.skipped.push({ customerId: customer.id, productId: pending.productId, skipped: "product_not_found" });
       continue;
     }
+    let reserveSkipped = "";
+    await store.updateCustomer(customer.id, (currentCustomer) => {
+      if (hasOpeningFlowAlreadySent(currentCustomer, product)) {
+        reserveSkipped = "already_sent";
+        return {
+          pendingOpeningFlow: null,
+          openingFlowInProgressAt: "",
+        };
+      }
+      const currentPending = currentCustomer.pendingOpeningFlow;
+      if (String(currentPending?.productId || "") !== String(product.id)) {
+        reserveSkipped = "pending_changed";
+        return {};
+      }
+      if (isOpeningFlowSendInProgress(currentCustomer)) {
+        reserveSkipped = "send_in_progress";
+        return {};
+      }
+      reserveSkipped = "";
+      return {
+        pendingOpeningFlow: {
+          ...currentPending,
+          reason: "opening_flow_send_in_progress",
+        },
+        openingFlowInProgressAt: now.toISOString(),
+        openingFlowFailedAt: "",
+        openingFlowFailureReason: "",
+        productId: product.id,
+      };
+    }, accountId);
+    if (reserveSkipped) {
+      result.skipped.push({ customerId: customer.id, productId: product.id, skipped: reserveSkipped });
+      if (reserveSkipped === "already_sent") {
+        await store.appendAuditLog({
+          actor: "ai_agent",
+          action: "opening_flow_skipped_already_sent",
+          customerId: customer.id,
+          result: product.id,
+          businessAccountId: accountId,
+        });
+      }
+      continue;
+    }
     const messages = product.opening_flow?.length
       ? product.opening_flow
       : [textMessage(productIntro(product))];
-    await store.updateCustomer(customer.id, () => ({
-      pendingOpeningFlow: {
-        ...pending,
-        reason: "opening_flow_send_in_progress",
-      },
-      openingFlowInProgressAt: now.toISOString(),
-      openingFlowFailedAt: "",
-      openingFlowFailureReason: "",
-      productId: product.id,
-    }), accountId);
     try {
       await sendOutbound(customer.id, messages, {
         businessAccountId: accountId,
@@ -4231,13 +4320,13 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       continue;
     }
     const sentAt = now.toISOString();
-    await store.updateCustomer(customer.id, () => ({
+    const customerAfterOpeningFlow = await store.updateCustomer(customer.id, (currentCustomer) => ({
       pendingOpeningFlow: null,
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
       openingFlowsSent: {
-        ...(customer.openingFlowsSent && typeof customer.openingFlowsSent === "object" ? customer.openingFlowsSent : {}),
+        ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt },
       },
       openingFlowSentAt: sentAt,
@@ -4245,7 +4334,7 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       productId: product.id,
     }), accountId);
     await enqueueOpeningFlowFollowups({
-      customer: { ...customer, openingFlowSentAt: sentAt, openingFlowProductId: product.id, productId: product.id },
+      customer: customerAfterOpeningFlow,
       product,
       businessAccountId: accountId,
       openingFlowSentAt: sentAt,
@@ -7041,6 +7130,7 @@ function pendingCustomerBufferKey(type, businessAccountId, customerId) {
 function pendingCustomerBufferMap(type) {
   if (type === PENDING_BUFFER_TYPE.MESSAGE_MERGE) return pendingMessageMergeBuffers;
   if (type === PENDING_BUFFER_TYPE.ORDER_DETAIL) return pendingOrderDetailBuffers;
+  if (type === PENDING_BUFFER_TYPE.OPENING_FLOW_INBOUND) return pendingOpeningFlowInboundBuffers;
   return null;
 }
 
@@ -7050,12 +7140,17 @@ async function clearPendingCustomerBuffers(businessAccountId, customerId) {
   const mergeBuffer = pendingMessageMergeBuffers.get(mergeKey);
   if (mergeBuffer?.timer) clearTimeout(mergeBuffer.timer);
   pendingMessageMergeBuffers.delete(mergeKey);
+  const openingFlowKey = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.OPENING_FLOW_INBOUND, businessAccountId, customerId);
+  const openingFlowBuffer = pendingOpeningFlowInboundBuffers.get(openingFlowKey);
+  if (openingFlowBuffer?.timer) clearTimeout(openingFlowBuffer.timer);
+  pendingOpeningFlowInboundBuffers.delete(openingFlowKey);
   const orderBuffer = pendingOrderDetailBuffers.get(orderKey);
   if (orderBuffer?.timer) clearTimeout(orderBuffer.timer);
   pendingOrderDetailBuffers.delete(orderKey);
   await Promise.all([
     store.deletePendingBuffer(mergeKey),
     store.deletePendingBuffer(orderKey),
+    store.deletePendingBuffer(openingFlowKey),
   ]);
 }
 
@@ -7148,6 +7243,10 @@ function shouldBufferMergedCustomerMessage(text) {
   return delayMs > 0 && Boolean(String(text || "").trim());
 }
 
+function openingFlowInboundBufferDelayMs() {
+  return Math.max(30000, Math.min(120000, Math.max(0, Number(config.messageSequenceDelayMs) || 1500) * 30));
+}
+
 async function bufferMergedCustomerMessage(args, customer) {
   const delayMs = Math.max(0, Number(config.messageMergeBufferMs) || 0);
   const key = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.MESSAGE_MERGE, args.businessAccountId, args.from);
@@ -7175,6 +7274,36 @@ async function bufferMergedCustomerMessage(args, customer) {
     messages: [],
     handoffRequired: false,
     handoffReason: "Customer message merge buffered.",
+  };
+}
+
+async function bufferOpeningFlowInboundMessage(args, customer) {
+  const delayMs = openingFlowInboundBufferDelayMs();
+  const key = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.OPENING_FLOW_INBOUND, args.businessAccountId, args.from);
+  const existing = pendingOpeningFlowInboundBuffers.get(key);
+  if (existing?.timer) clearTimeout(existing.timer);
+  const saved = await store.updatePendingBuffer(key, (stored) => {
+    const messages = [...(stored?.messages || []), String(args.text || "").trim()].filter(Boolean);
+    const sources = [...(stored?.sources || []), args.source || {}];
+    return {
+      type: PENDING_BUFFER_TYPE.OPENING_FLOW_INBOUND,
+      businessAccountId: args.businessAccountId || config.accountId,
+      customerId: args.from,
+      dueAt: new Date(Date.now() + delayMs).toISOString(),
+      messages,
+      sources,
+      args: durableBufferArgs(args),
+      correlationId: args.correlationId || stored?.correlationId || correlationIdForInbound(args.id, args.from),
+    };
+  });
+  schedulePendingCustomerBuffer(saved);
+  console.log(`Deferring customer message from ${args.from} until opening flow finishes (${saved.messages.length} fragment(s)).`);
+  return {
+    customer,
+    order: null,
+    messages: [],
+    handoffRequired: false,
+    handoffReason: "Opening flow send is in progress; customer message deferred.",
   };
 }
 
