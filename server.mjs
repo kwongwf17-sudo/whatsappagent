@@ -933,8 +933,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/admin/dashboard-data") {
       const selectedDate = parseSelectedDate(url.searchParams.get("date"));
+      const selectedEndDate = parseSelectedDate(url.searchParams.get("endDate") || url.searchParams.get("date"));
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
-      return sendJson(res, 200, await buildDashboardData(new Date(), selectedDate, adminSession.accountId));
+      return sendJson(res, 200, await buildDashboardData(new Date(), selectedDate, adminSession.accountId, selectedEndDate));
     }
 
     if (req.method === "POST" && url.pathname === "/admin/profile") {
@@ -5353,7 +5354,7 @@ async function saveFollowupRuntimeSettings(businessAccountId = config.accountId,
   }
 }
 
-async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId) {
+async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId, analyticsEndDate = analyticsDate) {
   const content = await getTeamContent(businessAccountId);
   const teamCatalog = content.catalog;
   const [
@@ -5503,7 +5504,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       optedOut: guardrails.optedOut,
       blockedFollowups: guardrails.blockedFollowups,
     },
-    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
+    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, endDate: analyticsEndDate }),
     profile: normalizeDashboardProfile(dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
@@ -5831,10 +5832,15 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
   });
 }
 
-function buildAnalytics({ customers, orders, productById, now }) {
-  const selectedDateCustomers = dailyCustomerRows(customers, orders, now);
+function buildAnalytics({ customers, orders, productById, now, endDate = now }) {
+  const rangeStart = startOfLocalDay(now);
+  const rangeEnd = endOfLocalDay(endDate);
+  if (rangeEnd < rangeStart) {
+    return buildAnalytics({ customers, orders, productById, now: endDate, endDate: now });
+  }
+  const selectedDateCustomers = customerRowsInRange(customers, orders, rangeStart, rangeEnd);
   const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
-  const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
+  const selectedDateOrders = orders.filter((order) => isWithinLocalDateRange(order.createdAt, rangeStart, rangeEnd));
   const selectedDateOrdersFromNewCustomers = selectedDateOrders.filter((order) =>
     selectedDateCustomerIds.has(order.customerId)
   );
@@ -5849,7 +5855,7 @@ function buildAnalytics({ customers, orders, productById, now }) {
     orderProductCounts.set(productName, (orderProductCounts.get(productName) || 0) + 1);
   }
   const totalSales = selectedDateOrders.reduce((sum, order) => sum + orderSalesAmount(order), 0);
-  const productPerformance = buildProductPerformanceAnalytics({ customers, orders, productById, now });
+  const productPerformance = buildProductPerformanceAnalytics({ customers, orders, productById, startDate: rangeStart, endDate: rangeEnd });
   const hourlyCustomerCounts = Array.from({ length: 24 }, (_, hour) => ({
     hour,
     label: `${String(hour).padStart(2, "0")}:00`,
@@ -5873,7 +5879,11 @@ function buildAnalytics({ customers, orders, productById, now }) {
   });
 
   return {
-    date: formatLocalDate(now),
+    date: formatLocalDate(rangeStart),
+    endDate: formatLocalDate(rangeEnd),
+    dateLabel: formatLocalDate(rangeStart) === formatLocalDate(rangeEnd)
+      ? formatLocalDate(rangeStart)
+      : `${formatLocalDate(rangeStart)} to ${formatLocalDate(rangeEnd)}`,
     totalNewCustomersToday: selectedDateCustomers.length,
     totalOrdersFromNewCustomersToday: selectedDateOrdersFromNewCustomers.length,
     totalOrdersToday: selectedDateOrders.length,
@@ -5893,11 +5903,9 @@ function buildAnalytics({ customers, orders, productById, now }) {
   };
 }
 
-function buildProductPerformanceAnalytics({ customers = [], orders = [], productById = new Map(), now = new Date() }) {
-  const nowTime = now.getTime();
-  const startToday = startOfLocalDay(now).getTime();
-  const start7Days = startOfLocalDay(addLocalDays(now, -6)).getTime();
-  const start30Days = startOfLocalDay(addLocalDays(now, -29)).getTime();
+function buildProductPerformanceAnalytics({ customers = [], orders = [], productById = new Map(), startDate = new Date(), endDate = new Date() }) {
+  const startTime = startOfLocalDay(startDate).getTime();
+  const endTime = endOfLocalDay(endDate).getTime();
   const productRows = new Map();
   const rowForProduct = (productId) => {
     const id = String(productId || "").trim();
@@ -5906,9 +5914,7 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
       productRows.set(key, {
         productId: id,
         product: productById.get(id)?.name || id || "Unknown product",
-        leadsToday: 0,
-        leads7Days: 0,
-        leads30Days: 0,
+        leads: 0,
         engaged: 0,
         noReply: 0,
         orders: 0,
@@ -5920,11 +5926,8 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
   for (const customer of customers) {
     const row = rowForProduct(customer.productId);
     const firstSeen = new Date(customer.firstSeenAt || 0).getTime();
-    if (Number.isFinite(firstSeen) && firstSeen >= start30Days && firstSeen <= nowTime) {
-      row.leads30Days += 1;
-    }
-    if (Number.isFinite(firstSeen) && firstSeen >= start7Days && firstSeen <= nowTime) row.leads7Days += 1;
-    if (Number.isFinite(firstSeen) && firstSeen >= startToday && firstSeen <= nowTime) row.leadsToday += 1;
+    if (!Number.isFinite(firstSeen) || firstSeen < startTime || firstSeen > endTime) continue;
+    row.leads += 1;
     if (Number(customer.inboundCount || 0) > 1 || ["engaged", "pendingOrder"].includes(customer.label || customer.conversationState)) {
       row.engaged += 1;
     } else if (!(customer.orderIds || []).length) {
@@ -5933,18 +5936,17 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
   }
 
   for (const order of orders) {
+    if (!isWithinLocalDateRange(order.createdAt, startDate, endDate)) continue;
     rowForProduct(order.productId).orders += 1;
   }
 
   const rows = [...productRows.values()]
-    .sort((left, right) => right.leads30Days - left.leads30Days || right.orders - left.orders || left.product.localeCompare(right.product));
+    .sort((left, right) => right.leads - left.leads || right.orders - left.orders || left.product.localeCompare(right.product));
 
   return {
     products: rows.map((row) => ({
       product: row.product,
-      leadsToday: row.leadsToday,
-      leads7Days: row.leads7Days,
-      leads30Days: row.leads30Days,
+      leads: row.leads,
       engaged: row.engaged,
       noReply: row.noReply,
       orders: row.orders,
@@ -5961,6 +5963,18 @@ function dailyCustomerRows(customers = [], orders = [], now = new Date()) {
   );
   return customers.filter((customer) =>
     isSameLocalDate(customer.firstSeenAt, now) || orderCustomerIds.has(customer.id)
+  );
+}
+
+function customerRowsInRange(customers = [], orders = [], startDate = new Date(), endDate = startDate) {
+  const orderCustomerIds = new Set(
+    orders
+      .filter((order) => isWithinLocalDateRange(order.createdAt, startDate, endDate))
+      .map((order) => order.customerId)
+      .filter(Boolean)
+  );
+  return customers.filter((customer) =>
+    isWithinLocalDateRange(customer.firstSeenAt, startDate, endDate) || orderCustomerIds.has(customer.id)
   );
 }
 
@@ -6091,6 +6105,11 @@ function startOfLocalDay(value) {
   return followupZonedLocalToDate({ year: parts.year, month: parts.month, day: parts.day, hour: 0, minute: 0, second: 0, millisecond: 0 });
 }
 
+function endOfLocalDay(value) {
+  const parts = followupZonedDateParts(value instanceof Date ? value : new Date(value));
+  return followupZonedLocalToDate({ year: parts.year, month: parts.month, day: parts.day, hour: 23, minute: 59, second: 59, millisecond: 999 });
+}
+
 function addHours(value, hours) {
   const date = value instanceof Date ? new Date(value) : new Date(value);
   date.setHours(date.getHours() + hours);
@@ -6140,6 +6159,14 @@ function testScenario(index) {
 function isSameLocalDate(value, now) {
   if (!value) return false;
   return formatLocalDate(new Date(value)) === formatLocalDate(now);
+}
+
+function isWithinLocalDateRange(value, startDate, endDate) {
+  if (!value) return false;
+  const time = new Date(value).getTime();
+  const start = startOfLocalDay(startDate).getTime();
+  const end = endOfLocalDay(endDate).getTime();
+  return Number.isFinite(time) && time >= start && time <= end;
 }
 
 function parseSelectedDate(value) {
@@ -15580,7 +15607,8 @@ function analyticsPageHtml() {
   </nav>
   <main>
     <div class="filterbar">
-      <label for="analytics-date">Analytics Date <input id="analytics-date" type="date" /></label>
+      <label for="analytics-date">Start Date <input id="analytics-date" type="date" /></label>
+      <label for="analytics-end-date">End Date <input id="analytics-end-date" type="date" /></label>
     </div>
     <div class="summary" id="analytics-summary"></div>
     <div class="charts">
@@ -15594,16 +15622,16 @@ function analyticsPageHtml() {
       </section>
     </div>
     <section>
-      <h2>Product Performance</h2>
-      <div class="table-wrap" id="product-performance"></div>
-    </section>
-    <section>
       <h2>New Customers By Product</h2>
       <div class="table-wrap" id="new-customers-by-product"></div>
     </section>
     <section>
       <h2>New Orders By Product</h2>
       <div class="table-wrap" id="new-orders-by-product"></div>
+    </section>
+    <section>
+      <h2>Product Performance</h2>
+      <div class="table-wrap" id="product-performance"></div>
     </section>
   </main>
   <script>
@@ -15645,10 +15673,12 @@ function analyticsPageHtml() {
     }
     async function loadAnalytics() {
       const selectedDate = document.querySelector('#analytics-date').value || localDateInput(new Date());
-      const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
+      const selectedEndDate = document.querySelector('#analytics-end-date').value || selectedDate;
+      const params = new URLSearchParams({ date: selectedDate, endDate: selectedEndDate });
+      const response = await fetch('/admin/dashboard-data?' + params.toString());
       const data = await response.json();
       const analytics = data.analytics;
-      document.querySelector('#generated').textContent = 'Date ' + analytics.date + ' | Generated ' + fmtTime(data.generatedAt);
+      document.querySelector('#generated').textContent = 'Date ' + (analytics.dateLabel || analytics.date) + ' | Generated ' + fmtTime(data.generatedAt);
       const metrics = [
         ['New Customers', analytics.totalNewCustomersToday],
         ['Total Orders', analytics.totalOrdersToday],
@@ -15668,9 +15698,7 @@ function analyticsPageHtml() {
       const performance = analytics.productPerformance || {};
       document.querySelector('#product-performance').innerHTML = table(performance.products || [], [
         { label: 'Product', key: 'product' },
-        { label: 'Leads Today', key: 'leadsToday' },
-        { label: 'Leads 7D', key: 'leads7Days' },
-        { label: 'Leads 30D', key: 'leads30Days' },
+        { label: 'Leads', key: 'leads' },
         { label: 'Engaged', key: 'engaged' },
         { label: 'No Reply', key: 'noReply' },
         { label: 'Orders', key: 'orders' }
@@ -15685,7 +15713,9 @@ function analyticsPageHtml() {
       ]);
     }
     document.querySelector('#analytics-date').value = localDateInput(new Date());
+    document.querySelector('#analytics-end-date').value = localDateInput(new Date());
     document.querySelector('#analytics-date').addEventListener('change', loadAnalytics);
+    document.querySelector('#analytics-end-date').addEventListener('change', loadAnalytics);
     document.querySelector('#refresh').addEventListener('click', loadAnalytics);
     loadAnalytics();
     setInterval(loadAnalytics, 15000);
