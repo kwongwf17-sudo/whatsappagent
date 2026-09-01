@@ -5365,7 +5365,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allFollowupQueue,
     orderStatusReplies,
     allComplaintCases,
-    allAuditEvents,
   ] = await Promise.all([
     store.listCustomers(analyticsDate, businessAccountId),
     store.listDeletedCustomers(businessAccountId),
@@ -5375,7 +5374,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
-    store.listAuditLog(),
   ]);
   const belongsToBusiness = (item) => (item.businessAccountId || config.accountId) === businessAccountId;
   const belongsToDashboard = (item) =>
@@ -5389,7 +5387,6 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
   const orders = allOrders.filter(belongsToDashboardOrder);
   const followupQueue = allFollowupQueue.filter(belongsToDashboard);
   const complaintCases = allComplaintCases.filter(belongsToDashboard);
-  const auditEvents = allAuditEvents.filter((event) => (event.businessAccountId || config.accountId) === businessAccountId);
   const customerIds = new Set(customers.map((customer) => customer.id));
   const outbox = allOutbox.filter((message) =>
     !isDemoEnvironmentCustomerId(message.from) &&
@@ -5506,7 +5503,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       optedOut: guardrails.optedOut,
       blockedFollowups: guardrails.blockedFollowups,
     },
-    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog, auditEvents }),
+    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
     profile: normalizeDashboardProfile(dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
@@ -5834,7 +5831,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
   });
 }
 
-function buildAnalytics({ customers, orders, productById, now, catalog: activeCatalog = catalog, auditEvents = [] }) {
+function buildAnalytics({ customers, orders, productById, now }) {
   const selectedDateCustomers = dailyCustomerRows(customers, orders, now);
   const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
   const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
@@ -5852,7 +5849,7 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
     orderProductCounts.set(productName, (orderProductCounts.get(productName) || 0) + 1);
   }
   const totalSales = selectedDateOrders.reduce((sum, order) => sum + orderSalesAmount(order), 0);
-  const productPerformance = buildProductPerformanceAnalytics({ customers, orders, productById, now, auditEvents });
+  const productPerformance = buildProductPerformanceAnalytics({ customers, orders, productById, now });
   const hourlyCustomerCounts = Array.from({ length: 24 }, (_, hour) => ({
     hour,
     label: `${String(hour).padStart(2, "0")}:00`,
@@ -5896,13 +5893,12 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
   };
 }
 
-function buildProductPerformanceAnalytics({ customers = [], orders = [], productById = new Map(), now = new Date(), auditEvents = [] }) {
+function buildProductPerformanceAnalytics({ customers = [], orders = [], productById = new Map(), now = new Date() }) {
   const nowTime = now.getTime();
   const startToday = startOfLocalDay(now).getTime();
   const start7Days = startOfLocalDay(addLocalDays(now, -6)).getTime();
   const start30Days = startOfLocalDay(addLocalDays(now, -29)).getTime();
   const productRows = new Map();
-  const customerById = new Map(customers.map((customer) => [customer.id, customer]));
   const rowForProduct = (productId) => {
     const id = String(productId || "").trim();
     const key = id || "unknown";
@@ -5916,10 +5912,6 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
         engaged: 0,
         noReply: 0,
         orders: 0,
-        sourceCounts: {},
-        objectionCounts: objectionMetricSeed(),
-        faqCounts: {},
-        productQuestionCounts: {},
       });
     }
     return productRows.get(key);
@@ -5930,7 +5922,6 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
     const firstSeen = new Date(customer.firstSeenAt || 0).getTime();
     if (Number.isFinite(firstSeen) && firstSeen >= start30Days && firstSeen <= nowTime) {
       row.leads30Days += 1;
-      row.sourceCounts[leadSourceLabel(customer)] = (row.sourceCounts[leadSourceLabel(customer)] || 0) + 1;
     }
     if (Number.isFinite(firstSeen) && firstSeen >= start7Days && firstSeen <= nowTime) row.leads7Days += 1;
     if (Number.isFinite(firstSeen) && firstSeen >= startToday && firstSeen <= nowTime) row.leadsToday += 1;
@@ -5939,36 +5930,13 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
     } else if (!(customer.orderIds || []).length) {
       row.noReply += 1;
     }
-    const objection = normalizeSalesIntent(customer.lastSalesReplyIntent || customer.salesReplyIntent || customer.salesStatus || "");
-    if (row.objectionCounts[objection] !== undefined) row.objectionCounts[objection] += 1;
   }
 
   for (const order of orders) {
     rowForProduct(order.productId).orders += 1;
   }
 
-  for (const event of auditEvents) {
-    const parsed = parseRouteAuditResult(event.result);
-    if (!parsed) continue;
-    const customer = customerById.get(event.customerId);
-    const row = rowForProduct(customer?.productId || event.productId || "");
-    if (parsed.type === "sales_reply" && row.objectionCounts[parsed.intent] !== undefined) {
-      row.objectionCounts[parsed.intent] += 1;
-    } else if (parsed.type === "general_faq") {
-      row.faqCounts[parsed.intent] = (row.faqCounts[parsed.intent] || 0) + 1;
-    } else if (parsed.type === "product_question") {
-      row.productQuestionCounts[parsed.intent] = (row.productQuestionCounts[parsed.intent] || 0) + 1;
-    }
-  }
-
   const rows = [...productRows.values()]
-    .map((row) => ({
-      ...row,
-      topSource: topMetricLabel(row.sourceCounts),
-      topObjection: topMetricLabel(row.objectionCounts),
-      topFaq: topMetricLabel(row.faqCounts),
-      topProductQuestion: topMetricLabel(row.productQuestionCounts),
-    }))
     .sort((left, right) => right.leads30Days - left.leads30Days || right.orders - left.orders || left.product.localeCompare(right.product));
 
   return {
@@ -5980,61 +5948,8 @@ function buildProductPerformanceAnalytics({ customers = [], orders = [], product
       engaged: row.engaged,
       noReply: row.noReply,
       orders: row.orders,
-      topSource: row.topSource,
-      topObjection: row.topObjection,
-      topFaq: row.topFaq,
-      topProductQuestion: row.topProductQuestion,
     })),
-    sources: rows.flatMap((row) => metricEntries(row.sourceCounts).map((entry) => ({ product: row.product, source: entry.label, count: entry.count }))).slice(0, 30),
-    objections: rows.map((row) => ({
-      product: row.product,
-      tooExpensive: row.objectionCounts.too_expensive,
-      paydayBudget: row.objectionCounts.payday_only_pay,
-      thinkingFirst: row.objectionCounts.thinking_first,
-      notInterested: row.objectionCounts.not_interested,
-      anotherDate: row.objectionCounts.another_date_purchase,
-      discountNegotiation: row.objectionCounts.price_objection_negotiation,
-    })),
-    faqs: rows.flatMap((row) => metricEntries(row.faqCounts).map((entry) => ({ product: row.product, question: entry.label, count: entry.count }))).slice(0, 30),
-    productQuestions: rows.flatMap((row) => metricEntries(row.productQuestionCounts).map((entry) => ({ product: row.product, question: entry.label, count: entry.count }))).slice(0, 30),
   };
-}
-
-function objectionMetricSeed() {
-  return {
-    too_expensive: 0,
-    payday_only_pay: 0,
-    thinking_first: 0,
-    not_interested: 0,
-    another_date_purchase: 0,
-    price_objection_negotiation: 0,
-  };
-}
-
-function leadSourceLabel(customer = {}) {
-  const source = customer.source || {};
-  return source.adSourceApp || source.adSourceType || source.transport || (source.adId ? "ad" : "direct");
-}
-
-function parseRouteAuditResult(result = "") {
-  const parts = String(result || "").split(":");
-  if (parts.length < 2) return null;
-  if (["sales_reply", "general_faq", "product_question"].includes(parts[0])) {
-    return { type: parts[0], intent: parts[1] || "" };
-  }
-  return null;
-}
-
-function metricEntries(counts = {}) {
-  return Object.entries(counts)
-    .filter(([, count]) => Number(count || 0) > 0)
-    .map(([label, count]) => ({ label: readableStorageLabel(label), count: Number(count || 0) }))
-    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
-}
-
-function topMetricLabel(counts = {}) {
-  const [entry] = metricEntries(counts);
-  return entry ? `${entry.label} (${entry.count})` : "-";
 }
 
 function dailyCustomerRows(customers = [], orders = [], now = new Date()) {
@@ -15683,22 +15598,6 @@ function analyticsPageHtml() {
       <div class="table-wrap" id="product-performance"></div>
     </section>
     <section>
-      <h2>Leads By Product Source</h2>
-      <div class="table-wrap" id="leads-by-source"></div>
-    </section>
-    <section>
-      <h2>Objection Metrics By Product</h2>
-      <div class="table-wrap" id="objections-by-product"></div>
-    </section>
-    <section>
-      <h2>Top General FAQs By Product</h2>
-      <div class="table-wrap" id="faqs-by-product"></div>
-    </section>
-    <section>
-      <h2>Top Product Questions</h2>
-      <div class="table-wrap" id="product-questions"></div>
-    </section>
-    <section>
       <h2>New Customers By Product</h2>
       <div class="table-wrap" id="new-customers-by-product"></div>
     </section>
@@ -15774,35 +15673,7 @@ function analyticsPageHtml() {
         { label: 'Leads 30D', key: 'leads30Days' },
         { label: 'Engaged', key: 'engaged' },
         { label: 'No Reply', key: 'noReply' },
-        { label: 'Orders', key: 'orders' },
-        { label: 'Top Source', key: 'topSource' },
-        { label: 'Top Objection', key: 'topObjection' },
-        { label: 'Top FAQ', key: 'topFaq' },
-        { label: 'Top Product Question', key: 'topProductQuestion' }
-      ]);
-      document.querySelector('#leads-by-source').innerHTML = table(performance.sources || [], [
-        { label: 'Product', key: 'product' },
-        { label: 'Source', key: 'source' },
-        { label: 'Leads 30D', key: 'count' }
-      ]);
-      document.querySelector('#objections-by-product').innerHTML = table(performance.objections || [], [
-        { label: 'Product', key: 'product' },
-        { label: 'Too Expensive', key: 'tooExpensive' },
-        { label: 'Payday / Budget', key: 'paydayBudget' },
-        { label: 'Thinking First', key: 'thinkingFirst' },
-        { label: 'Not Interested', key: 'notInterested' },
-        { label: 'Another Date', key: 'anotherDate' },
-        { label: 'Discount / Negotiation', key: 'discountNegotiation' }
-      ]);
-      document.querySelector('#faqs-by-product').innerHTML = table(performance.faqs || [], [
-        { label: 'Product', key: 'product' },
-        { label: 'FAQ Topic', key: 'question' },
-        { label: 'Count', key: 'count' }
-      ]);
-      document.querySelector('#product-questions').innerHTML = table(performance.productQuestions || [], [
-        { label: 'Product', key: 'product' },
-        { label: 'Question Type', key: 'question' },
-        { label: 'Count', key: 'count' }
+        { label: 'Orders', key: 'orders' }
       ]);
       document.querySelector('#new-customers-by-product').innerHTML = table(analytics.newCustomersByProductToday, [
         { label: 'Product', key: 'product' },
