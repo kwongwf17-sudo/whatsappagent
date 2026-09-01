@@ -1523,16 +1523,7 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
     if (req.method === "GET" && url.pathname === "/admin/analytics") {
       return sendHtml(res, 200, analyticsPageHtml());
     }
-
-    if (req.method === "GET" && url.pathname === "/admin/compliance") {
-      return sendHtml(res, 200, compliancePageHtml());
-    }
-
-    if (req.method === "GET" && url.pathname === "/admin/compliance-data") {
-      return sendJson(res, 200, await buildComplianceData());
-    }
-
-    if (req.method === "GET" && url.pathname === "/admin/customer/export") {
+if (req.method === "GET" && url.pathname === "/admin/customer/export") {
       const customerId = url.searchParams.get("customerId") || "";
       if (!customerId) return sendText(res, 400, "Missing customerId");
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
@@ -7851,9 +7842,7 @@ function whatsappWebStatusHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -8011,7 +8000,6 @@ function whatsappWebStatusHtml() {
       state.textContent = "QR session started. Scan within the expiry window.";
       loadStatus();
     }
-    document.querySelector("#refresh").addEventListener("click", loadStatus);
     document.querySelector("#start-qr").addEventListener("click", startQr);
     document.querySelector("#pair").addEventListener("click", requestPairingCode);
     document.querySelector("#disconnect").addEventListener("click", disconnectWhatsApp);
@@ -10092,7 +10080,6 @@ function orderAdminDashboardHtml() {
   </header>
   <nav>
     <form method="post" action="/order-admin/logout" style="margin:0"><button type="submit">Logout</button></form>
-    <button id="refresh" type="button">Refresh</button>
   </nav>
   <main>
     <div class="summary" id="summary"></div>
@@ -10242,7 +10229,6 @@ function orderAdminDashboardHtml() {
       document.querySelectorAll("button[data-filter]").forEach(item => item.classList.toggle("active", item.dataset.filter === "all"));
       render();
     });
-    document.querySelector("#refresh").addEventListener("click", loadOrders);
     loadOrders();
     setInterval(loadOrders, 15000);
   </script>
@@ -10336,7 +10322,6 @@ function superAdminAccountsHtml() {
     <a href="/superadmin/system">System Management</a>
     <a href="/admin/dashboard">Business Dashboard</a>
     <form method="post" action="/superadmin/logout" style="margin:0"><button type="submit">Logout</button></form>
-    <button id="refresh" type="button">Refresh</button>
   </nav>
   <main>
     <section>
@@ -10429,7 +10414,6 @@ function superAdminAccountsHtml() {
       }
     });
     document.querySelector("#cancel-reset").addEventListener("click", () => document.querySelector("#reset-panel").classList.remove("open"));
-    document.querySelector("#refresh").addEventListener("click", loadAccounts);
     loadAccounts();
   </script>
 </body>
@@ -10498,7 +10482,6 @@ function superAdminSystemHtml() {
     <a href="/superadmin/accounts">Accounts</a>
     <a href="/admin/dashboard">Business Dashboard</a>
     <form method="post" action="/superadmin/logout" style="margin:0"><button type="submit">Logout</button></form>
-    <button id="refresh" type="button">Refresh</button>
   </nav>
   <main>
     <div class="summary" id="summary"></div>
@@ -10801,7 +10784,6 @@ function superAdminSystemHtml() {
       }
     });
     document.querySelector("#team-settings-form").addEventListener("submit", saveTeamSettings);
-    document.querySelector("#refresh").addEventListener("click", load);
     load();
     setInterval(load, 15000);
   </script>
@@ -11257,9 +11239,7 @@ function adminDashboardHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <button id="profile-nav" type="button">Profile</button>
   </nav>
   <main>
@@ -12223,7 +12203,6 @@ function adminDashboardHtml() {
     }
 
     document.querySelector("#profile-form").addEventListener("submit", saveProfile);
-    document.querySelector('#refresh').addEventListener('click', loadDashboard);
     document.querySelector("#profile-nav").addEventListener("click", () => openDashboardTab("profile"));
     document.querySelectorAll('.tab').forEach(button => {
       button.addEventListener('click', () => openDashboardTab(button.dataset.tab));
@@ -12306,9 +12285,7 @@ function adminChatPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -12520,7 +12497,6 @@ function adminChatPageHtml() {
         document.querySelector("#status").textContent = error.message;
       });
     });
-    document.querySelector("#refresh").addEventListener("click", load);
     load().catch(error => {
       document.querySelector("#status").textContent = error.message;
     });
@@ -12594,9 +12570,7 @@ function replyLibraryPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -12885,7 +12859,6 @@ function replyLibraryPageHtml() {
     document.querySelector("#faq-form").addEventListener("submit", saveFaq);
     document.querySelector("#sales-form").addEventListener("submit", saveSales);
     document.querySelector("#order-form-followup-form").addEventListener("submit", saveOrderFormFollowups);
-    document.querySelector("#refresh").addEventListener("click", () => { loadFaq(); loadSales(); });
     Promise.all([loadFaq(), loadSales()]).then(() => { newFaq(); newSales(); document.querySelector("#page-state").textContent = "General replies ready"; }).catch(error => { document.querySelector("#page-state").textContent = error.message; });
   </script>
 </body>
@@ -12953,9 +12926,7 @@ function faqLibraryPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -13398,10 +13369,6 @@ function faqLibraryPageHtml() {
     document.querySelector("#sales-reply-form").addEventListener("submit", saveSalesReply);
 
     document.querySelector("#faq-form").addEventListener("submit", saveFaq);
-    document.querySelector("#refresh").addEventListener("click", function() {
-      loadLibrary();
-      loadSalesLibrary();
-    });
     loadLibrary().then(function() { newFaq("general"); }).catch(function(error) {
       document.querySelector("#page-state").textContent = error.message;
     });
@@ -13472,9 +13439,7 @@ function salesRepliesPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -13706,7 +13671,6 @@ function salesRepliesPageHtml() {
     document.querySelector("#new-product-reply").addEventListener("click", function() { newReply("product"); });
     document.querySelector("#new-general-reply").addEventListener("click", function() { newReply("general"); });
     document.querySelector("#reply-form").addEventListener("submit", saveReply);
-    document.querySelector("#refresh").addEventListener("click", loadLibrary);
     loadLibrary().then(function() { newReply("general"); }).catch(function(error) {
       document.querySelector("#page-state").textContent = error.message;
     });
@@ -13775,9 +13739,7 @@ function followupSettingsPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -14174,7 +14136,6 @@ function followupSettingsPageHtml() {
     }
     document.querySelector("#save-followups").addEventListener("click", save);
     document.querySelector("#add-followup-row").addEventListener("click", addFollowupRow);
-    document.querySelector("#refresh").addEventListener("click", load);
     load();
   </script>
 </body>
@@ -14341,9 +14302,7 @@ function productFlowPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -15454,7 +15413,6 @@ function productFlowPageHtml() {
       ];
       renderOrderOptions();
     });
-    document.querySelector("#refresh").addEventListener("click", () => loadProducts(selectedProduct && selectedProduct.id));
     loadProducts();
   </script>
 </body>
@@ -15600,9 +15558,7 @@ function analyticsPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
     <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
@@ -15716,7 +15672,6 @@ function analyticsPageHtml() {
     document.querySelector('#analytics-end-date').value = localDateInput(new Date());
     document.querySelector('#analytics-date').addEventListener('change', loadAnalytics);
     document.querySelector('#analytics-end-date').addEventListener('change', loadAnalytics);
-    document.querySelector('#refresh').addEventListener('click', loadAnalytics);
     loadAnalytics();
     setInterval(loadAnalytics, 15000);
   </script>
@@ -15768,8 +15723,6 @@ function aiSuggestionsPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
-    <button id="refresh" type="button">Refresh</button>
   </nav>
   <main>
     <section>
@@ -15847,215 +15800,7 @@ function aiSuggestionsPageHtml() {
       document.querySelector("#state").textContent = "Pending suggestions: " + data.count;
       render(data.pending || []);
     }
-    document.querySelector("#refresh").addEventListener("click", load);
     load().catch(error => { document.querySelector("#state").textContent = error.message; });
-  </script>
-</body>
-</html>`;
-}
-
-function compliancePageHtml() {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Compliance & Security</title>
-  <style>
-    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #ffffff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; }
-    body { margin: 0; background: #f5f5f7; }
-    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); color: #1d1d1f; border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
-    h1 { margin: 0; font-size: 20px; }
-    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
-    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
-    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font-weight: 600; cursor: pointer; }
-    nav a:hover, button:hover { border-color: #a8a8ad; }
-    main { padding: 22px; display: grid; gap: 18px; }
-    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
-    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
-    .content { padding: 14px; }
-    .tool-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 8px; align-items: start; }
-    input { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; }
-    input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
-    pre { white-space: pre-wrap; word-break: break-word; background: #f5f5f7; padding: 12px; border-radius: 8px; max-height: 320px; overflow: auto; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 9px 10px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; }
-    th { background: var(--surface-soft); color: #6e6e73; font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
-    .danger { color: #9b1c12; }
-    .muted { color: var(--muted); }
-    @media (max-width: 720px) { .tool-row { grid-template-columns: 1fr; } }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Compliance & Security</h1>
-    <div class="sub" id="generated">Loading compliance status...</div>
-  </header>
-  <nav>
-    <a href="/admin/dashboard">Dashboard</a>
-    <a href="/admin/chat">Chat Inbox</a>
-    <a href="/admin/whatsapp-web">WhatsApp Web</a>
-    <a href="/admin/analytics">Analytics</a>
-    <a href="/admin/ai-suggestions">AI Suggestions</a>
-    <a href="/admin/reply-library">Reply Library</a>
-    <a href="/admin/product-flow">Product Flow</a>
-    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-    <a href="/admin/compliance">Compliance</a>
-    <a href="/demo/chat">Customer Demo</a>
-    <button id="refresh" type="button">Refresh</button>
-    <a href="/admin/dashboard?tab=profile">Profile</a>
-  </nav>
-  <main>
-    <section>
-      <h2>Customer Data Tools</h2>
-      <div class="content">
-        <div class="tool-row">
-          <input id="customer-id" placeholder="Customer WhatsApp ID" />
-          <button id="export-customer" type="button">Export Customer Data</button>
-          <button id="delete-customer" class="danger" type="button">Delete Customer</button>
-        </div>
-        <p class="muted">Deletion moves the customer out of active customers and records the action in the audit log.</p>
-        <pre id="customer-result">No customer action yet.</pre>
-      </div>
-    </section>
-    <section>
-      <h2>Reset Demo Data</h2>
-      <div class="content">
-        <p class="muted">Use this before a fresh test. It clears demo customers, orders, message logs, deleted customers, and writes an audit event.</p>
-        <button id="reset-demo" class="danger" type="button">Reset Demo Data</button>
-      </div>
-    </section>
-    <section>
-      <h2>Generate Test Customers</h2>
-      <div class="content">
-        <p class="muted">Creates local simulated customers only. No real WhatsApp messages are sent.</p>
-        <div class="tool-row">
-          <input id="test-customer-count" type="number" min="1" max="500" value="100" />
-          <button id="generate-test-customers" type="button">Generate Test Customers</button>
-        </div>
-      </div>
-    </section>
-    <section><h2>Data Retention Policy</h2><div class="content" id="retention"></div></section>
-    <section><h2>Automation Guardrails</h2><div class="content" id="automation-guardrails"></div></section>
-    <section><h2>WhatsApp Go-Live Readiness</h2><div class="content" id="whatsapp-readiness"></div></section>
-    <section><h2>Security Checklist</h2><div class="content" id="security"></div></section>
-    <section><h2>Privacy Notice Template</h2><div class="content" id="privacy"></div></section>
-    <section><h2>Human Handoff Rules</h2><div class="content" id="handoff-rules"></div></section>
-    <section><h2>Audit Log</h2><div class="content" id="audit-log"></div></section>
-  </main>
-  <script>
-    function esc(value) {
-      return String(value ?? "").replace(/[&<>"']/g, function(ch) {
-        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
-      });
-    }
-    function fmtTime(value) {
-      if (!value) return "";
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return esc(value);
-      return date.toLocaleString();
-    }
-    function list(items, render) {
-      return '<ul>' + items.map(item => '<li>' + render(item) + '</li>').join('') + '</ul>';
-    }
-    function table(rows, columns) {
-      if (!rows.length) return '<p class="muted">No records yet.</p>';
-      return '<table><thead><tr>' + columns.map(c => '<th>' + esc(c.label) + '</th>').join('') +
-        '</tr></thead><tbody>' + rows.map(row => '<tr>' + columns.map(c => '<td>' + (c.render ? c.render(row) : esc(row[c.key])) + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
-    }
-    async function loadCompliance() {
-      const response = await fetch('/admin/compliance-data');
-      const data = await response.json();
-      document.querySelector('#generated').textContent = 'Generated ' + fmtTime(data.generatedAt);
-      document.querySelector('#retention').innerHTML = table(data.retentionPolicy, [
-        { label: 'Data', key: 'item' },
-        { label: 'Rule', key: 'rule' }
-      ]);
-      document.querySelector('#automation-guardrails').innerHTML = table(data.automationGuardrails, [
-        { label: 'Guardrail', key: 'item' },
-        { label: 'Status', key: 'status' }
-      ]);
-      document.querySelector('#whatsapp-readiness').innerHTML = table(data.whatsappReadiness, [
-        { label: 'Launch Item', key: 'item' },
-        { label: 'Status', key: 'status' }
-      ]);
-      document.querySelector('#security').innerHTML = table(data.securityChecklist, [
-        { label: 'Security Item', key: 'item' },
-        { label: 'Status', key: 'status' }
-      ]);
-      document.querySelector('#privacy').innerHTML = list(data.privacyNotice, item => esc(item));
-      document.querySelector('#handoff-rules').innerHTML = list(data.handoffRules, item => esc(item));
-      document.querySelector('#audit-log').innerHTML = table(data.auditLog, [
-        { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
-        { label: 'Actor', key: 'actor' },
-        { label: 'Action', key: 'action' },
-        { label: 'Customer', key: 'customerId' },
-        { label: 'Result', key: 'result' },
-        { label: 'Reason', key: 'reason' }
-      ]);
-    }
-    async function exportCustomer() {
-      const customerId = document.querySelector('#customer-id').value.trim();
-      if (!customerId) return;
-      const response = await fetch('/admin/customer/export?customerId=' + encodeURIComponent(customerId));
-      const data = await response.json();
-      document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
-      loadCompliance();
-    }
-    async function deleteCustomer() {
-      const customerId = document.querySelector('#customer-id').value.trim();
-      if (!customerId) return;
-      const reason = 'Manual deletion from compliance page';
-      const response = await fetch('/admin/customer/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customerId, reason })
-      });
-      const data = await response.json();
-      document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
-      loadCompliance();
-    }
-    async function resetDemoData() {
-      const ok = confirm('Reset all demo customers, orders, deleted customers, message logs, and audit log?');
-      if (!ok) return;
-      const response = await fetch('/admin/reset-demo-data', { method: 'POST' });
-      const data = await response.json();
-      document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
-      loadCompliance();
-    }
-    async function generateTestCustomers() {
-      const count = Number(document.querySelector('#test-customer-count').value || 100);
-      const button = document.querySelector('#generate-test-customers');
-      button.disabled = true;
-      button.textContent = 'Generating...';
-      document.querySelector('#customer-result').textContent = 'Generating ' + count + ' simulated customer(s)...';
-      try {
-        const response = await fetch('/admin/generate-test-customers', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ count })
-        });
-        const text = await response.text();
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = { ok: false, status: response.status, error: text || 'Unexpected empty response' };
-        }
-        document.querySelector('#customer-result').textContent = JSON.stringify(data, null, 2);
-        loadCompliance();
-      } finally {
-        button.disabled = false;
-        button.textContent = 'Generate Test Customers';
-      }
-    }
-    document.querySelector('#refresh').addEventListener('click', loadCompliance);
-    document.querySelector('#export-customer').addEventListener('click', exportCustomer);
-    document.querySelector('#delete-customer').addEventListener('click', deleteCustomer);
-    document.querySelector('#reset-demo').addEventListener('click', resetDemoData);
-    document.querySelector('#generate-test-customers').addEventListener('click', generateTestCustomers);
-    loadCompliance();
-    setInterval(loadCompliance, 15000);
   </script>
 </body>
 </html>`;
@@ -16283,9 +16028,7 @@ async function demoChatHtml(contentAccountId = config.accountId) {
       <a href="/admin/reply-library">Reply Library</a>
       <a href="/admin/product-flow">Product Flow</a>
       <a href="/admin/follow-up-settings">Follow-Up Settings</a>
-      <a href="/admin/compliance">Compliance</a>
       <a href="/demo/chat">Customer Demo</a>
-      <button id="refresh" type="button">Refresh</button>
       <a href="/admin/dashboard?tab=profile">Profile</a>
     </nav>
   <main>
@@ -16491,7 +16234,6 @@ async function demoChatHtml(contentAccountId = config.accountId) {
     productSelect.addEventListener("change", () => {
       switchDemoProduct(productSelect.value);
     });
-    document.querySelector("#refresh").addEventListener("click", () => window.location.reload());
 
     async function runFollowup(now, label) {
       const response = await fetch("/demo/followups/run", {
