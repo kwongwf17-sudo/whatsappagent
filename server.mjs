@@ -39,6 +39,7 @@ import {
   rerankKnowledgeRecords,
   searchVectorStore,
   selectSalesReply,
+  suggestTemplateImprovement,
 } from "./lib/openai.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
@@ -964,6 +965,54 @@ const server = http.createServer(async (req, res) => {
       return sendHtml(res, 200, adminChatPageHtml());
     }
 
+    if (req.method === "GET" && url.pathname === "/admin/ai-suggestions") {
+      return sendHtml(res, 200, aiSuggestionsPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/ai-suggestions-data") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const content = await getTeamContent(adminSession.accountId);
+      return sendJson(res, 200, aiSuggestionsData(content));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/ai-suggestions/approve") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const content = await getTeamContent(adminSession.accountId);
+        const suggestion = approveAiSuggestion(body, content);
+        await saveTeamContent(adminSession.accountId, content);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "ai_template_suggestion_approved",
+          result: `${suggestion.type}:${suggestion.id}`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, { suggestion, data: aiSuggestionsData(content) });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/ai-suggestions/reject") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const content = await getTeamContent(adminSession.accountId);
+        const suggestion = rejectAiSuggestion(body, content);
+        await saveTeamContent(adminSession.accountId, content);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "ai_template_suggestion_rejected",
+          result: `${suggestion.type}:${suggestion.id}`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, { suggestion, data: aiSuggestionsData(content) });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/admin/whatsapp-web") {
       return sendHtml(res, 200, whatsappWebStatusHtml());
     }
@@ -1145,24 +1194,25 @@ const server = http.createServer(async (req, res) => {
           from: `business_admin:${adminSession.accountId}`,
           businessAccountId: adminSession.accountId,
         });
-        let learnedFaq = null;
+        let templateSuggestion = null;
         try {
-          learnedFaq = await maybeLearnFromManualReply(customer, replyText, adminSession.accountId);
+          templateSuggestion = await maybeSuggestTemplateFromManualReply(customer, replyText, adminSession.accountId);
         } catch (learningError) {
           await recordSystemError("manual_reply_learning", learningError, `Customer: ${customerId}`, adminSession.accountId);
         }
         await store.updateCustomer(customerId, () => ({
           handoffStatus: "",
           handoffReason: "",
-          lastLearnedFaqId: learnedFaq?.id || customer.lastLearnedFaqId || "",
+          lastTemplateSuggestionId: templateSuggestion?.id || customer.lastTemplateSuggestionId || "",
         }), adminSession.accountId);
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
           action: "manual_reply_sent",
           customerId,
-          result: learnedFaq ? `sent_via_whatsapp_api; learned_faq:${learnedFaq.id}` : "sent_via_whatsapp_api",
+          result: templateSuggestion ? `sent_via_whatsapp_api; template_suggestion:${templateSuggestion.id}` : "sent_via_whatsapp_api",
+          businessAccountId: adminSession.accountId,
         });
-        return sendJson(res, 200, { ok: true, customerId, learnedFaq });
+        return sendJson(res, 200, { ok: true, customerId, templateSuggestion });
       } catch (error) {
         const detail = String(error.message || "Unknown send error").trim();
         const failedId = error.failedMessageId || "";
@@ -5315,6 +5365,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     allFollowupQueue,
     orderStatusReplies,
     allComplaintCases,
+    allAuditEvents,
   ] = await Promise.all([
     store.listCustomers(analyticsDate, businessAccountId),
     store.listDeletedCustomers(businessAccountId),
@@ -5324,6 +5375,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     operations.listFollowupQueue(businessAccountId),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
+    store.listAuditLog(),
   ]);
   const belongsToBusiness = (item) => (item.businessAccountId || config.accountId) === businessAccountId;
   const belongsToDashboard = (item) =>
@@ -5337,6 +5389,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
   const orders = allOrders.filter(belongsToDashboardOrder);
   const followupQueue = allFollowupQueue.filter(belongsToDashboard);
   const complaintCases = allComplaintCases.filter(belongsToDashboard);
+  const auditEvents = allAuditEvents.filter((event) => (event.businessAccountId || config.accountId) === businessAccountId);
   const customerIds = new Set(customers.map((customer) => customer.id));
   const outbox = allOutbox.filter((message) =>
     !isDemoEnvironmentCustomerId(message.from) &&
@@ -5453,7 +5506,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       optedOut: guardrails.optedOut,
       blockedFollowups: guardrails.blockedFollowups,
     },
-    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog }),
+    analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, catalog: teamCatalog, auditEvents }),
     profile: normalizeDashboardProfile(dashboardProfile),
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
@@ -5781,7 +5834,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
   });
 }
 
-function buildAnalytics({ customers, orders, productById, now, catalog: activeCatalog = catalog }) {
+function buildAnalytics({ customers, orders, productById, now, catalog: activeCatalog = catalog, auditEvents = [] }) {
   const selectedDateCustomers = dailyCustomerRows(customers, orders, now);
   const selectedDateCustomerIds = new Set(selectedDateCustomers.map((customer) => customer.id));
   const selectedDateOrders = orders.filter((order) => isSameLocalDate(order.createdAt, now));
@@ -5799,7 +5852,7 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
     orderProductCounts.set(productName, (orderProductCounts.get(productName) || 0) + 1);
   }
   const totalSales = selectedDateOrders.reduce((sum, order) => sum + orderSalesAmount(order), 0);
-  const followupPerformance = buildFollowupPerformance(customers, now, activeCatalog);
+  const productPerformance = buildProductPerformanceAnalytics({ customers, orders, productById, now, auditEvents });
   const hourlyCustomerCounts = Array.from({ length: 24 }, (_, hour) => ({
     hour,
     label: `${String(hour).padStart(2, "0")}:00`,
@@ -5838,9 +5891,150 @@ function buildAnalytics({ customers, orders, productById, now, catalog: activeCa
     customerCharts: {
       hourly: hourlyCustomerCounts,
       sevenDays: sevenDayCustomerCounts,
-      followups: followupPerformance,
     },
+    productPerformance,
   };
+}
+
+function buildProductPerformanceAnalytics({ customers = [], orders = [], productById = new Map(), now = new Date(), auditEvents = [] }) {
+  const nowTime = now.getTime();
+  const startToday = startOfLocalDay(now).getTime();
+  const start7Days = startOfLocalDay(addLocalDays(now, -6)).getTime();
+  const start30Days = startOfLocalDay(addLocalDays(now, -29)).getTime();
+  const productRows = new Map();
+  const customerById = new Map(customers.map((customer) => [customer.id, customer]));
+  const rowForProduct = (productId) => {
+    const id = String(productId || "").trim();
+    const key = id || "unknown";
+    if (!productRows.has(key)) {
+      productRows.set(key, {
+        productId: id,
+        product: productById.get(id)?.name || id || "Unknown product",
+        leadsToday: 0,
+        leads7Days: 0,
+        leads30Days: 0,
+        engaged: 0,
+        noReply: 0,
+        orders: 0,
+        sourceCounts: {},
+        objectionCounts: objectionMetricSeed(),
+        faqCounts: {},
+        productQuestionCounts: {},
+      });
+    }
+    return productRows.get(key);
+  };
+
+  for (const customer of customers) {
+    const row = rowForProduct(customer.productId);
+    const firstSeen = new Date(customer.firstSeenAt || 0).getTime();
+    if (Number.isFinite(firstSeen) && firstSeen >= start30Days && firstSeen <= nowTime) {
+      row.leads30Days += 1;
+      row.sourceCounts[leadSourceLabel(customer)] = (row.sourceCounts[leadSourceLabel(customer)] || 0) + 1;
+    }
+    if (Number.isFinite(firstSeen) && firstSeen >= start7Days && firstSeen <= nowTime) row.leads7Days += 1;
+    if (Number.isFinite(firstSeen) && firstSeen >= startToday && firstSeen <= nowTime) row.leadsToday += 1;
+    if (Number(customer.inboundCount || 0) > 1 || ["engaged", "pendingOrder"].includes(customer.label || customer.conversationState)) {
+      row.engaged += 1;
+    } else if (!(customer.orderIds || []).length) {
+      row.noReply += 1;
+    }
+    const objection = normalizeSalesIntent(customer.lastSalesReplyIntent || customer.salesReplyIntent || customer.salesStatus || "");
+    if (row.objectionCounts[objection] !== undefined) row.objectionCounts[objection] += 1;
+  }
+
+  for (const order of orders) {
+    rowForProduct(order.productId).orders += 1;
+  }
+
+  for (const event of auditEvents) {
+    const parsed = parseRouteAuditResult(event.result);
+    if (!parsed) continue;
+    const customer = customerById.get(event.customerId);
+    const row = rowForProduct(customer?.productId || event.productId || "");
+    if (parsed.type === "sales_reply" && row.objectionCounts[parsed.intent] !== undefined) {
+      row.objectionCounts[parsed.intent] += 1;
+    } else if (parsed.type === "general_faq") {
+      row.faqCounts[parsed.intent] = (row.faqCounts[parsed.intent] || 0) + 1;
+    } else if (parsed.type === "product_question") {
+      row.productQuestionCounts[parsed.intent] = (row.productQuestionCounts[parsed.intent] || 0) + 1;
+    }
+  }
+
+  const rows = [...productRows.values()]
+    .map((row) => ({
+      ...row,
+      topSource: topMetricLabel(row.sourceCounts),
+      topObjection: topMetricLabel(row.objectionCounts),
+      topFaq: topMetricLabel(row.faqCounts),
+      topProductQuestion: topMetricLabel(row.productQuestionCounts),
+    }))
+    .sort((left, right) => right.leads30Days - left.leads30Days || right.orders - left.orders || left.product.localeCompare(right.product));
+
+  return {
+    products: rows.map((row) => ({
+      product: row.product,
+      leadsToday: row.leadsToday,
+      leads7Days: row.leads7Days,
+      leads30Days: row.leads30Days,
+      engaged: row.engaged,
+      noReply: row.noReply,
+      orders: row.orders,
+      topSource: row.topSource,
+      topObjection: row.topObjection,
+      topFaq: row.topFaq,
+      topProductQuestion: row.topProductQuestion,
+    })),
+    sources: rows.flatMap((row) => metricEntries(row.sourceCounts).map((entry) => ({ product: row.product, source: entry.label, count: entry.count }))).slice(0, 30),
+    objections: rows.map((row) => ({
+      product: row.product,
+      tooExpensive: row.objectionCounts.too_expensive,
+      paydayBudget: row.objectionCounts.payday_only_pay,
+      thinkingFirst: row.objectionCounts.thinking_first,
+      notInterested: row.objectionCounts.not_interested,
+      anotherDate: row.objectionCounts.another_date_purchase,
+      discountNegotiation: row.objectionCounts.price_objection_negotiation,
+    })),
+    faqs: rows.flatMap((row) => metricEntries(row.faqCounts).map((entry) => ({ product: row.product, question: entry.label, count: entry.count }))).slice(0, 30),
+    productQuestions: rows.flatMap((row) => metricEntries(row.productQuestionCounts).map((entry) => ({ product: row.product, question: entry.label, count: entry.count }))).slice(0, 30),
+  };
+}
+
+function objectionMetricSeed() {
+  return {
+    too_expensive: 0,
+    payday_only_pay: 0,
+    thinking_first: 0,
+    not_interested: 0,
+    another_date_purchase: 0,
+    price_objection_negotiation: 0,
+  };
+}
+
+function leadSourceLabel(customer = {}) {
+  const source = customer.source || {};
+  return source.adSourceApp || source.adSourceType || source.transport || (source.adId ? "ad" : "direct");
+}
+
+function parseRouteAuditResult(result = "") {
+  const parts = String(result || "").split(":");
+  if (parts.length < 2) return null;
+  if (["sales_reply", "general_faq", "product_question"].includes(parts[0])) {
+    return { type: parts[0], intent: parts[1] || "" };
+  }
+  return null;
+}
+
+function metricEntries(counts = {}) {
+  return Object.entries(counts)
+    .filter(([, count]) => Number(count || 0) > 0)
+    .map(([label, count]) => ({ label: readableStorageLabel(label), count: Number(count || 0) }))
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+}
+
+function topMetricLabel(counts = {}) {
+  const [entry] = metricEntries(counts);
+  return entry ? `${entry.label} (${entry.count})` : "-";
 }
 
 function dailyCustomerRows(customers = [], orders = [], now = new Date()) {
@@ -5975,6 +6169,11 @@ function addLocalDays(value, days) {
   const date = value instanceof Date ? new Date(value) : new Date(value);
   date.setDate(date.getDate() + days);
   return date;
+}
+
+function startOfLocalDay(value) {
+  const parts = followupZonedDateParts(value instanceof Date ? value : new Date(value));
+  return followupZonedLocalToDate({ year: parts.year, month: parts.month, day: parts.day, hour: 0, minute: 0, second: 0, millisecond: 0 });
 }
 
 function addHours(value, hours) {
@@ -7706,6 +7905,7 @@ function whatsappWebStatusHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -8358,33 +8558,69 @@ function faqLibraryData(content = defaultTeamContent) {
   };
 }
 
-async function maybeLearnFromManualReply(customer, replyText, businessAccountId) {
+async function maybeSuggestTemplateFromManualReply(customer, replyText, businessAccountId) {
   if (customer.handoffStatus !== "human_required") return null;
   const latestInbound = await latestInboundMessageForCustomer(customer.id, businessAccountId);
   const question = String(latestInbound?.body || "").trim();
   if (!question || !replyText) return null;
   if (shouldSkipLearningQuestion(question)) return null;
   const content = await getTeamContent(businessAccountId);
-
-  const scope = isGeneralBusinessQuestion(question) ? "general" : "product";
-  const productId = scope === "product" ? String(customer.productId || "").trim() : "";
-  if (scope === "product" && !findCatalogProduct(productId, content.catalog)) return null;
-
-  const learnedFaq = upsertLearnedFaq({
-    scope,
-    productId,
+  const product = findCatalogProduct(customer.productId, content.catalog || catalog);
+  const decision = await templateSuggestionDecision({
     question,
     replyText,
-  }, content);
+    product,
+    customer,
+    businessAccountId,
+  });
+  if (!decision || decision.type === "none") return null;
+
+  const suggestion = decision.type === "sales_reply"
+    ? upsertSuggestedSalesReply({ customer, question, replyText, salesIntent: decision.salesIntent }, content)
+    : upsertSuggestedFaq({ customer, question, replyText, decision }, content);
+  if (!suggestion) return null;
   await saveTeamContent(businessAccountId, content);
   await store.appendAuditLog({
     actor: `system:${businessAccountId}`,
-    action: "manual_reply_learned_faq",
+    action: "manual_reply_template_suggested",
     customerId: customer.id,
-    result: `${learnedFaq.scope}:${learnedFaq.productId || "general"}:${learnedFaq.id}`,
+    result: `${suggestion.type}:${suggestion.productId || "general"}:${suggestion.id}`,
     businessAccountId,
   });
-  return learnedFaq;
+  return suggestion;
+}
+
+async function templateSuggestionDecision({ question, replyText, product, customer, businessAccountId }) {
+  const fallback = fallbackTemplateSuggestionDecision(question, customer);
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return fallback;
+  try {
+    const aiDecision = await suggestTemplateImprovement({
+      apiKey,
+      model: await openAiModelForAccount(businessAccountId),
+      customerMessage: question,
+      adminReply: replyText,
+      productName: product?.name || "",
+      productId: product?.id || customer.productId || "",
+      salesIntents: SALES_INTENT_OPTIONS.map((item) => ({ id: item.key, label: item.label })),
+    });
+    if (aiDecision.type === "sales_reply" && !SALES_INTENT_LABELS.has(aiDecision.salesIntent)) {
+      return fallback?.type === "sales_reply" ? fallback : null;
+    }
+    return aiDecision.type === "none" ? null : aiDecision;
+  } catch (error) {
+    await recordSystemError("manual_reply_template_suggestion_ai", error, `Customer: ${customer.id}`, businessAccountId);
+    return fallback;
+  }
+}
+
+function fallbackTemplateSuggestionDecision(question, customer = {}) {
+  if (isGeneralBusinessQuestion(question)) return { type: "faq", scope: "general", topic: "", salesIntent: "" };
+  const salesIntent = normalizeSalesIntent(question);
+  if (SALES_INTENT_LABELS.has(salesIntent)) {
+    return { type: "sales_reply", scope: "general", topic: SALES_INTENT_LABELS.get(salesIntent), salesIntent };
+  }
+  return customer.productId ? { type: "faq", scope: "product", topic: "", salesIntent: "" } : null;
 }
 
 async function latestInboundMessageForCustomer(customerId, businessAccountId) {
@@ -8398,8 +8634,11 @@ async function latestInboundMessageForCustomer(customerId, businessAccountId) {
     .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")))[0] || null;
 }
 
-function upsertLearnedFaq({ scope, productId, question, replyText }, content = defaultTeamContent) {
+function upsertSuggestedFaq({ customer, question, replyText, decision = {} }, content = defaultTeamContent) {
+  const scope = decision.scope === "general" || isGeneralBusinessQuestion(question) ? "general" : "product";
+  const productId = scope === "product" ? String(customer.productId || "").trim() : "";
   const product = scope === "product" ? findCatalogProduct(productId, content.catalog || catalog) : null;
+  if (scope === "product" && !product) return null;
   const records = scope === "general" ? ((content.faqLibrary || faqLibrary).approved_faqs ||= []) : (product.approved_faqs ||= []);
   const normalizedQuestion = normalizeLearnedText(question);
   const existing = records.find((faq) =>
@@ -8408,20 +8647,57 @@ function upsertLearnedFaq({ scope, productId, question, replyText }, content = d
 
   if (existing) {
     existing.approved_reply = replyText;
-    existing.active = true;
-    existing.learned_from_handoff = true;
+    existing.active = false;
+    existing.ai_suggestion = true;
+    existing.suggestion_status = "pending";
+    existing.suggested_from = "manual_reply";
+    existing.source_customer_id = customer.id;
     existing.updatedAt = new Date().toISOString();
-    return { ...existing, scope, productId };
+    return aiSuggestionRow({ ...existing, scope, productId }, "faq");
   }
 
-  return saveApprovedFaq({
+  const faq = saveApprovedFaq({
     scope,
     productId,
-    topic: `Learned: ${question.slice(0, 80)}`,
+    topic: decision.topic || `Suggested: ${question.slice(0, 80)}`,
     exampleQuestions: [question],
     approvedReply: replyText,
-    active: true,
+    active: false,
+    aiSuggestion: true,
+    suggestionStatus: "pending",
+    suggestedFrom: "manual_reply",
+    sourceCustomerId: customer.id,
   }, content);
+  return aiSuggestionRow(faq, "faq");
+}
+
+function upsertSuggestedSalesReply({ customer, question, replyText, salesIntent }, content = defaultTeamContent) {
+  const records = ((content.salesReplyLibrary || salesReplyLibrary).sales_replies ||= []);
+  const normalizedQuestion = normalizeLearnedText(question);
+  const existing = records.find((reply) =>
+    reply.ai_suggestion === true &&
+    (reply.example_messages || []).some((example) => normalizeLearnedText(example) === normalizedQuestion)
+  );
+  if (existing) {
+    existing.approved_reply = replyText;
+    existing.active = false;
+    existing.suggestion_status = "pending";
+    existing.source_customer_id = customer.id;
+    existing.updatedAt = new Date().toISOString();
+    return aiSuggestionRow({ ...existing, scope: "general", productId: "" }, "sales_reply");
+  }
+  const salesReply = saveSalesReply({
+    salesIntent,
+    salesIntentLabel: SALES_INTENT_LABELS.get(salesIntent) || readableStorageLabel(salesIntent),
+    exampleMessages: [question],
+    approvedReply: replyText,
+    active: false,
+    aiSuggestion: true,
+    suggestionStatus: "pending",
+    suggestedFrom: "manual_reply",
+    sourceCustomerId: customer.id,
+  }, content);
+  return aiSuggestionRow(salesReply, "sales_reply");
 }
 
 function shouldSkipLearningQuestion(question) {
@@ -8478,6 +8754,12 @@ function saveApprovedFaq(body, content = defaultTeamContent) {
     example_questions: exampleQuestions,
     approved_reply: approvedReply,
     active: body.active !== false,
+    ai_suggestion: body.aiSuggestion === true || body.ai_suggestion === true || existing.ai_suggestion === true,
+    suggestion_status: String(body.suggestionStatus || body.suggestion_status || existing.suggestion_status || "").trim(),
+    suggested_from: String(body.suggestedFrom || body.suggested_from || existing.suggested_from || "").trim(),
+    source_customer_id: String(body.sourceCustomerId || body.source_customer_id || existing.source_customer_id || "").trim(),
+    createdAt: existing.createdAt || body.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
   if (index >= 0) records[index] = saved;
   else records.push(saved);
@@ -8544,7 +8826,7 @@ function saveSalesReply(body, content = defaultTeamContent) {
   let id = existingId || proposedId;
   if (!existingId) {
     let suffix = 2;
-      const allIds = new Set([
+    const allIds = new Set([
       ...(teamSalesReplyLibrary.sales_replies || []).map((reply) => reply.id),
     ]);
     while (allIds.has(id)) {
@@ -8552,6 +8834,8 @@ function saveSalesReply(body, content = defaultTeamContent) {
       suffix += 1;
     }
   }
+  const index = records.findIndex((reply) => reply.id === id);
+  const existing = index >= 0 ? records[index] : {};
   const saved = {
     id,
     sales_intent: salesIntent,
@@ -8564,8 +8848,13 @@ function saveSalesReply(body, content = defaultTeamContent) {
     scope: storageScope,
     productId: "",
     active: body.active !== false,
+    ai_suggestion: body.aiSuggestion === true || body.ai_suggestion === true || existing.ai_suggestion === true,
+    suggestion_status: String(body.suggestionStatus || body.suggestion_status || existing.suggestion_status || "").trim(),
+    suggested_from: String(body.suggestedFrom || body.suggested_from || existing.suggested_from || "").trim(),
+    source_customer_id: String(body.sourceCustomerId || body.source_customer_id || existing.source_customer_id || "").trim(),
+    createdAt: existing.createdAt || body.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
-  const index = records.findIndex((reply) => reply.id === id);
   if (index >= 0) records[index] = saved;
   else records.push(saved);
   return { ...saved, scope, productId };
@@ -8624,6 +8913,94 @@ function deleteSalesReply(body, content = defaultTeamContent) {
   if (index < 0) throw new Error("Sales reply not found.");
   const [deleted] = records.splice(index, 1);
   return { ...deleted, scope, productId: deleted.productId || productId };
+}
+
+function aiSuggestionsData(content = defaultTeamContent) {
+  const teamCatalog = content.catalog || catalog;
+  const teamFaqLibrary = content.faqLibrary || faqLibrary;
+  const rows = [];
+  for (const faq of teamFaqLibrary.approved_faqs || []) {
+    if (isPendingAiSuggestion(faq)) rows.push(aiSuggestionRow({ ...faq, scope: "general", productId: "" }, "faq"));
+  }
+  for (const product of teamCatalog.products || []) {
+    for (const faq of product.approved_faqs || []) {
+      if (isPendingAiSuggestion(faq)) rows.push(aiSuggestionRow({ ...faq, scope: "product", productId: product.id, productName: product.name }, "faq"));
+    }
+  }
+  for (const reply of (content.salesReplyLibrary || salesReplyLibrary).sales_replies || []) {
+    if (isPendingAiSuggestion(reply)) rows.push(aiSuggestionRow({ ...reply, scope: "general", productId: "" }, "sales_reply"));
+  }
+  rows.sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")));
+  return {
+    pending: rows,
+    count: rows.length,
+    products: (teamCatalog.products || []).map((product) => ({ id: product.id, name: product.name })),
+  };
+}
+
+function isPendingAiSuggestion(record = {}) {
+  return record.ai_suggestion === true && record.active === false && (record.suggestion_status || "pending") === "pending";
+}
+
+function aiSuggestionRow(record = {}, type = "faq") {
+  const isSalesReply = type === "sales_reply";
+  return {
+    id: record.id || "",
+    type,
+    label: isSalesReply ? "Sales Reply" : record.scope === "product" ? "Product FAQ" : "General FAQ",
+    scope: record.scope || "general",
+    productId: record.productId || "",
+    productName: record.productName || "",
+    topic: record.topic || record.objection_type || readableStorageLabel(record.sales_intent) || "",
+    examples: record.example_questions || record.exampleMessages || record.example_messages || [],
+    reply: record.approved_reply || record.approvedReply || "",
+    sourceCustomerId: record.source_customer_id || "",
+    suggestedFrom: record.suggested_from || "",
+    createdAt: record.createdAt || "",
+    updatedAt: record.updatedAt || "",
+  };
+}
+
+function approveAiSuggestion(body, content = defaultTeamContent) {
+  const match = findAiSuggestionRecord(body, content);
+  match.record.active = true;
+  match.record.suggestion_status = "approved";
+  match.record.updatedAt = new Date().toISOString();
+  return aiSuggestionRow({ ...match.record, scope: match.scope, productId: match.productId, productName: match.productName }, match.type);
+}
+
+function rejectAiSuggestion(body, content = defaultTeamContent) {
+  const match = findAiSuggestionRecord(body, content);
+  const [removed] = match.records.splice(match.index, 1);
+  removed.suggestion_status = "rejected";
+  return aiSuggestionRow({ ...removed, scope: match.scope, productId: match.productId, productName: match.productName }, match.type);
+}
+
+function findAiSuggestionRecord(body, content = defaultTeamContent) {
+  const id = String(body.id || "").trim();
+  const type = String(body.type || "").trim();
+  const scope = body.scope === "product" ? "product" : "general";
+  const productId = String(body.productId || "").trim();
+  if (!id) throw new Error("Suggestion id is required.");
+  if (type === "sales_reply") {
+    const records = ((content.salesReplyLibrary || salesReplyLibrary).sales_replies ||= []);
+    const index = records.findIndex((record) => record.id === id && isPendingAiSuggestion(record));
+    if (index < 0) throw new Error("AI suggestion not found.");
+    return { type, scope: "general", productId: "", productName: "", records, index, record: records[index] };
+  }
+  const teamCatalog = content.catalog || catalog;
+  if (scope === "product") {
+    const product = findCatalogProduct(productId, teamCatalog);
+    if (!product) throw new Error("Product suggestion not found.");
+    const records = (product.approved_faqs ||= []);
+    const index = records.findIndex((record) => record.id === id && isPendingAiSuggestion(record));
+    if (index < 0) throw new Error("AI suggestion not found.");
+    return { type: "faq", scope, productId: product.id, productName: product.name || "", records, index, record: records[index] };
+  }
+  const records = ((content.faqLibrary || faqLibrary).approved_faqs ||= []);
+  const index = records.findIndex((record) => record.id === id && isPendingAiSuggestion(record));
+  if (index < 0) throw new Error("AI suggestion not found.");
+  return { type: "faq", scope: "general", productId: "", productName: "", records, index, record: records[index] };
 }
 
 function legacyStandardSalesReplies(product) {
@@ -10934,6 +11311,7 @@ function adminDashboardHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -11982,6 +12360,7 @@ function adminChatPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -12178,9 +12557,11 @@ function adminChatPageHtml() {
       sendButton.disabled = true;
       state.textContent = "Sending to " + activeCustomerId + "...";
       try {
-        await request("/admin/manual-reply", { customerId: activeCustomerId, text });
+        const result = await request("/admin/manual-reply", { customerId: activeCustomerId, text });
         replyText.value = "";
-        state.textContent = "Sent.";
+        state.textContent = result.templateSuggestion
+          ? "Sent. AI suggestion added for review."
+          : "Sent.";
         await load();
       } catch (error) {
         state.textContent = error.message;
@@ -12267,6 +12648,7 @@ function replyLibraryPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -12625,6 +13007,7 @@ function faqLibraryPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -13143,6 +13526,7 @@ function salesRepliesPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -13445,6 +13829,7 @@ function followupSettingsPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -14010,6 +14395,7 @@ function productFlowPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -15249,52 +15635,6 @@ function analyticsPageHtml() {
       color: #6e6e73;
       font-size: 13px;
     }
-    .followup-chart {
-      display: grid;
-      gap: 12px;
-      padding: 16px 14px;
-    }
-    .followup-row {
-      display: grid;
-      grid-template-columns: 130px 1fr 70px;
-      align-items: center;
-      gap: 10px;
-      font-size: 13px;
-    }
-    .followup-label {
-      font-weight: 700;
-      color: #1d1d1f;
-    }
-    .followup-track {
-      height: 30px;
-      display: grid;
-      grid-template-columns: 1fr;
-      border-radius: 5px;
-      background: #f0f0f2;
-      overflow: hidden;
-      position: relative;
-    }
-    .followup-bar {
-      min-width: 2px;
-      background: var(--accent);
-      color: #fff;
-      display: flex;
-      align-items: center;
-      padding-left: 8px;
-      font-weight: 700;
-      box-sizing: border-box;
-      white-space: nowrap;
-    }
-    .followup-rate {
-      font-weight: 700;
-      color: #1d1d1f;
-      text-align: right;
-    }
-    .followup-meta {
-      grid-column: 2 / 4;
-      color: #6e6e73;
-      font-size: 12px;
-    }
     section { margin: 0 0 22px; background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
     h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
     .table-wrap { overflow-x: auto; }
@@ -15314,6 +15654,7 @@ function analyticsPageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -15336,11 +15677,27 @@ function analyticsPageHtml() {
         <h2>Customers Across Seven Days</h2>
         <div id="customers-seven-day-chart"></div>
       </section>
-      <section class="chart-card">
-        <h2>Follow-Up Reply Performance</h2>
-        <div id="followup-performance-chart"></div>
-      </section>
     </div>
+    <section>
+      <h2>Product Performance</h2>
+      <div class="table-wrap" id="product-performance"></div>
+    </section>
+    <section>
+      <h2>Leads By Product Source</h2>
+      <div class="table-wrap" id="leads-by-source"></div>
+    </section>
+    <section>
+      <h2>Objection Metrics By Product</h2>
+      <div class="table-wrap" id="objections-by-product"></div>
+    </section>
+    <section>
+      <h2>Top General FAQs By Product</h2>
+      <div class="table-wrap" id="faqs-by-product"></div>
+    </section>
+    <section>
+      <h2>Top Product Questions</h2>
+      <div class="table-wrap" id="product-questions"></div>
+    </section>
     <section>
       <h2>New Customers By Product</h2>
       <div class="table-wrap" id="new-customers-by-product"></div>
@@ -15387,20 +15744,6 @@ function analyticsPageHtml() {
         '</div>';
       }).join('') + '</div><div class="chart-note">' + esc(note) + '</div>';
     }
-    function followupPerformanceChart(rows) {
-      const max = Math.max(1, ...rows.map(row => Number(row.sent || 0)));
-      return '<div class="followup-chart">' + rows.map(row => {
-        const sent = Number(row.sent || 0);
-        const replies = Number(row.replies || 0);
-        const width = Math.max(sent === 0 ? 2 : 8, Math.round((sent / max) * 100));
-        return '<div class="followup-row">' +
-          '<div class="followup-label">' + esc(row.label) + '</div>' +
-          '<div class="followup-track"><div class="followup-bar" style="width:' + width + '%">' + esc(replies + ' replied / ' + sent + ' sent') + '</div></div>' +
-          '<div class="followup-rate">' + esc(row.rateLabel) + '</div>' +
-          '<div class="followup-meta">Reply rate for this follow-up message on the selected date</div>' +
-        '</div>';
-      }).join('') + '</div>';
-    }
     async function loadAnalytics() {
       const selectedDate = document.querySelector('#analytics-date').value || localDateInput(new Date());
       const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
@@ -15423,9 +15766,44 @@ function analyticsPageHtml() {
         analytics.customerCharts.sevenDays,
         'Total new customers per day, ending ' + analytics.date
       );
-      document.querySelector('#followup-performance-chart').innerHTML = followupPerformanceChart(
-        analytics.customerCharts.followups
-      );
+      const performance = analytics.productPerformance || {};
+      document.querySelector('#product-performance').innerHTML = table(performance.products || [], [
+        { label: 'Product', key: 'product' },
+        { label: 'Leads Today', key: 'leadsToday' },
+        { label: 'Leads 7D', key: 'leads7Days' },
+        { label: 'Leads 30D', key: 'leads30Days' },
+        { label: 'Engaged', key: 'engaged' },
+        { label: 'No Reply', key: 'noReply' },
+        { label: 'Orders', key: 'orders' },
+        { label: 'Top Source', key: 'topSource' },
+        { label: 'Top Objection', key: 'topObjection' },
+        { label: 'Top FAQ', key: 'topFaq' },
+        { label: 'Top Product Question', key: 'topProductQuestion' }
+      ]);
+      document.querySelector('#leads-by-source').innerHTML = table(performance.sources || [], [
+        { label: 'Product', key: 'product' },
+        { label: 'Source', key: 'source' },
+        { label: 'Leads 30D', key: 'count' }
+      ]);
+      document.querySelector('#objections-by-product').innerHTML = table(performance.objections || [], [
+        { label: 'Product', key: 'product' },
+        { label: 'Too Expensive', key: 'tooExpensive' },
+        { label: 'Payday / Budget', key: 'paydayBudget' },
+        { label: 'Thinking First', key: 'thinkingFirst' },
+        { label: 'Not Interested', key: 'notInterested' },
+        { label: 'Another Date', key: 'anotherDate' },
+        { label: 'Discount / Negotiation', key: 'discountNegotiation' }
+      ]);
+      document.querySelector('#faqs-by-product').innerHTML = table(performance.faqs || [], [
+        { label: 'Product', key: 'product' },
+        { label: 'FAQ Topic', key: 'question' },
+        { label: 'Count', key: 'count' }
+      ]);
+      document.querySelector('#product-questions').innerHTML = table(performance.productQuestions || [], [
+        { label: 'Product', key: 'product' },
+        { label: 'Question Type', key: 'question' },
+        { label: 'Count', key: 'count' }
+      ]);
       document.querySelector('#new-customers-by-product').innerHTML = table(analytics.newCustomersByProductToday, [
         { label: 'Product', key: 'product' },
         { label: 'New Customers Today', key: 'count' }
@@ -15440,6 +15818,136 @@ function analyticsPageHtml() {
     document.querySelector('#refresh').addEventListener('click', loadAnalytics);
     loadAnalytics();
     setInterval(loadAnalytics, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function aiSuggestionsPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Suggestions</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface: #ffffff; --surface-soft: #fbfbfd; --line: #d2d2d7; --muted: #6e6e73; --accent: #0071e3; --danger: #b42318; }
+    body { margin: 0; background: #f5f5f7; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { border-color: #f1b6b0; color: var(--danger); background: #fff7f6; }
+    main { padding: 22px; }
+    section { background: var(--surface); border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--surface-soft); border-bottom: 1px solid #e5e5ea; }
+    .note { padding: 10px 14px; color: var(--muted); font-size: 13px; border-bottom: 1px solid #f0f0f2; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; min-width: 920px; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; line-height: 1.4; }
+    th { background: var(--surface-soft); color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    td.reply { white-space: pre-wrap; max-width: 380px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .empty { padding: 14px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AI Suggestions</h1>
+    <div class="sub" id="state">Loading suggestions...</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/compliance">Compliance</a>
+    <button id="refresh" type="button">Refresh</button>
+  </nav>
+  <main>
+    <section>
+      <h2>Pending Template Improvements</h2>
+      <div class="note">These suggestions are inactive until approved. Approving updates only the currently signed-in team account.</div>
+      <div class="table-wrap" id="suggestions"></div>
+    </section>
+  </main>
+  <script>
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+    }
+    function fmtTime(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString();
+    }
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Request failed.");
+      return data;
+    }
+    function render(rows) {
+      if (!rows.length) {
+        document.querySelector("#suggestions").innerHTML = '<div class="empty">No pending suggestions.</div>';
+        return;
+      }
+      document.querySelector("#suggestions").innerHTML = '<table><thead><tr>' +
+        ['Type', 'Product', 'Topic', 'Customer Example', 'Suggested Reply', 'Source', 'Actions'].map(label => '<th>' + esc(label) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map(row => '<tr>' +
+          '<td>' + esc(row.label) + '</td>' +
+          '<td>' + esc(row.productName || row.productId || '-') + '</td>' +
+          '<td>' + esc(row.topic || '-') + '</td>' +
+          '<td>' + esc((row.examples || []).join("\\n")) + '</td>' +
+          '<td class="reply">' + esc(row.reply || '') + '</td>' +
+          '<td>' + esc(row.sourceCustomerId || '-') + '<br>' + esc(fmtTime(row.updatedAt || row.createdAt)) + '</td>' +
+          '<td><div class="actions">' +
+            '<button class="primary" data-approve="' + esc(row.id) + '" data-type="' + esc(row.type) + '" data-scope="' + esc(row.scope) + '" data-product="' + esc(row.productId) + '">Approve</button>' +
+            '<button class="danger" data-reject="' + esc(row.id) + '" data-type="' + esc(row.type) + '" data-scope="' + esc(row.scope) + '" data-product="' + esc(row.productId) + '">Reject</button>' +
+          '</div></td>' +
+        '</tr>').join('') + '</tbody></table>';
+      document.querySelectorAll('button[data-approve]').forEach(button => {
+        button.addEventListener('click', () => updateSuggestion('/admin/ai-suggestions/approve', button));
+      });
+      document.querySelectorAll('button[data-reject]').forEach(button => {
+        button.addEventListener('click', () => updateSuggestion('/admin/ai-suggestions/reject', button));
+      });
+    }
+    async function updateSuggestion(path, button) {
+      button.disabled = true;
+      try {
+        const data = await request(path, {
+          id: button.dataset.approve || button.dataset.reject,
+          type: button.dataset.type,
+          scope: button.dataset.scope,
+          productId: button.dataset.product,
+        });
+        render(data.data.pending || []);
+        document.querySelector("#state").textContent = "Pending suggestions: " + data.data.count;
+      } catch (error) {
+        document.querySelector("#state").textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+    async function load() {
+      const response = await fetch('/admin/ai-suggestions-data');
+      const data = await response.json();
+      document.querySelector("#state").textContent = "Pending suggestions: " + data.count;
+      render(data.pending || []);
+    }
+    document.querySelector("#refresh").addEventListener("click", load);
+    load().catch(error => { document.querySelector("#state").textContent = error.message; });
   </script>
 </body>
 </html>`;
@@ -15487,6 +15995,7 @@ function compliancePageHtml() {
     <a href="/admin/chat">Chat Inbox</a>
     <a href="/admin/whatsapp-web">WhatsApp Web</a>
     <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -15869,6 +16378,7 @@ async function demoChatHtml(contentAccountId = config.accountId) {
       <a href="/admin/dashboard">Dashboard</a>
       <a href="/admin/chat">Chat Inbox</a>
       <a href="/admin/analytics">Analytics</a>
+      <a href="/admin/ai-suggestions">AI Suggestions</a>
       <a href="/admin/reply-library">Reply Library</a>
       <a href="/admin/product-flow">Product Flow</a>
       <a href="/admin/follow-up-settings">Follow-Up Settings</a>
@@ -16147,5 +16657,3 @@ async function demoChatHtml(contentAccountId = config.accountId) {
 </body>
 </html>`;
 }
-
-
