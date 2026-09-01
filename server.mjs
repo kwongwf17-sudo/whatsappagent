@@ -113,6 +113,10 @@ const config = {
   postgresTable: getEnv("WHATSAPP_POSTGRES_TABLE", "json_documents"),
   followupQueueTableEnabled: parseBool(getEnv("WHATSAPP_FOLLOWUP_QUEUE_TABLE_ENABLED", "false")),
   followupQueueTableName: getEnv("WHATSAPP_FOLLOWUP_QUEUE_TABLE", "followup_dispatch_queue_rows"),
+  outboxTableEnabled: parseBool(getEnv("WHATSAPP_OUTBOX_TABLE_ENABLED", "false")),
+  outboxTableName: getEnv("WHATSAPP_OUTBOX_TABLE", "outbox_messages"),
+  customersTableEnabled: parseBool(getEnv("WHATSAPP_CUSTOMERS_TABLE_ENABLED", "false")),
+  customersTableName: getEnv("WHATSAPP_CUSTOMERS_TABLE", "customers"),
   assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
   webSessionDir: path.resolve(getEnv("WHATSAPP_WEB_SESSION_DIR", path.join(__dirname, "data", "whatsapp-web-session"))),
   catalogPath: resolveSeedPath("PRODUCT_CATALOG_PATH", "product_catalog.json"),
@@ -218,6 +222,10 @@ const postgresAdapter = config.storeBackend === "postgres"
       tableName: config.postgresTable,
       followupQueueTableEnabled: config.followupQueueTableEnabled,
       followupQueueTableName: config.followupQueueTableName,
+      outboxTableEnabled: config.outboxTableEnabled,
+      outboxTableName: config.outboxTableName,
+      customersTableEnabled: config.customersTableEnabled,
+      customersTableName: config.customersTableName,
     })
   : null;
 const storageAdapter = sqliteAdapter || postgresAdapter;
