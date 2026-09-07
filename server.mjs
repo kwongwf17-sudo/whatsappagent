@@ -2642,6 +2642,7 @@ async function processInboundMessageCore({
     ? null
     : await maybeSelectApprovedSalesReply({
         customerMessage: text,
+        conversationContext,
         routeClassification,
         product,
         catalog: teamCatalog,
@@ -3027,6 +3028,7 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
 
 async function maybeSelectApprovedSalesReply({
   customerMessage,
+  conversationContext = [],
   product,
   catalog: activeCatalog,
   salesReplyLibrary: activeSalesReplyLibrary,
@@ -3050,6 +3052,7 @@ async function maybeSelectApprovedSalesReply({
       normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
       productName: product?.name || "",
       salesReplyRecords: records,
+      conversationContext,
     });
     if (!selected?.salesReplyId) return null;
     const record = records.find((reply) => reply.id === selected.salesReplyId);
