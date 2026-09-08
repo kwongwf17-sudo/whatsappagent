@@ -19,6 +19,7 @@ import {
   isGeneralBusinessQuestion,
   isProductNameMessage,
   findSalesReplyExactMatch,
+  findSalesReplyPrimaryIntentMatch,
   normalizeCustomerMessage,
   productIntro,
   salesReplyRecordsForProduct,
@@ -3036,6 +3037,7 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
 async function maybeSelectApprovedSalesReply({
   customerMessage,
   conversationContext = [],
+  routeClassification = null,
   product,
   catalog: activeCatalog,
   salesReplyLibrary: activeSalesReplyLibrary,
@@ -3051,6 +3053,10 @@ async function maybeSelectApprovedSalesReply({
     SALES_INTENT_LABELS.has(String(reply.sales_intent || "").trim())
   );
   if (!records.length) return null;
+  const routedReply = findSalesReplyPrimaryIntentMatch(activeCatalog, product, routeClassification, {
+    salesReplyLibrary: activeSalesReplyLibrary,
+  });
+  if (routedReply && records.some((reply) => reply.id === routedReply.id)) return routedReply;
   try {
     const selected = await selectSalesReply({
       apiKey,
