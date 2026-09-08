@@ -13,6 +13,7 @@ import {
   extractOrderDetails,
   formatAdminOrderMessage,
   findApprovedFaqLocalMatch,
+  findApprovedFaqPrimaryIntentMatch,
   findProduct,
   findProductMatch,
   isGeneralBusinessQuestion,
@@ -63,6 +64,7 @@ import {
   complaintCategoryDisplay,
   detectObviousComplaint,
 } from "./lib/complaints.mjs";
+import { filterKnowledgeRecordsForRoute } from "./lib/retrieval.mjs";
 import { validateProductionConfig } from "./lib/config_security.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2650,16 +2652,21 @@ async function processInboundMessageCore({
         businessAccountId: knowledgeAccountId,
       });
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
+  const routedApprovedFaq = faqSalesResponse || selectedSalesReply || !allowKnowledgeRoute
+    ? null
+    : findApprovedFaqPrimaryIntentMatch(teamCatalog, product, routeClassification, {
+        faqLibrary: teamFaqLibrary,
+      });
   const exactApprovedFaq = faqSalesResponse || selectedSalesReply
     ? null
-    : (allowKnowledgeRoute
+    : (routedApprovedFaq || (allowKnowledgeRoute
       ? findApprovedFaqLocalMatch(teamCatalog, product, text, {
           faqLibrary: teamFaqLibrary,
           customer,
           conversationContext,
           includeProduct: false,
         })
-      : null);
+      : null));
   const approvedFaqMatch = exactApprovedFaq
     ? {
         faqId: exactApprovedFaq.id,
@@ -3458,12 +3465,12 @@ async function retrieveAndRerankVectorStoreKnowledge({
   businessAccountId,
 }) {
   const candidates = boostKnowledgeCandidates(
-    await searchVectorStore({
+    filterKnowledgeRecordsForRoute(await searchVectorStore({
       apiKey,
       vectorStoreId,
       query: retrievalQuery,
-      maxResults: 3,
-    }),
+      maxResults: 8,
+    }), routeClassification, product),
     routeClassification
   );
   if (!candidates.length) return [];
