@@ -3343,6 +3343,10 @@ function faqTopicOptionsForClassifier(activeCatalog, product, activeFaqLibrary) 
     .map((faq) => ({
       id: stableFaqTopicId(faq),
       label: faq.topic || faq.brunei_malay_topic || faq.id || "",
+      exampleQuestions: (faq.example_questions || faq.exampleQuestions || [])
+        .map((question) => String(question || "").trim())
+        .filter(Boolean)
+        .slice(0, 8),
       scope: faq.scope || "",
     }));
 }
