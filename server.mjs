@@ -14653,10 +14653,45 @@ function productFlowPageHtml() {
       if (option) option.textContent = selectedProduct.name + (selectedProduct.ready ? "" : " (Setup)");
     }
 
+    function clientSafeOptionId(value) {
+      return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "option";
+    }
+
+    function ensureOrderOptionIds() {
+      if (!selectedProduct) return;
+      const used = new Set();
+      selectedProduct.orderOptions = (selectedProduct.orderOptions || []).map((option, index) => {
+        const base = clientSafeOptionId(option.id || option.name || "option-" + (index + 1));
+        let id = base;
+        let suffix = 2;
+        while (used.has(id)) {
+          id = base + "-" + suffix;
+          suffix += 1;
+        }
+        used.add(id);
+        return { ...option, id };
+      });
+    }
+
+    function newOrderOptionId() {
+      const used = new Set((selectedProduct.orderOptions || []).map(option => option.id).filter(Boolean));
+      let id = "option-" + Date.now().toString(36);
+      let suffix = 2;
+      while (used.has(id)) {
+        id = "option-" + Date.now().toString(36) + "-" + suffix;
+        suffix += 1;
+      }
+      return id;
+    }
+
     function optionCardHtml(option, index) {
       const addOns = (option.add_ons || []).join("\\n");
       const aliases = (option.aliases || []).join("\\n");
-      return '<div class="option-card" data-option-index="' + index + '">' +
+      return '<div class="option-card" data-option-index="' + index + '" data-option-id="' + esc(option.id || "") + '">' +
         '<div class="option-card-head">' +
           '<div class="option-card-title"><span class="option-index">' + esc(index + 1) + '</span><span>' + esc(option.name || "New option") + '</span></div>' +
           '<button class="remove-option" type="button" data-remove-option="' + index + '">Delete</button>' +
@@ -14678,14 +14713,44 @@ function productFlowPageHtml() {
     }
 
     function renderOrderOptions() {
+      ensureOrderOptionIds();
       const options = selectedProduct.orderOptions || [];
       document.querySelector("#order-options").innerHTML = options.map(optionCardHtml).join("") || '<div class="empty-options">No order options yet. Add at least one option before real testing.</div>';
+      document.querySelectorAll("#order-options .option-card").forEach(card => {
+        const index = Number(card.dataset.optionIndex);
+        card.querySelectorAll("[data-option-field]").forEach(input => {
+          input.addEventListener("input", () => updateOrderOptionFromCard(card, index));
+          input.addEventListener("change", () => {
+            updateOrderOptionFromCard(card, index);
+            if (["name", "price", "quantity"].includes(input.dataset.optionField)) {
+              selectedProduct.orderOptions = readOrderOptions();
+              selectedProduct.upsellSettings = readUpsellSettings();
+              renderOrderOptions();
+            }
+          });
+        });
+      });
       document.querySelectorAll("button[data-remove-option]").forEach(button => {
         button.addEventListener("click", () => {
+          selectedProduct.orderOptions = readOrderOptions();
+          selectedProduct.upsellSettings = readUpsellSettings();
           selectedProduct.orderOptions = (selectedProduct.orderOptions || []).filter((_, index) => index !== Number(button.dataset.removeOption));
           renderOrderOptions();
         });
       });
+    }
+
+    function updateOrderOptionFromCard(card, index) {
+      const option = selectedProduct.orderOptions && selectedProduct.orderOptions[index];
+      if (!option) return;
+      const get = field => card.querySelector('[data-option-field="' + field + '"]');
+      option.id = card.dataset.optionId || option.id || "";
+      option.name = get("name").value;
+      option.price = get("price").value;
+      option.quantity = Number(get("quantity").value || 1);
+      option.add_ons = get("add_ons").value.split(/\\r?\\n/).map(item => item.trim()).filter(Boolean);
+      option.aliases = get("aliases").value.split(/\\r?\\n/).map(item => item.trim()).filter(Boolean);
+      option.requires_add_on = get("requires_add_on").checked;
     }
 
     function priceNumber(option) {
@@ -15169,6 +15234,7 @@ function productFlowPageHtml() {
       return Array.from(document.querySelectorAll("#order-options .option-card")).map(card => {
         const get = field => card.querySelector('[data-option-field="' + field + '"]');
         return {
+          id: card.dataset.optionId || "",
           name: get("name").value,
           price: get("price").value,
           quantity: Number(get("quantity").value || 1),
@@ -15463,7 +15529,7 @@ function productFlowPageHtml() {
       if (!selectedProduct) return;
       selectedProduct.orderOptions = [
         ...(selectedProduct.orderOptions || []),
-        { name: "", price: "", quantity: 1, aliases: [], requires_add_on: false, add_ons: [] }
+        { id: newOrderOptionId(), name: "", price: "", quantity: 1, aliases: [], requires_add_on: false, add_ons: [] }
       ];
       renderOrderOptions();
     });
