@@ -214,6 +214,21 @@ const DEFAULT_ORDER_FORM = {
   phoneLabel: "Phone number",
   optionLabel: "Order option",
 };
+const PACKAGE_INTEREST_EXPECTED_ACTION_TTL_MS = 60 * 60 * 1000;
+function openingFlowPackageInterestPatch(product = {}, setAt = new Date().toISOString()) {
+  const parsedSetAt = Date.parse(setAt);
+  const baseTime = Number.isFinite(parsedSetAt) ? parsedSetAt : Date.now();
+  return {
+    awaitingPackageBInterest: true,
+    expectedNextAction: {
+      type: "package_interest_confirmation",
+      source: "opening_flow",
+      productId: product?.id || "",
+      setAt,
+      expiresAt: new Date(baseTime + PACKAGE_INTEREST_EXPECTED_ACTION_TTL_MS).toISOString(),
+    },
+  };
+}
 const DEFAULT_ORDER_FORM_FOLLOWUP_MESSAGES = [
   "Hi kita, boleh bantu isi detail order tadi supaya saya dapat hold promo untuk kita ya.",
   "Follow up saja kita, kalau jadi order boleh share nama, alamat, phone number dan package pilihan ya.",
@@ -2970,6 +2985,7 @@ async function processInboundMessageCore({
       openingFlowSentAt,
       openingFlowProductId: product.id,
       productId: product.id,
+      ...openingFlowPackageInterestPatch(product, openingFlowSentAt),
     }), businessAccountId);
     finalCustomer = customerAfterOpeningFlow;
     await store.appendAuditLog({
@@ -4428,6 +4444,7 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       openingFlowSentAt: sentAt,
       openingFlowProductId: product.id,
       productId: product.id,
+      ...openingFlowPackageInterestPatch(product, sentAt),
     }), accountId);
     await enqueueOpeningFlowFollowups({
       customer: customerAfterOpeningFlow,
