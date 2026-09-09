@@ -38,10 +38,12 @@ import {
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
+  interpretCustomerImage,
   rerankKnowledgeRecords,
   searchVectorStore,
   selectSalesReply,
   suggestTemplateImprovement,
+  transcribeAudio,
 } from "./lib/openai.mjs";
 import { JsonStore } from "./lib/store.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
@@ -103,6 +105,7 @@ const config = {
   openaiApiKey: usableEnv("OPENAI_API_KEY"),
   openaiModel: getEnv("OPENAI_MODEL", "gpt-5.4-mini"),
   extractionModel: getEnv("OPENAI_EXTRACTION_MODEL", "gpt-5.4-mini"),
+  transcriptionModel: getEnv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
   embeddingModel: getEnv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
   vectorStoreId: usableEnv("OPENAI_VECTOR_STORE_ID"),
   accountId: getEnv("ACCOUNT_ID", "demo"),
@@ -1783,11 +1786,14 @@ if (!config.skipHttpServer && webTransportManager) {
           return;
         }
         if (!message.text && message.mediaType) {
-          await recordInboundMediaHandoff({
+          await processInboundMediaMessage({
             id: message.id,
             from: message.from,
             mediaType: message.mediaType,
+            caption: message.caption || "",
+            media: message.media || null,
             source: message.source || {},
+            live: true,
             businessAccountId: message.businessAccountId || config.accountId,
           });
           return;
@@ -1887,16 +1893,21 @@ async function handleWebhookPayload(rawBody) {
     for (const message of messages) {
       const businessAccountId = await businessAccountIdForPhoneNumber(message.phoneNumberId);
       const text = getMessageText(message);
-      if (!text) {
-        await recordInboundMediaHandoff({
+      const mediaType = inboundWebhookMediaType(message);
+      if (mediaType !== "text" && mediaType !== "interactive" && mediaType !== "button") {
+        await processInboundMediaMessage({
           id: message.id,
           from: message.from,
-          mediaType: inboundWebhookMediaType(message),
+          mediaType,
+          caption: inboundWebhookMediaCaption(message),
+          media: inboundWebhookMediaPayload(message),
           source: extractMessageSource(message),
+          live: true,
           businessAccountId,
         });
         continue;
       }
+      if (!text) continue;
 
       await processInboundMessage({
         id: message.id,
@@ -2056,6 +2067,286 @@ function inboundMediaPlaceholder(mediaType = "media") {
   if (mediaType === "image") return "[Customer sent an image]";
   if (mediaType === "video") return "[Customer sent a video]";
   return "[Customer sent a media message]";
+}
+
+async function processInboundMediaMessage({
+  id = "",
+  from,
+  mediaType = "media",
+  caption = "",
+  media = null,
+  source = {},
+  live = false,
+  businessAccountId = config.accountId,
+}) {
+  const normalizedMediaType = normalizeInboundMediaType(mediaType);
+  const contactPatch = customerContactPatch(from, source);
+  const correlationId = correlationIdForInbound(id, from);
+  if (id) {
+    const claim = await store.claimProcessedMessage(id, businessAccountId, {
+      customerId: String(from || ""),
+      correlationId,
+      mediaType: normalizedMediaType,
+    });
+    if (!claim.claimed) {
+      console.log(`Skipping duplicate inbound ${normalizedMediaType} message ${id} from ${from}.`);
+      return {
+        customer: await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch }),
+        messages: [],
+        duplicateInbound: true,
+        correlationId: claim.record?.correlationId || correlationId,
+      };
+    }
+  }
+  if (id && await store.hasOutboxMessageId(id, businessAccountId)) {
+    console.log(`Skipping duplicate inbound ${normalizedMediaType} message ${id} from ${from}.`);
+    return {
+      customer: await store.getOrCreateCustomer(from, { businessAccountId, ...contactPatch }),
+      messages: [],
+      duplicateInbound: true,
+      correlationId,
+    };
+  }
+
+  await store.appendOutbox({
+    ...(id ? { id } : {}),
+    direction: "inbound",
+    from,
+    to: "agent",
+    businessAccountId,
+    correlationId,
+    channel: "customer",
+    type: normalizedMediaType,
+    body: inboundMediaPlaceholder(normalizedMediaType),
+    caption: String(caption || "").trim(),
+  });
+  const nowIso = new Date().toISOString();
+  await store.getOrCreateCustomer(from, {
+    lastInboundMessageId: id,
+    lastMessageAt: nowIso,
+    lastInboundAt: nowIso,
+    recordInbound: true,
+    businessAccountId,
+    source,
+    ...contactPatch,
+  });
+
+  try {
+    const mediaText = await mediaTextForInbound({
+      from,
+      mediaType: normalizedMediaType,
+      caption,
+      media,
+      source,
+      businessAccountId,
+    });
+    if (!mediaText.text || mediaText.handoffRequired) {
+      const customer = await markInboundMediaHandoff({
+        from,
+        mediaType: normalizedMediaType,
+        source,
+        businessAccountId,
+        correlationId,
+        reason: mediaText.reason || `Customer sent ${normalizedMediaType}; manual reply required.`,
+      });
+      await completeMediaProcessedMessage(id, businessAccountId, correlationId, from, true);
+      return { customer, messages: [], handoffRequired: true, handoffReason: customer.handoffReason, correlationId };
+    }
+
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "media_message_understood",
+      customerId: from,
+      businessAccountId,
+      result: `${normalizedMediaType}:${mediaText.category || "text"}`,
+      reason: mediaText.reason || "",
+      correlationId,
+    });
+    const result = await processInboundMessage({
+      id: id ? `${id}:media_text` : "",
+      from,
+      text: mediaText.text,
+      source: {
+        ...(source || {}),
+        mediaType: normalizedMediaType,
+        mediaUnderstanding: true,
+        mediaCategory: mediaText.category || "",
+        mediaCaption: String(caption || "").trim(),
+      },
+      live,
+      businessAccountId,
+      skipInboundRecord: true,
+      correlationId,
+    });
+    await completeMediaProcessedMessage(id, businessAccountId, correlationId, from, Boolean(result?.handoffRequired));
+    return result;
+  } catch (error) {
+    await recordSystemError("inbound_media_understanding", error, `Customer: ${from}; mediaType: ${normalizedMediaType}`, businessAccountId);
+    const customer = await markInboundMediaHandoff({
+      from,
+      mediaType: normalizedMediaType,
+      source,
+      businessAccountId,
+      correlationId,
+      reason: `Customer sent ${normalizedMediaType}; media understanding failed and manual reply is required.`,
+    });
+    await completeMediaProcessedMessage(id, businessAccountId, correlationId, from, true);
+    return { customer, messages: [], handoffRequired: true, handoffReason: customer.handoffReason, correlationId };
+  }
+}
+
+async function completeMediaProcessedMessage(id, businessAccountId, correlationId, customerId, handoffRequired) {
+  if (!id) return;
+  await store.completeProcessedMessage(id, businessAccountId, {
+    correlationId,
+    customerId: String(customerId || ""),
+    handoffRequired: Boolean(handoffRequired),
+  }).catch(() => {});
+}
+
+async function mediaTextForInbound({
+  from,
+  mediaType,
+  caption = "",
+  media = null,
+  source = {},
+  businessAccountId = config.accountId,
+}) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) {
+    return { text: "", handoffRequired: true, reason: "OpenAI API key not configured." };
+  }
+  const mediaFile = media?.bytes?.length
+    ? normalizeDownloadedMedia(media, mediaType)
+    : await downloadCloudInboundMedia({ media, mediaType, businessAccountId });
+  if (!mediaFile?.bytes?.length) {
+    return { text: "", handoffRequired: true, reason: "Media bytes were not available." };
+  }
+
+  if (mediaType === "audio") {
+    const transcript = await transcribeAudio({
+      apiKey,
+      model: config.transcriptionModel,
+      bytes: mediaFile.bytes,
+      filename: mediaFile.filename || "voice.ogg",
+      mimeType: mediaFile.mimeType || "audio/ogg",
+    });
+    return transcript
+      ? { text: transcript, category: "voice_transcript", reason: "Voice message transcribed." }
+      : { text: "", handoffRequired: true, reason: "Voice transcription was empty." };
+  }
+
+  if (mediaType === "image") {
+    const customer = await store.getCustomer(from, businessAccountId);
+    const content = await getTeamContent(businessAccountId);
+    const product = content.catalog.products.find((item) => item.id === customer?.productId) ||
+      content.catalog.products.find((item) => item.id === content.catalog.default_product_id) ||
+      content.catalog.products[0];
+    const interpretation = await interpretCustomerImage({
+      apiKey,
+      model: await openAiModelForAccount(businessAccountId),
+      imageDataUrl: mediaDataUrl(mediaFile),
+      caption,
+      productName: product?.name || "",
+      conversationContext: await recentConversationContext(from, businessAccountId),
+    });
+    if (!interpretation.safeToAutoRoute || !interpretation.text) {
+      return {
+        text: interpretation.text || "",
+        category: interpretation.category,
+        handoffRequired: true,
+        reason: interpretation.reason || "Image is not safe to auto-route.",
+      };
+    }
+    return {
+      text: interpretation.text,
+      category: interpretation.category,
+      reason: interpretation.reason || "Image safely interpreted.",
+    };
+  }
+
+  return { text: "", handoffRequired: true, reason: `Unsupported media type: ${mediaType}` };
+}
+
+function normalizeDownloadedMedia(media = {}, mediaType = "media") {
+  return {
+    bytes: Buffer.isBuffer(media.bytes) ? media.bytes : Buffer.from(media.bytes || []),
+    mimeType: String(media.mimeType || defaultMimeTypeForMedia(mediaType)),
+    filename: String(media.filename || `customer-${mediaType}`),
+  };
+}
+
+function mediaDataUrl(media = {}) {
+  const bytes = Buffer.isBuffer(media.bytes) ? media.bytes : Buffer.from(media.bytes || []);
+  return `data:${media.mimeType || "application/octet-stream"};base64,${bytes.toString("base64")}`;
+}
+
+function defaultMimeTypeForMedia(mediaType = "media") {
+  if (mediaType === "audio") return "audio/ogg";
+  if (mediaType === "image") return "image/jpeg";
+  if (mediaType === "video") return "video/mp4";
+  return "application/octet-stream";
+}
+
+async function downloadCloudInboundMedia({ media = {}, mediaType = "media", businessAccountId = config.accountId } = {}) {
+  const mediaId = String(media?.id || "").trim();
+  if (!mediaId) return null;
+  const accessToken = await whatsappAccessTokenForAccount(businessAccountId);
+  if (!accessToken) throw new Error(`Missing WhatsApp access token for account ${businessAccountId}.`);
+  const metadataResponse = await fetch(`https://graph.facebook.com/${config.graphVersion}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const metadataText = await metadataResponse.text();
+  if (!metadataResponse.ok) throw new Error(`WhatsApp media metadata failed: ${metadataText}`);
+  const metadata = metadataText ? JSON.parse(metadataText) : {};
+  const mediaUrl = metadata.url;
+  if (!mediaUrl) throw new Error("WhatsApp media metadata did not include a download URL.");
+  const mediaResponse = await fetch(mediaUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const mediaText = mediaResponse.ok ? "" : await mediaResponse.text();
+  if (!mediaResponse.ok) throw new Error(`WhatsApp media download failed: ${mediaText}`);
+  return {
+    bytes: Buffer.from(await mediaResponse.arrayBuffer()),
+    mimeType: metadata.mime_type || media.mimeType || defaultMimeTypeForMedia(mediaType),
+    filename: metadata.file_name || `${mediaId}-${mediaType}`,
+  };
+}
+
+async function whatsappAccessTokenForAccount(businessAccountId = config.accountId) {
+  const settings = await adminAccounts.getTeamSettings(businessAccountId);
+  return settings.whatsappAccessToken || config.accessToken;
+}
+
+async function markInboundMediaHandoff({
+  from,
+  mediaType = "media",
+  source = {},
+  businessAccountId = config.accountId,
+  correlationId = "",
+  reason = "",
+}) {
+  console.log(`Incoming WhatsApp ${mediaType} message from ${from}; routed to handoff.`);
+  const contactPatch = customerContactPatch(from, source);
+  const handoffReason = reason || `Customer sent ${mediaType}; manual reply required.`;
+  const customer = await store.updateCustomer(from, () => ({
+    businessAccountId,
+    source,
+    ...contactPatch,
+    handoffStatus: "human_required",
+    handoffReason,
+    handoffSeverity: handoffSeverityForReason(handoffReason),
+  }), businessAccountId);
+  await store.appendAuditLog({
+    actor: "ai_agent",
+    action: "media_message_handoff",
+    customerId: from,
+    businessAccountId,
+    result: mediaType,
+    reason: handoffReason,
+    correlationId,
+  });
+  return customer;
 }
 
 async function recordInboundMediaHandoff({
@@ -7294,6 +7585,22 @@ function getMessageText(message) {
     return (message.button?.text || message.button?.payload || "").trim();
   }
   return "";
+}
+
+function inboundWebhookMediaPayload(message = {}) {
+  const type = String(message.type || "").toLowerCase();
+  const payload = message[type] || {};
+  return {
+    id: payload.id || "",
+    mimeType: payload.mime_type || payload.mimeType || "",
+    sha256: payload.sha256 || "",
+    filename: payload.filename || "",
+  };
+}
+
+function inboundWebhookMediaCaption(message = {}) {
+  const type = String(message.type || "").toLowerCase();
+  return String(message[type]?.caption || "").trim();
 }
 
 function inboundWebhookMediaType(message = {}) {
