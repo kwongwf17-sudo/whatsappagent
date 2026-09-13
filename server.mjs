@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   buildConversationPlan,
@@ -660,6 +660,32 @@ const server = http.createServer(async (req, res) => {
           result: account.id,
         });
         return sendJson(res, 200, { account });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/superadmin/accounts/purge") {
+      const body = await readJsonBody(req);
+      const accountId = String(body.id || "").trim();
+      const confirmation = String(body.confirmation || "").trim();
+      try {
+        if (!accountId) throw new Error("Account ID is required.");
+        if (confirmation !== accountId) throw new Error("Type the exact account ID to purge this account.");
+        const account = await adminAccounts.getAccount(accountId);
+        if (!account) throw new Error("Account not found.");
+        if (webTransportManager) {
+          await webTransportManager.disconnect(accountId, { reconnect: false }).catch(() => null);
+        }
+        const purge = await purgeAccountStorage(accountId);
+        const deletedAccount = await adminAccounts.deleteAccount(accountId);
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "admin_account_purged",
+          result: accountId,
+          purge,
+        });
+        return sendJson(res, 200, { account: deletedAccount, purge });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -8726,6 +8752,79 @@ async function webTransportHealthData() {
   };
 }
 
+async function purgeAccountStorage(accountId) {
+  const id = String(accountId || "").trim();
+  if (!id) throw new Error("Account ID is required.");
+  return {
+    store: await store.purgeAccountData(id),
+    operations: await operations.purgeAccountData(id),
+    teamContent: await teamContentStore.deleteContent(id),
+    legacyDocuments: await purgeLegacyAccountDocuments(id),
+    mediaAssets: await purgePersistedMediaAssets(id),
+    webSession: await purgeWebSession(id),
+  };
+}
+
+async function purgeLegacyAccountDocuments(accountId) {
+  const id = String(accountId || "").trim();
+  const key = `team_content_${id.replace(/[^a-z0-9_-]+/gi, "_").replace(/^_+|_+$/g, "") || "default"}`;
+  const summary = { deletedKeys: 0 };
+  if (storageAdapter?.deleteJsonDocumentKey) {
+    summary.deletedKeys += await storageAdapter.deleteJsonDocumentKey(key);
+  }
+  return summary;
+}
+
+async function purgePersistedMediaAssets(accountId) {
+  const id = String(accountId || "").trim();
+  const prefix = `media-asset-${safeAssetSegment(id)}-`;
+  const accounts = await adminAccounts.listAccounts();
+  const sameMediaPrefixAccounts = accounts
+    .filter((account) => account.id !== id && safeAssetSegment(account.id) === safeAssetSegment(id))
+    .map((account) => account.id);
+  const summary = {
+    deletedKeys: 0,
+    deletedFiles: 0,
+    skipped: sameMediaPrefixAccounts.length ? `Shared media prefix with ${sameMediaPrefixAccounts.join(", ")}` : "",
+  };
+  if (summary.skipped) return summary;
+
+  if (storageAdapter?.deleteJsonDocumentKeysByPrefix) {
+    summary.deletedKeys += await storageAdapter.deleteJsonDocumentKeysByPrefix(prefix);
+  }
+
+  const mediaDir = path.join(config.dataDir, "media_assets");
+  try {
+    const entries = await readdir(mediaDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.startsWith(prefix) || !entry.name.endsWith(".json")) continue;
+      const target = path.resolve(mediaDir, entry.name);
+      if (!isInsideDirectory(target, mediaDir)) continue;
+      await rm(target, { force: true });
+      summary.deletedFiles += 1;
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  return summary;
+}
+
+async function purgeWebSession(accountId) {
+  const root = path.resolve(config.webSessionDir);
+  const target = path.resolve(root, String(accountId || ""));
+  if (!isInsideDirectory(target, root) || target === root) {
+    return { deleted: false, skipped: "Resolved session path is outside session root." };
+  }
+  await rm(target, { recursive: true, force: true });
+  return { deleted: true };
+}
+
+function isInsideDirectory(targetPath, rootPath) {
+  const root = path.resolve(rootPath);
+  const target = path.resolve(targetPath);
+  return target === root || target.startsWith(`${root}${path.sep}`);
+}
+
 async function vectorStoreIdForAccount(businessAccountId = config.accountId) {
   const settings = await adminAccounts.getTeamSettings(businessAccountId);
   return settings.openaiVectorStoreId || config.vectorStoreId;
@@ -10755,7 +10854,7 @@ function superAdminAccountsHtml() {
       accounts = data.accounts || [];
       document.querySelector("#generated").textContent = accounts.length + " account(s)";
       document.querySelector("#accounts").innerHTML = '<table><thead><tr><th>Account ID</th><th>Name</th><th>Role</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody>' +
-        accounts.map(account => '<tr><td>' + esc(account.id) + '</td><td>' + esc(account.name) + '</td><td>' + esc(account.role === "order_admin" ? "Order Admin" : "Business Admin") + '</td><td><span class="pill' + (account.active ? '' : ' off') + '">' + (account.active ? 'Active' : 'Disabled') + '</span></td><td>' + esc(fmt(account.updatedAt)) + '</td><td><div class="row-actions"><button type="button" data-reset="' + esc(account.id) + '">Reset Password</button><button class="' + (account.active ? 'danger' : '') + '" type="button" data-status="' + esc(account.id) + '" data-active="' + (!account.active) + '">' + (account.active ? 'Disable' : 'Enable') + '</button></div></td></tr>').join('') +
+        accounts.map(account => '<tr><td>' + esc(account.id) + '</td><td>' + esc(account.name) + '</td><td>' + esc(account.role === "order_admin" ? "Order Admin" : "Business Admin") + '</td><td><span class="pill' + (account.active ? '' : ' off') + '">' + (account.active ? 'Active' : 'Disabled') + '</span></td><td>' + esc(fmt(account.updatedAt)) + '</td><td><div class="row-actions"><button type="button" data-reset="' + esc(account.id) + '">Reset Password</button><button class="' + (account.active ? 'danger' : '') + '" type="button" data-status="' + esc(account.id) + '" data-active="' + (!account.active) + '">' + (account.active ? 'Disable' : 'Enable') + '</button><button class="danger" type="button" data-purge="' + esc(account.id) + '">Purge Account</button></div></td></tr>').join('') +
         '</tbody></table>';
       document.querySelectorAll("button[data-reset]").forEach(button => button.addEventListener("click", () => {
         document.querySelector("#reset-id").value = button.dataset.reset;
@@ -10764,6 +10863,21 @@ function superAdminAccountsHtml() {
       document.querySelectorAll("button[data-status]").forEach(button => button.addEventListener("click", async () => {
         await request("/superadmin/accounts/status", { id: button.dataset.status, active: button.dataset.active === "true" });
         loadAccounts();
+      }));
+      document.querySelectorAll("button[data-purge]").forEach(button => button.addEventListener("click", async () => {
+        const id = button.dataset.purge;
+        const confirmation = prompt("Permanently purge account " + id + " and its account data? Type " + id + " to confirm.");
+        if (confirmation !== id) return;
+        button.disabled = true;
+        try {
+          const data = await request("/superadmin/accounts/purge", { id, confirmation });
+          document.querySelector("#generated").textContent = "Purged " + id + ".";
+          console.log("Account purge result", data.purge);
+          loadAccounts();
+        } catch (error) {
+          alert(error.message);
+          button.disabled = false;
+        }
       }));
     }
     document.querySelector("#create-form").addEventListener("submit", async event => {
