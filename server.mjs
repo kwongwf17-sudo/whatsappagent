@@ -210,6 +210,14 @@ const FOLLOWUP_MEDIA_TYPES = new Map([
   ["video/webm", { extension: "webm", type: "video" }],
   ["video/quicktime", { extension: "mov", type: "video" }],
 ]);
+const CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const CHAT_VIDEO_MAX_BYTES = 16 * 1024 * 1024;
+const CHAT_MEDIA_TYPES = new Map([
+  ["image/jpeg", { extension: "jpg", type: "image", maxBytes: CHAT_IMAGE_MAX_BYTES }],
+  ["image/png", { extension: "png", type: "image", maxBytes: CHAT_IMAGE_MAX_BYTES }],
+  ["image/webp", { extension: "webp", type: "image", maxBytes: CHAT_IMAGE_MAX_BYTES }],
+  ["video/mp4", { extension: "mp4", type: "video", maxBytes: CHAT_VIDEO_MAX_BYTES }],
+]);
 const DEFAULT_ORDER_CLOSING_MESSAGES = [
   "Sorry Dear our stock just finish , I will take order again, will take around 15-18 days for arrived brunei new stock 🥰 But i will try my best to get it quick for you ya.",
   "REMINDER ✨: \n-Order after 1 hour cannot be canceled. \n-Brg Sampai baru byr runner",
@@ -1211,6 +1219,7 @@ const server = http.createServer(async (req, res) => {
       const customerId = String(body.customerId || "").trim();
       const caseId = String(body.caseId || "").trim();
       const type = String(body.type || "conversation").trim();
+      const selectedProductId = String(body.productId || "").trim();
       try {
         if (type === "complaint" || caseId) {
           const complaint = await store.resolveComplaintCase(
@@ -1243,20 +1252,37 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (!customerId) return sendJson(res, 400, { error: "Customer ID is required." });
+        const existingCustomer = (await store.listCustomers(new Date(), adminSession.accountId)).find((item) => item.id === customerId);
+        if (!existingCustomer) return sendJson(res, 404, { error: "Customer not found." });
+        const content = await getTeamContent(adminSession.accountId);
+        const productId = selectedProductId || existingCustomer.productId || "";
+        if (!productId) {
+          return sendJson(res, 409, {
+            error: "Choose a product before acknowledging this handoff.",
+            code: "product_required",
+            customerId,
+            products: content.catalog.products.map((product) => ({ id: product.id, name: product.name || product.id })),
+          });
+        }
+        const product = findCatalogProduct(productId, content.catalog);
+        if (!product) return sendJson(res, 400, { error: "Selected product was not found." });
         const customer = await store.updateCustomer(customerId, () => ({
           handoffStatus: "",
           handoffReason: "",
           handoffAcknowledgedAt: new Date().toISOString(),
           handoffAcknowledgedBy: `admin:${adminSession.accountId}`,
+          productId: product.id,
+          followupBlocked: Boolean(existingCustomer.optedOut),
+          followupBlockedReason: existingCustomer.optedOut ? existingCustomer.followupBlockedReason : "",
         }), adminSession.accountId);
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
           action: "handoff_acknowledged",
           customerId,
-          result: customer.handoffAcknowledgedAt || "",
+          result: [customer.handoffAcknowledgedAt || "", `product:${product.id}`].filter(Boolean).join("; "),
           businessAccountId: adminSession.accountId,
         });
-        return sendJson(res, 200, { acknowledged: true, customerId });
+        return sendJson(res, 200, { acknowledged: true, customerId, productId: product.id });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -1315,6 +1341,176 @@ const server = http.createServer(async (req, res) => {
             : `Message was not sent: ${detail}`,
           failedMessageId: failedId,
         });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/manual-reply/media") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "").trim();
+      const caption = String(body.caption || "").trim().slice(0, 500);
+      if (!customerId) return sendJson(res, 400, { error: "Customer ID is required." });
+      const customer = (await store.listCustomers()).find(
+        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
+      );
+      if (!customer) return sendJson(res, 404, { error: "Customer not found." });
+      const lastInboundAt = new Date(customer.lastInboundAt || customer.firstSeenAt || 0).getTime();
+      if (config.transportMode === "cloud" && !config.demoMode && (!Number.isFinite(lastInboundAt) || Date.now() - lastInboundAt > DAY_MS)) {
+        return sendJson(res, 409, {
+          error: "The 24-hour customer service window has ended. Send an approved WhatsApp template instead.",
+        });
+      }
+      let media = null;
+      try {
+        media = decodeUploadedChatMedia(body.dataUrl);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || "Media upload failed." });
+      }
+      if (!media) {
+        return sendJson(res, 400, { error: "Only JPG, PNG, WEBP photos or MP4 videos are supported." });
+      }
+      try {
+        const accountAssetId = safeAssetSegment(adminSession.accountId);
+        const targetDirectory = path.join(config.assetsDir, accountAssetId, "chat");
+        await mkdir(targetDirectory, { recursive: true });
+        const originalName = String(body.originalName || "").trim();
+        const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName))) || "media";
+        const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${originalBase}.${media.extension}`;
+        await writeFile(path.join(targetDirectory, filename), media.bytes);
+        const mediaUrl = `/assets/${accountAssetId}/chat/${filename}`;
+        const message = { type: media.type, url: mediaUrl, caption };
+        await sendOutbound(customerId, [message], {
+          channel: "business_admin",
+          from: `business_admin:${adminSession.accountId}`,
+          businessAccountId: adminSession.accountId,
+          purpose: "manual_media_reply",
+        });
+        const now = new Date().toISOString();
+        const actor = `admin:${adminSession.accountId}`;
+        const openComplaints = (await store.listComplaintCases(adminSession.accountId))
+          .filter((complaint) => complaint.customerId === customerId && complaint.status !== "resolved");
+        for (const complaint of openComplaints) {
+          await store.resolveComplaintCase(complaint.id, adminSession.accountId, actor);
+        }
+        const hasOpenComplaint = (await store.listComplaintCases(adminSession.accountId))
+          .some((complaint) => complaint.customerId === customerId && complaint.status !== "resolved");
+        await store.updateCustomer(customerId, (current) => ({
+          handoffStatus: "",
+          handoffReason: "",
+          handoffAcknowledgedAt: now,
+          handoffAcknowledgedBy: actor,
+          ...(hasOpenComplaint ? {} : {
+            complaintStatus: current.complaintStatus === "open" ? "resolved" : current.complaintStatus,
+            complaintResolvedAt: openComplaints.length ? now : current.complaintResolvedAt,
+            followupBlocked: Boolean(current.optedOut),
+            followupBlockedReason: current.optedOut ? current.followupBlockedReason : "",
+          }),
+        }), adminSession.accountId);
+        await store.appendAuditLog({
+          actor,
+          action: "manual_media_reply_sent",
+          customerId,
+          result: [
+            `${media.type}:${mediaUrl}`,
+            openComplaints.length ? `resolved_complaints:${openComplaints.length}` : "",
+          ].filter(Boolean).join("; "),
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, { ok: true, customerId, media: { type: media.type, url: mediaUrl, caption } });
+      } catch (error) {
+        const detail = String(error.message || "Unknown send error").trim();
+        const failedId = error.failedMessageId || "";
+        return sendJson(res, 502, {
+          error: failedId
+            ? `Media was not sent: ${detail} (failed queue: ${failedId})`
+            : `Media was not sent: ${detail}`,
+          failedMessageId: failedId,
+        });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/manual-reply/opening-flow") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "").trim();
+      if (!customerId) return sendJson(res, 400, { error: "Customer ID is required." });
+      const customer = (await store.listCustomers()).find(
+        (item) => item.id === customerId && (item.businessAccountId || config.accountId) === adminSession.accountId
+      );
+      if (!customer) return sendJson(res, 404, { error: "Customer not found." });
+      const lastInboundAt = new Date(customer.lastInboundAt || customer.firstSeenAt || 0).getTime();
+      if (config.transportMode === "cloud" && !config.demoMode && (!Number.isFinite(lastInboundAt) || Date.now() - lastInboundAt > DAY_MS)) {
+        return sendJson(res, 409, {
+          error: "The 24-hour customer service window has ended. Send an approved WhatsApp template instead.",
+        });
+      }
+      const productId = String(body.productId || customer.productId || "").trim();
+      if (!productId) return sendJson(res, 400, { error: "Choose a product before sending opening flow." });
+      const content = await getTeamContent(adminSession.accountId);
+      const product = findCatalogProduct(productId, content.catalog || catalog);
+      if (!product) return sendJson(res, 404, { error: "Product not found." });
+      const openingMessages = clampMessages(Array.isArray(product.opening_flow) && product.opening_flow.length
+        ? product.opening_flow
+        : buildProductOpeningFlow(productFlowEditorData(product)));
+      if (!openingMessages.length) return sendJson(res, 400, { error: "Opening flow has no messages for this product." });
+      try {
+        await sendOutbound(customerId, openingMessages, {
+          channel: "business_admin",
+          from: `business_admin:${adminSession.accountId}`,
+          businessAccountId: adminSession.accountId,
+          purpose: "manual_opening_flow",
+        });
+        const sentAt = new Date().toISOString();
+        await store.updateCustomer(customerId, (current) => ({
+          pendingOpeningFlow: null,
+          openingFlowInProgressAt: "",
+          openingFlowFailedAt: "",
+          openingFlowFailureReason: "",
+          openingFlowsSent: {
+            ...(current.openingFlowsSent && typeof current.openingFlowsSent === "object" ? current.openingFlowsSent : {}),
+            [product.id]: { sentAt, manual: true },
+          },
+          openingFlowSentAt: sentAt,
+          openingFlowProductId: product.id,
+          productId: product.id,
+          ...openingFlowPackageInterestPatch(product, sentAt),
+        }), adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "manual_opening_flow_sent",
+          customerId,
+          result: `${product.id}:${openingMessages.length}`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, { ok: true, customerId, productId: product.id, sent: openingMessages.length });
+      } catch (error) {
+        const detail = String(error.message || "Unknown send error").trim();
+        const failedId = error.failedMessageId || "";
+        return sendJson(res, 502, {
+          error: failedId
+            ? `Opening flow was not sent: ${detail} (failed queue: ${failedId})`
+            : `Opening flow was not sent: ${detail}`,
+          failedMessageId: failedId,
+        });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/chat/process-recovered") {
+      const body = await readJsonBody(req);
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const customerId = String(body.customerId || "").trim();
+      const messageId = String(body.messageId || "").trim();
+      if (!customerId || !messageId) return sendJson(res, 400, { error: "Customer and message are required." });
+      try {
+        const result = await safelyProcessRecoveredMessage({
+          customerId,
+          messageId,
+          businessAccountId: adminSession.accountId,
+          actor: `admin:${adminSession.accountId}`,
+        });
+        return sendJson(res, 200, result);
+      } catch (error) {
+        return sendJson(res, 409, { error: error.message || "Recovered message could not be processed safely." });
       }
     }
 
@@ -1837,6 +2033,9 @@ if (!config.skipHttpServer && webTransportManager) {
         }
         await processInboundMessage(message);
       },
+      onRecoveredMessage: async (message) => {
+        await recordRecoveredWebMessage(message);
+      },
     }))
     .catch((error) => recordSystemError("web_transport_start", error));
 }
@@ -2106,6 +2305,268 @@ function inboundMediaPlaceholder(mediaType = "media") {
   return "[Customer sent a media message]";
 }
 
+async function recordRecoveredWebMessage({
+  id = "",
+  from = "",
+  text = "",
+  mediaType = "",
+  caption = "",
+  source = {},
+  businessAccountId = config.accountId,
+  recoveredAt = "",
+  originalTimestamp = "",
+} = {}) {
+  const customerId = String(from || "").trim();
+  const messageId = String(id || "").trim();
+  if (!customerId || !messageId) return { imported: false, reason: "missing_customer_or_message_id" };
+  const normalizedMediaType = mediaType ? normalizeInboundMediaType(mediaType) : "text";
+  const body = normalizedMediaType === "text"
+    ? String(text || "").trim()
+    : inboundMediaPlaceholder(normalizedMediaType);
+  const cleanCaption = String(caption || "").trim();
+  if (!body && !cleanCaption) return { imported: false, reason: "empty_recovered_message" };
+  const correlationId = correlationIdForInbound(messageId, customerId);
+  const contactPatch = customerContactPatch(customerId, source);
+  const claim = await store.claimProcessedMessage(messageId, businessAccountId, {
+    customerId,
+    correlationId,
+    mediaType: normalizedMediaType,
+    recoveredAfterReconnect: true,
+    recoveryImportOnly: true,
+  });
+  if (!claim.claimed || await store.hasOutboxMessageId(messageId, businessAccountId)) {
+    console.log(`Skipping duplicate recovered WhatsApp Web message ${messageId} from ${customerId}.`);
+    if (claim.claimed) {
+      await store.completeProcessedMessage(messageId, businessAccountId, {
+        correlationId,
+        customerId,
+        recoveredAfterReconnect: true,
+        recoveryImportOnly: true,
+        duplicateInbound: true,
+      }).catch(() => {});
+    }
+    return {
+      imported: false,
+      duplicateInbound: true,
+      correlationId: claim.record?.correlationId || correlationId,
+    };
+  }
+  const createdAt = originalTimestamp || recoveredAt || new Date().toISOString();
+  await store.appendOutbox({
+    id: messageId,
+    direction: "inbound",
+    from: customerId,
+    to: "agent",
+    businessAccountId,
+    correlationId,
+    channel: "customer",
+    type: normalizedMediaType,
+    body,
+    caption: cleanCaption,
+    createdAt,
+    source,
+    recoveredAfterReconnect: true,
+    recoveryImportOnly: true,
+  });
+  await store.getOrCreateCustomer(customerId, {
+    lastInboundMessageId: messageId,
+    lastMessageAt: createdAt,
+    lastInboundAt: createdAt,
+    recordInbound: true,
+    businessAccountId,
+    source: {
+      ...(source || {}),
+      recoveredAfterReconnect: true,
+      recoveryImportOnly: true,
+    },
+    ...contactPatch,
+  });
+  await store.completeProcessedMessage(messageId, businessAccountId, {
+    correlationId,
+    customerId,
+    recoveredAfterReconnect: true,
+    recoveryImportOnly: true,
+    handoffRequired: false,
+  }).catch(() => {});
+  await store.appendAuditLog({
+    actor: "system",
+    action: "web_recovery_message_imported",
+    customerId,
+    result: `${normalizedMediaType}:${messageId}`,
+    reason: "Imported missed WhatsApp Web message after reconnect without AI auto-processing.",
+    businessAccountId,
+    correlationId,
+  });
+  return { imported: true, correlationId };
+}
+
+async function safelyProcessRecoveredMessage({
+  customerId = "",
+  messageId = "",
+  businessAccountId = config.accountId,
+  actor = "admin",
+} = {}) {
+  const customer = await store.getCustomer(customerId, businessAccountId);
+  if (!customer) throw new Error("Customer not found.");
+  const messages = await store.listOutbox(businessAccountId);
+  const message = messages.find((item) =>
+    String(item.id || "") === String(messageId || "") &&
+    String(item.businessAccountId || config.accountId) === String(businessAccountId || config.accountId) &&
+    item.direction === "inbound" &&
+    item.channel === "customer" &&
+    item.from === customerId
+  );
+  if (!message) throw new Error("Recovered message not found.");
+  if (!message.recoveredAfterReconnect || !message.recoveryImportOnly) {
+    throw new Error("Only import-only recovered messages can be processed from this button.");
+  }
+  const messageType = normalizeInboundMediaType(message.type || "text");
+  if (messageType !== "text") {
+    throw new Error("Recovered media messages need manual review because media bytes may not be available after history sync.");
+  }
+  const text = String(message.body || message.caption || "").trim();
+  if (!text) throw new Error("Recovered message has no text to process.");
+  const createdAt = new Date(message.createdAt || 0);
+  if (!Number.isFinite(createdAt.getTime()) || Date.now() - createdAt.getTime() > DAY_MS) {
+    throw new Error("Recovered message is older than 24 hours. Please reply manually.");
+  }
+  const activeState = conversationActiveState(customer);
+  if (["complaint", "handoff", "submittedOrder", "done", "optedOut", "anotherDatePurchase"].includes(activeState)) {
+    throw new Error(`Customer is currently in ${activeState}; please handle manually.`);
+  }
+  const laterConversationMessages = messages.filter((item) =>
+    String(item.businessAccountId || config.accountId) === String(businessAccountId || config.accountId) &&
+    ["customer", "business_admin"].includes(String(item.channel || "")) &&
+    (item.from === customerId || item.to === customerId) &&
+    String(item.createdAt || "") > String(message.createdAt || "")
+  );
+  if (laterConversationMessages.some((item) => item.channel === "business_admin" || item.from === `business_admin:${businessAccountId}`)) {
+    throw new Error("Manual staff reply already happened after this recovered message.");
+  }
+  if (laterConversationMessages.some((item) => item.direction === "inbound" && item.from === customerId)) {
+    throw new Error("A newer customer message exists. Process the latest recovered message instead.");
+  }
+  if (!customer.productId) {
+    const content = await getTeamContent(businessAccountId);
+    const productResolution = resolveProduct(
+      content.catalog,
+      text,
+      productDetectionSource(customer, message.source || {}),
+      customer.productId || ""
+    );
+    if (!hasConfidentProductResolution(productResolution)) {
+      throw new Error("Product is not confidently locked for this recovered message. Select/send product context first.");
+    }
+  }
+  const processId = `${messageId}:safe_process`;
+  const correlationId = correlationIdForInbound(processId, customerId);
+  const claim = await store.claimProcessedMessage(processId, businessAccountId, {
+    customerId,
+    correlationId,
+    recoveredAfterReconnect: true,
+    safeAutoProcess: true,
+    sourceMessageId: messageId,
+  });
+  if (!claim.claimed) {
+    return {
+      ok: true,
+      alreadyProcessed: true,
+      customerId,
+      messageId,
+      correlationId: claim.record?.correlationId || correlationId,
+    };
+  }
+  try {
+    const result = await processInboundMessage({
+      id: processId,
+      from: customerId,
+      text,
+      source: {
+        ...(message.source || {}),
+        recoveredAfterReconnect: true,
+        safeAutoProcess: true,
+        sourceMessageId: messageId,
+      },
+      live: true,
+      businessAccountId,
+      skipInboundRecord: true,
+      skipMessageMergeBuffer: true,
+      correlationId,
+    });
+    await store.completeProcessedMessage(processId, businessAccountId, {
+      correlationId,
+      customerId,
+      orderId: result?.order?.id || result?.order?.orderId || "",
+      handoffRequired: Boolean(result?.handoffRequired),
+      recoveredAfterReconnect: true,
+      safeAutoProcess: true,
+      sourceMessageId: messageId,
+    });
+    await store.appendAuditLog({
+      actor,
+      action: "web_recovery_message_processed",
+      customerId,
+      result: `${messageType}:${messageId}`,
+      reason: "Admin processed an import-only recovered WhatsApp Web message through the existing inbound pipeline.",
+      businessAccountId,
+      correlationId,
+    });
+    return {
+      ok: true,
+      customerId,
+      messageId,
+      sent: Array.isArray(result?.messages) ? result.messages.length : 0,
+      handoffRequired: Boolean(result?.handoffRequired),
+      correlationId,
+    };
+  } catch (error) {
+    await store.failProcessedMessage(processId, businessAccountId, error?.code || error?.name || "RECOVERY_PROCESS_FAILED", {
+      correlationId,
+      customerId,
+      recoveredAfterReconnect: true,
+      safeAutoProcess: true,
+      sourceMessageId: messageId,
+    }).catch(() => {});
+    throw error;
+  }
+}
+
+function mediaUnderstandingErrorDiagnostic(mediaType = "media", error = null) {
+  const rawMessage = String(error?.message || error || "Unknown media understanding error").trim();
+  const message = rawMessage || "Unknown media understanding error";
+  const lower = message.toLowerCase();
+  let category = "unexpected processing error";
+  if (lower.includes("missing whatsapp access token")) {
+    category = "missing WhatsApp media download credentials";
+  } else if (lower.includes("whatsapp media metadata failed")) {
+    category = "WhatsApp media metadata request failed";
+  } else if (lower.includes("did not include a download url")) {
+    category = "WhatsApp media download URL missing";
+  } else if (lower.includes("whatsapp media download failed")) {
+    category = "WhatsApp media file download failed";
+  } else if (lower.includes("openai /responses returned non-json")) {
+    category = "OpenAI image response was not valid JSON";
+  } else if (lower.includes("openai /responses failed")) {
+    category = "OpenAI image understanding request failed";
+  } else if (lower.includes("openai /audio/transcriptions returned non-json")) {
+    category = "OpenAI audio transcription response was not valid JSON";
+  } else if (lower.includes("openai /audio/transcriptions failed")) {
+    category = "OpenAI audio transcription request failed";
+  } else if (/\b(fetch failed|econnreset|etimedout|enotfound|network)\b/i.test(message)) {
+    category = "network request failed";
+  }
+  return {
+    category,
+    reason: `Customer sent ${mediaType}; media understanding failed (${category}). Manual reply is required.`,
+    details: [
+      `mediaType=${mediaType}`,
+      `failureCategory=${category}`,
+      `error=${message}`,
+      error?.stack ? `stack=${String(error.stack).slice(0, 2000)}` : "",
+    ].filter(Boolean).join("\n"),
+  };
+}
+
 async function processInboundMediaMessage({
   id = "",
   from,
@@ -2218,14 +2679,25 @@ async function processInboundMediaMessage({
     await completeMediaProcessedMessage(id, businessAccountId, correlationId, from, Boolean(result?.handoffRequired));
     return result;
   } catch (error) {
-    await recordSystemError("inbound_media_understanding", error, `Customer: ${from}; mediaType: ${normalizedMediaType}`, businessAccountId);
+    const diagnostic = mediaUnderstandingErrorDiagnostic(normalizedMediaType, error);
+    await recordSystemError(
+      "inbound_media_understanding",
+      error,
+      [
+        `Customer: ${from}`,
+        `Message ID: ${id || ""}`,
+        `Correlation ID: ${correlationId}`,
+        diagnostic.details,
+      ].filter(Boolean).join("\n"),
+      businessAccountId
+    );
     const customer = await markInboundMediaHandoff({
       from,
       mediaType: normalizedMediaType,
       source,
       businessAccountId,
       correlationId,
-      reason: `Customer sent ${normalizedMediaType}; media understanding failed and manual reply is required.`,
+      reason: diagnostic.reason,
     });
     await completeMediaProcessedMessage(id, businessAccountId, correlationId, from, true);
     return { customer, messages: [], handoffRequired: true, handoffReason: customer.handoffReason, correlationId };
@@ -3423,11 +3895,60 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
     body,
     purpose: "manual_whatsapp_message",
   });
+  const actor = `business_admin:${businessAccountId}`;
+  const customerBeforeClear = await store.getOrCreateCustomer(from, { businessAccountId });
+  let templateSuggestion = null;
+  try {
+    templateSuggestion = await maybeSuggestTemplateFromManualReply(customerBeforeClear, body, businessAccountId);
+  } catch (learningError) {
+    await recordSystemError("manual_phone_reply_learning", learningError, `Customer: ${from}`, businessAccountId);
+  }
+  const openComplaints = (await store.listComplaintCases(businessAccountId))
+    .filter((complaint) => complaint.customerId === from && complaint.status !== "resolved");
+  for (const complaint of openComplaints) {
+    await store.resolveComplaintCase(complaint.id, businessAccountId, actor);
+  }
+  const hasOpenComplaint = (await store.listComplaintCases(businessAccountId))
+    .some((complaint) => complaint.customerId === from && complaint.status !== "resolved");
+  const wasComplaintHandoff = Boolean(
+    openComplaints.length ||
+    customerBeforeClear.complaintStatus === "open" ||
+    String(customerBeforeClear.handoffReason || "").startsWith("Complaint")
+  );
+  const shouldKeepProductRequiredHandoff = Boolean(
+    customerBeforeClear.handoffStatus === "human_required" &&
+    !customerBeforeClear.productId &&
+    !wasComplaintHandoff
+  );
+  await store.updateCustomer(from, (customer) => ({
+    handoffStatus: shouldKeepProductRequiredHandoff ? "human_required" : "",
+    handoffReason: shouldKeepProductRequiredHandoff
+      ? "Manual phone reply recorded, but product must be selected before follow-up can resume."
+      : "",
+    ...(shouldKeepProductRequiredHandoff ? {} : {
+      handoffAcknowledgedAt: now,
+      handoffAcknowledgedBy: actor,
+    }),
+    lastTemplateSuggestionId: templateSuggestion?.id || customer.lastTemplateSuggestionId || "",
+    ...(hasOpenComplaint ? {} : {
+      complaintStatus: customer.complaintStatus === "open" ? "resolved" : customer.complaintStatus,
+      complaintResolvedAt: openComplaints.length ? now : customer.complaintResolvedAt,
+      followupBlocked: shouldKeepProductRequiredHandoff ? true : Boolean(customer.optedOut),
+      followupBlockedReason: shouldKeepProductRequiredHandoff
+        ? "product_required_after_manual_phone_reply"
+        : customer.optedOut ? customer.followupBlockedReason : "",
+    }),
+  }), businessAccountId);
   await store.appendAuditLog({
-    actor: `business_admin:${businessAccountId}`,
+    actor,
     action: "manual_whatsapp_message_recorded",
     customerId: from,
-    result: id || "",
+    result: [
+      id || "",
+      templateSuggestion ? `template_suggestion:${templateSuggestion.id}` : "",
+      openComplaints.length ? `resolved_complaints:${openComplaints.length}` : "",
+      shouldKeepProductRequiredHandoff ? "product_required_before_handoff_clear" : "",
+    ].filter(Boolean).join("; "),
     businessAccountId,
   });
 }
@@ -5952,6 +6473,44 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
         createdAt: customer.lastMessageAt || customer.firstSeenAt || "",
       })),
   ].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const recoveredByCustomer = new Map();
+  for (const message of outbox) {
+    if (
+      message.direction !== "inbound" ||
+      !message.recoveredAfterReconnect ||
+      !message.recoveryImportOnly ||
+      !message.from
+    ) continue;
+    const existing = recoveredByCustomer.get(message.from);
+    if (!existing) {
+      recoveredByCustomer.set(message.from, { customerId: message.from, messages: [message] });
+    } else {
+      existing.messages.push(message);
+    }
+  }
+  const recoveryQueue = await Promise.all([...recoveredByCustomer.values()].map(async (entry) => {
+    const sortedMessages = entry.messages
+      .slice()
+      .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+    const latest = sortedMessages.at(-1) || {};
+    const customer = customerById.get(entry.customerId) || {};
+    const processed = latest.id
+      ? await store.getProcessedMessage(`${latest.id}:safe_process`, businessAccountId).catch(() => null)
+      : null;
+    return {
+      customerId: entry.customerId,
+      phone: customerPhone(entry.customerId),
+      productId: customer.productId || "",
+      product: productById.get(customer.productId)?.name || customer.productId || "",
+      status: processed?.processingStatus === "completed" ? "processed" : "pending",
+      messageId: latest.id || "",
+      messageType: latest.type || "text",
+      message: latest.body || latest.caption || "",
+      missedCount: sortedMessages.length,
+      createdAt: latest.createdAt || "",
+    };
+  }));
+  recoveryQueue.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 
   return {
     generatedAt: now.toISOString(),
@@ -5962,6 +6521,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       orders: orders.length,
       followupsDue: followupRows.filter((row) => /^due\b/i.test(row.status || "")).length,
       followupsQueued: pendingFollowupDispatches,
+      recovery: recoveryQueue.filter((row) => row.status !== "processed").length,
       deleted: deletedCustomers.length,
       outbox: outbox.length,
       optedOut: guardrails.optedOut,
@@ -5993,6 +6553,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     customers: customerRows,
     anotherDatePurchaseCustomers,
     handoffQueue,
+    recoveryQueue,
     orders: orders.map((order) => ({
       id: order.id,
       customerId: order.customerId,
@@ -6151,6 +6712,8 @@ function formatDashboardMessage(message) {
             ? "Business admin"
             : "AI agent",
     body: message.body || message.caption || message.url || (message.name ? `[template] ${message.name}` : ""),
+    recoveredAfterReconnect: Boolean(message.recoveredAfterReconnect),
+    recoveryImportOnly: Boolean(message.recoveryImportOnly),
   };
 }
 
@@ -10552,6 +11115,26 @@ function decodeUploadedFollowupMedia(dataUrl) {
   };
 }
 
+function decodeUploadedChatMedia(dataUrl) {
+  const match = /^data:([^;]+);base64,(.+)$/i.exec(String(dataUrl || ""));
+  if (!match) return null;
+  const mimeType = match[1].toLowerCase();
+  const mediaType = CHAT_MEDIA_TYPES.get(mimeType);
+  if (!mediaType) return null;
+  const bytes = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+  if (bytes.length > mediaType.maxBytes) {
+    const limit = mediaType.type === "video" ? "16 MB" : "5 MB";
+    const error = new Error(`${mediaType.type === "video" ? "Video" : "Photo"} must be ${limit} or smaller.`);
+    error.code = "MEDIA_TOO_LARGE";
+    throw error;
+  }
+  return {
+    ...mediaType,
+    mimeType,
+    bytes,
+  };
+}
+
 async function persistCatalog() {
   const contents = `${JSON.stringify(catalog, null, 2)}\n`;
   catalogWriteQueue = catalogWriteQueue.then(() => writeFile(config.catalogPath, contents, "utf8"));
@@ -11564,6 +12147,55 @@ function adminDashboardHtml() {
       width: 16px;
       height: 16px;
     }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      background: rgba(0,0,0,.32);
+    }
+    .modal-card {
+      width: min(460px, 100%);
+      background: #fff;
+      border: 1px solid #e5e5ea;
+      border-radius: 10px;
+      box-shadow: 0 18px 48px rgba(0,0,0,.18);
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+    .modal-card h3 {
+      margin: 0;
+      font-size: 17px;
+    }
+    .modal-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .modal-card label {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .modal-card select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
     .tabs {
       display: flex;
       flex-wrap: wrap;
@@ -11901,6 +12533,7 @@ function adminDashboardHtml() {
       <button class="tab" type="button" data-tab="order-customers">Customer List</button>
       <button class="tab" type="button" data-tab="another-date-purchase">Another Date Purchase</button>
       <button class="tab" type="button" data-tab="handoff">Handoff</button>
+      <button class="tab" type="button" data-tab="recovery">Recovery</button>
       <button class="tab" type="button" data-tab="orders">Orders</button>
       <button class="tab" type="button" data-tab="followups">Follow-ups</button>
       <button class="tab" type="button" data-tab="deleted">Deleted</button>
@@ -11941,6 +12574,11 @@ function adminDashboardHtml() {
         <label for="handoff-date">Date <input id="handoff-date" type="date" /></label>
         <button id="handoff-all" type="button">All Dates</button>
       </div>
+      <div class="table-wrap"></div>
+    </section>
+    <section id="recovery" class="panel">
+      <h2>Recovery</h2>
+      <p class="note">Missed customer messages imported after WhatsApp Web reconnect. Review first, then process with AI only when safe.</p>
       <div class="table-wrap"></div>
     </section>
     <section id="orders" class="panel">
@@ -11995,6 +12633,7 @@ function adminDashboardHtml() {
       orderCustomers: document.querySelector("#order-customers .table-wrap"),
       anotherDatePurchase: document.querySelector("#another-date-purchase .table-wrap"),
       handoff: document.querySelector("#handoff .table-wrap"),
+      recovery: document.querySelector("#recovery .table-wrap"),
       orders: document.querySelector("#orders .table-wrap"),
       followups: document.querySelector("#followups .table-wrap"),
       deleted: document.querySelector("#deleted .table-wrap")
@@ -12110,6 +12749,7 @@ function adminDashboardHtml() {
         newCustomers: data.analytics?.totalNewCustomersToday || 0,
         handoff: handoffRows.length,
         complaints: handoffRows.filter(row => row.type === "complaint").length,
+        recovery: (data.recoveryQueue || []).filter(row => row.status !== "processed").length,
         orders: rowsForDate(data.orders || [], "createdAt", selectedDate).length,
         orderCustomers: new Set(rowsForDate(data.orderCustomers || [], "createdAt", selectedDate).map(row => row.customerId).filter(Boolean)).size,
         anotherDatePurchase: (data.anotherDatePurchaseCustomers || []).length,
@@ -12226,11 +12866,9 @@ function adminDashboardHtml() {
         } else if (actionKey === "ack-handoff") {
           for (const item of ids) {
             const parts = String(item).split("::");
-            await request("/admin/handoff/acknowledge", {
-              customerId: parts[0] || "",
-              type: parts[1] || "conversation",
-              caseId: parts[2] || "",
-            });
+            const row = handoffRowFor(parts[0] || "", parts[1] || "conversation", parts[2] || "");
+            const acknowledged = await acknowledgeHandoffRow(row);
+            if (!acknowledged) return;
           }
         } else if (actionKey === "reached-warehouse") {
           for (const item of ids) {
@@ -12277,6 +12915,7 @@ function adminDashboardHtml() {
       const summaryItems = [
         ['Customers', stats.newCustomers],
         ['Handoff', stats.handoff],
+        ['Recovery', stats.recovery],
         ['Complaints', stats.complaints],
         ['Orders', stats.orders]
       ];
@@ -12289,6 +12928,7 @@ function adminDashboardHtml() {
       renderCustomerLabelTabs(customerFilterBase());
       renderCustomers();
       renderHandoff();
+      renderRecovery();
       renderOrderCustomerSkuFilter();
       renderOrderCustomers();
       renderAnotherDatePurchaseCustomers();
@@ -12316,7 +12956,7 @@ function adminDashboardHtml() {
         { label: 'Type', key: 'type', render: r => pill(r.type) },
         { label: 'Customer', key: 'customerId' },
         { label: 'Phone', key: 'phone' },
-        { label: 'Product', key: 'product' },
+        { label: 'Product', key: 'product', render: r => r.product ? esc(r.product) : '<span class="pill warn">No product locked</span>' },
         { label: 'Category', key: 'category' },
         { label: 'Customer Message', key: 'customerMessage' },
         { label: 'Reason', key: 'reason' },
@@ -12330,16 +12970,52 @@ function adminDashboardHtml() {
       bindManualOrderButtons();
       document.querySelectorAll("button[data-handoff-ack]").forEach(button => button.addEventListener("click", async () => {
         if (!confirm("Acknowledge this handoff and remove it from the Handoff tab?")) return;
-        await request("/admin/handoff/acknowledge", {
-          customerId: button.dataset.handoffAck,
-          type: button.dataset.handoffType,
-          caseId: button.dataset.handoffCase
-        });
+        const row = handoffRowFor(button.dataset.handoffAck, button.dataset.handoffType, button.dataset.handoffCase);
+        const acknowledged = await acknowledgeHandoffRow(row);
+        if (!acknowledged) return;
         loadDashboard();
       }));
       document.querySelectorAll("button[data-complaint-resolve]").forEach(button => button.addEventListener("click", async () => {
         await request("/admin/handoff/complaint/resolve", { caseId: button.dataset.complaintResolve });
         loadDashboard();
+      }));
+    }
+
+    function renderRecovery() {
+      const rows = dashboardData ? dashboardData.recoveryQueue || [] : [];
+      sections.recovery.innerHTML = table(rows, [
+        { label: 'Customer', key: 'customerId' },
+        { label: 'Phone', key: 'phone' },
+        { label: 'Product', key: 'product', render: r => r.product ? esc(r.product) : '<span class="pill warn">No product locked</span>' },
+        { label: 'Missed Message', key: 'message' },
+        { label: 'Missed Count', key: 'missedCount' },
+        { label: 'Status', key: 'status', render: r => pill(r.status) },
+        { label: 'Time', key: 'createdAt', render: r => fmtTime(r.createdAt) },
+        { label: 'Action', key: 'messageId', render: r => '<div class="actions"><button type="button" data-recovery-chat="' + esc(r.customerId) + '">Chat</button>' +
+          (r.status === 'processed'
+            ? '<span class="muted">Processed</span>'
+            : '<button type="button" data-recovery-process="' + esc(r.messageId || '') + '" data-recovery-customer="' + esc(r.customerId || '') + '">Process with AI</button>') +
+          '</div>' }
+      ]);
+      document.querySelectorAll("button[data-recovery-chat]").forEach(button => button.addEventListener("click", () => {
+        window.location.href = "/admin/chat?customerId=" + encodeURIComponent(button.dataset.recoveryChat);
+      }));
+      document.querySelectorAll("button[data-recovery-process]").forEach(button => button.addEventListener("click", async () => {
+        if (!confirm("Process this recovered message with AI now? The system will refuse if it is not safe.")) return;
+        button.disabled = true;
+        button.textContent = "Processing...";
+        try {
+          await request("/admin/chat/process-recovered", {
+            customerId: button.dataset.recoveryCustomer,
+            messageId: button.dataset.recoveryProcess,
+          });
+          await loadDashboard();
+          openDashboardTab("recovery");
+        } catch (error) {
+          alert(error.message || "Recovered message could not be processed.");
+          button.disabled = false;
+          button.textContent = "Process with AI";
+        }
       }));
     }
 
@@ -12633,6 +13309,93 @@ function adminDashboardHtml() {
       return result;
     }
 
+    function handoffRowFor(customerId, type, caseId) {
+      const rows = dashboardData ? dashboardData.handoffQueue || [] : [];
+      return rows.find(row =>
+        String(row.customerId || "") === String(customerId || "") &&
+        String(row.type || "conversation") === String(type || "conversation") &&
+        String(row.caseId || "") === String(caseId || "")
+      ) || rows.find(row => String(row.customerId || "") === String(customerId || ""));
+    }
+
+    function chooseHandoffProduct(row) {
+      const products = dashboardData ? dashboardData.products || [] : [];
+      if (!products.length) {
+        alert("No products are configured for this account.");
+        return Promise.resolve("");
+      }
+      return new Promise(resolve => {
+        const backdrop = document.createElement("div");
+        backdrop.className = "modal-backdrop";
+        const card = document.createElement("div");
+        card.className = "modal-card";
+        const title = document.createElement("h3");
+        title.textContent = "Choose product";
+        const help = document.createElement("p");
+        help.textContent = "This customer has no product locked. Select the product before clearing handoff so follow-ups can continue correctly.";
+        const label = document.createElement("label");
+        label.textContent = "Product";
+        const select = document.createElement("select");
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "Choose product...";
+        select.appendChild(placeholder);
+        products.forEach(product => {
+          const option = document.createElement("option");
+          option.value = product.id || "";
+          option.textContent = product.name || product.id || "";
+          select.appendChild(option);
+        });
+        if (row?.productId) select.value = row.productId;
+        label.appendChild(select);
+        const actions = document.createElement("div");
+        actions.className = "modal-actions";
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.textContent = "Cancel";
+        const confirmButton = document.createElement("button");
+        confirmButton.type = "button";
+        confirmButton.textContent = "Save & Acknowledge";
+        actions.append(cancel, confirmButton);
+        card.append(title, help, label, actions);
+        backdrop.appendChild(card);
+        document.body.appendChild(backdrop);
+        const close = value => {
+          backdrop.remove();
+          resolve(value || "");
+        };
+        cancel.addEventListener("click", () => close(""));
+        backdrop.addEventListener("click", event => {
+          if (event.target === backdrop) close("");
+        });
+        confirmButton.addEventListener("click", () => {
+          if (!select.value) {
+            alert("Please choose a product first.");
+            select.focus();
+            return;
+          }
+          close(select.value);
+        });
+        select.focus();
+      });
+    }
+
+    async function acknowledgeHandoffRow(row) {
+      if (!row) throw new Error("Handoff row not found.");
+      let productId = row.productId || "";
+      if (String(row.type || "conversation") !== "complaint" && !productId) {
+        productId = await chooseHandoffProduct(row);
+        if (!productId) return false;
+      }
+      await request("/admin/handoff/acknowledge", {
+        customerId: row.customerId,
+        type: row.type || "conversation",
+        caseId: row.caseId || "",
+        productId,
+      });
+      return true;
+    }
+
     function setTabLabel(tabId, label, counts) {
       const tab = document.querySelector('.tab[data-tab="' + tabId + '"]');
       if (!tab) return;
@@ -12652,6 +13415,7 @@ function adminDashboardHtml() {
         { value: stats.handoff, title: "Handoff" },
         { value: stats.complaints, title: "Complaints", soft: true }
       ]);
+      setTabLabel("recovery", "Recovery", [{ value: stats.recovery }]);
       setTabLabel("orders", "Orders", [{ value: stats.orders }]);
       setTabLabel("followups", "Follow-ups", [
         { value: stats.followupsDue, title: "Due" },
@@ -12937,14 +13701,22 @@ function adminChatPageHtml() {
     .row.staff .bubble { background: #dff6dd; border-color: #bee8ba; }
     .row.admin .bubble { background: #fff8e8; border-color: #f5dfaa; }
     .meta { margin-bottom: 5px; color: var(--muted); font-size: 11px; font-weight: 700; }
+    .recovery-actions { margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .recovery-actions button { padding: 6px 9px; font-size: 12px; background: #fff; color: #1d1d1f; }
+    .recovery-badge { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #fff8e8; color: #7a4a00; border: 1px solid #f5dfaa; font-size: 11px; font-weight: 700; }
     .composer { padding: 12px; border-top: 1px solid #e5e5ea; background: #fff; }
     .composer-state { min-height: 18px; color: var(--muted); font-size: 12px; margin-bottom: 7px; }
+    .composer-tools { display: grid; grid-template-columns: minmax(150px, 220px) minmax(180px, 1fr) minmax(160px, 240px); gap: 8px; margin-bottom: 8px; align-items: center; }
+    .composer-tools input, .composer-tools select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px; font: inherit; background: #fff; min-width: 0; }
+    .media-picker { border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px; font: inherit; font-weight: 700; color: #1d1d1f; background: #fff; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .media-picker input { display: none; }
     .composer-row { display: flex; gap: 8px; align-items: end; }
     textarea { flex: 1; min-height: 58px; max-height: 160px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; }
-    textarea:focus, input:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
+    textarea:focus, input:focus, select:focus { outline: 3px solid rgba(0,113,227,.18); border-color: var(--accent); }
     .composer button { min-width: 80px; background: var(--accent); border-color: var(--accent); color: #fff; }
+    .composer button.secondary { background: #fff; border-color: var(--line); color: #1d1d1f; min-width: 142px; }
     .empty { color: var(--muted); padding: 18px; }
-    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } .chat-header { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } .chat-header { align-items: flex-start; flex-direction: column; } .composer-tools { grid-template-columns: 1fr; } .composer-row { flex-wrap: wrap; } textarea { flex-basis: 100%; } }
   </style>
 </head>
 <body>
@@ -12978,9 +13750,15 @@ function adminChatPageHtml() {
         <div class="thread" id="thread"><div class="empty">No conversation selected.</div></div>
         <form class="composer" id="composer">
           <div class="composer-state" id="composer-state"></div>
+          <div class="composer-tools">
+            <label class="media-picker" for="media-file" id="media-label">Attach photo/video<input id="media-file" type="file" accept="image/jpeg,image/png,image/webp,video/mp4" disabled /></label>
+            <input id="media-caption" maxlength="500" placeholder="Optional media caption" disabled />
+            <select id="opening-product" disabled></select>
+          </div>
           <div class="composer-row">
             <textarea id="reply-text" maxlength="${escapeHtml(config.maxReplyChars)}" placeholder="Type manual WhatsApp reply..." disabled></textarea>
             <button id="send-reply" type="submit" disabled>Send</button>
+            <button id="send-opening-flow" class="secondary" type="button" disabled>Send Opening Flow</button>
           </div>
         </form>
       </section>
@@ -12996,7 +13774,18 @@ function adminChatPageHtml() {
     const search = document.querySelector("#search");
     const replyText = document.querySelector("#reply-text");
     const sendButton = document.querySelector("#send-reply");
+    const mediaFile = document.querySelector("#media-file");
+    const mediaCaption = document.querySelector("#media-caption");
+    const mediaLabel = document.querySelector("#media-label");
+    const openingProduct = document.querySelector("#opening-product");
+    const openingFlowButton = document.querySelector("#send-opening-flow");
     const state = document.querySelector("#composer-state");
+    const mediaLimits = {
+      "image/jpeg": 5 * 1024 * 1024,
+      "image/png": 5 * 1024 * 1024,
+      "image/webp": 5 * 1024 * 1024,
+      "video/mp4": 16 * 1024 * 1024
+    };
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
@@ -13049,6 +13838,43 @@ function adminChatPageHtml() {
       if (!response.ok) throw new Error(result.error || "Request failed");
       return result;
     }
+    function activeCustomer() {
+      return customerRows().find(item => item.id === activeCustomerId);
+    }
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Unable to read selected media."));
+        reader.readAsDataURL(file);
+      });
+    }
+    function selectedMediaFile() {
+      return mediaFile.files && mediaFile.files[0] ? mediaFile.files[0] : null;
+    }
+    function validateMediaFile(file) {
+      if (!file) return "";
+      const limit = mediaLimits[file.type];
+      if (!limit) return "Only JPG, PNG, WEBP photos or MP4 videos are supported.";
+      if (file.size > limit) return file.type === "video/mp4" ? "Video must be 16 MB or smaller." : "Photo must be 5 MB or smaller.";
+      return "";
+    }
+    function renderOpeningProductSelect(customer) {
+      const products = data ? data.products || [] : [];
+      if (!customer) {
+        openingProduct.innerHTML = '<option value="">Choose product...</option>';
+        return;
+      }
+      const options = ['<option value="">Choose product...</option>'].concat(products.map(product =>
+        '<option value="' + esc(product.id) + '">' + esc(product.name || product.id) + '</option>'
+      ));
+      openingProduct.innerHTML = options.join("");
+      openingProduct.value = customer.productId || "";
+    }
+    function renderMediaLabel() {
+      const file = selectedMediaFile();
+      mediaLabel.childNodes[0].nodeValue = file ? file.name : "Attach photo/video";
+    }
     function customerRows() {
       const q = search.value.trim().toLowerCase();
       const rows = data ? data.customers || [] : [];
@@ -13086,9 +13912,15 @@ function adminChatPageHtml() {
       });
     }
     function renderThread() {
-      const customer = customerRows().find(item => item.id === activeCustomerId);
+      const customer = activeCustomer();
       replyText.disabled = !customer;
       sendButton.disabled = !customer;
+      mediaFile.disabled = !customer;
+      mediaCaption.disabled = !customer;
+      openingProduct.disabled = !customer;
+      openingFlowButton.disabled = !customer;
+      renderOpeningProductSelect(customer);
+      renderMediaLabel();
       if (!customer) {
         header.innerHTML = '<div><strong>No customer selected</strong><span>Select a customer on the left.</span></div>';
         thread.innerHTML = '<div class="empty">No conversation selected.</div>';
@@ -13108,11 +13940,23 @@ function adminChatPageHtml() {
       thread.innerHTML = messages.map(message => {
         const role = message.direction === "inbound" ? "customer" : message.channel === "business_admin" ? "staff" : message.channel === "admin" ? "admin" : "agent";
         const label = role === "customer" ? "Customer" : role === "staff" ? "You" : role === "admin" ? "Admin alert" : "AI agent";
+        const mediaLine = message.type === "image" || message.type === "video"
+          ? '<div><strong>' + esc(message.type === "image" ? "Photo" : "Video") + ':</strong> ' +
+            (message.url ? '<a href="' + esc(message.url) + '" target="_blank" rel="noopener">open media</a>' : 'media sent') +
+            '</div>'
+          : "";
+        const body = mediaLine + (message.caption ? '<div>' + esc(message.caption) + '</div>' : esc(message.body || ''));
+        const recoveryActions = message.recoveredAfterReconnect && message.recoveryImportOnly && message.direction === "inbound"
+          ? '<div class="recovery-actions"><span class="recovery-badge">Recovered after reconnect</span><button type="button" data-process-recovered="' + esc(message.id || '') + '" data-recovered-customer="' + esc(message.from || '') + '">Process with AI</button></div>'
+          : "";
         return '<div class="row ' + role + '"><div class="bubble">' +
           '<div class="meta">' + esc(label) + ' | ' + esc(fmtTime(message.createdAt)) + '</div>' +
-          esc(message.body || '') +
+          body + recoveryActions +
         '</div></div>';
       }).join("");
+      thread.querySelectorAll("button[data-process-recovered]").forEach(button => {
+        button.addEventListener("click", () => processRecoveredMessage(button.dataset.recoveredCustomer, button.dataset.processRecovered));
+      });
       thread.scrollTop = thread.scrollHeight;
     }
     function render() {
@@ -13145,15 +13989,48 @@ function adminChatPageHtml() {
         state.textContent = error.message;
       }
     }
+    async function processRecoveredMessage(customerId, messageId) {
+      if (!customerId || !messageId) return;
+      if (!confirm("Process this recovered message with AI now? The system will refuse if it is not safe.")) return;
+      state.textContent = "Processing recovered message...";
+      try {
+        const result = await request("/admin/chat/process-recovered", { customerId, messageId });
+        state.textContent = result.alreadyProcessed
+          ? "Recovered message was already processed."
+          : "Recovered message processed" + (result.sent ? " (" + result.sent + " reply message" + (result.sent === 1 ? "" : "s") + ")" : "") + ".";
+        await load();
+      } catch (error) {
+        state.textContent = error.message;
+      }
+    }
     document.querySelector("#composer").addEventListener("submit", async (event) => {
       event.preventDefault();
       const text = replyText.value.trim();
-      if (!activeCustomerId || !text) return;
+      const file = selectedMediaFile();
+      if (!activeCustomerId || (!text && !file)) return;
+      const mediaError = validateMediaFile(file);
+      if (mediaError) {
+        state.textContent = mediaError;
+        return;
+      }
       sendButton.disabled = true;
       state.textContent = "Sending to " + activeCustomerId + "...";
       try {
-        const result = await request("/admin/manual-reply", { customerId: activeCustomerId, text });
+        let result = null;
+        if (file) {
+          result = await request("/admin/manual-reply/media", {
+            customerId: activeCustomerId,
+            dataUrl: await fileToDataUrl(file),
+            originalName: file.name,
+            caption: mediaCaption.value.trim() || text
+          });
+        } else {
+          result = await request("/admin/manual-reply", { customerId: activeCustomerId, text });
+        }
         replyText.value = "";
+        mediaCaption.value = "";
+        mediaFile.value = "";
+        renderMediaLabel();
         state.textContent = result.templateSuggestion
           ? "Sent. AI suggestion added for review."
           : "Sent.";
@@ -13163,6 +14040,32 @@ function adminChatPageHtml() {
       } finally {
         sendButton.disabled = false;
         replyText.focus();
+      }
+    });
+    mediaFile.addEventListener("change", () => {
+      renderMediaLabel();
+      const error = validateMediaFile(selectedMediaFile());
+      if (error) state.textContent = error;
+    });
+    openingFlowButton.addEventListener("click", async () => {
+      const customer = activeCustomer();
+      if (!customer) return;
+      const productId = openingProduct.value || customer.productId || "";
+      if (!productId) {
+        state.textContent = "Choose a product before sending opening flow.";
+        openingProduct.focus();
+        return;
+      }
+      openingFlowButton.disabled = true;
+      state.textContent = "Sending opening flow to " + activeCustomerId + "...";
+      try {
+        const result = await request("/admin/manual-reply/opening-flow", { customerId: activeCustomerId, productId });
+        state.textContent = "Opening flow sent (" + result.sent + " message" + (result.sent === 1 ? "" : "s") + ").";
+        await load();
+      } catch (error) {
+        state.textContent = error.message;
+      } finally {
+        openingFlowButton.disabled = false;
       }
     });
     search.addEventListener("input", render);
