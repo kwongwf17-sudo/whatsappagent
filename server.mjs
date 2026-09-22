@@ -69,6 +69,12 @@ import {
 } from "./lib/complaints.mjs";
 import { filterKnowledgeRecordsForRoute } from "./lib/retrieval.mjs";
 import { validateProductionConfig } from "./lib/config_security.mjs";
+import {
+  formatHandoffAlert,
+  handoffAlertPatch,
+  handoffAlertSettings,
+  shouldSendHandoffAlert,
+} from "./lib/handoff_alerts.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 await loadEnvFile(path.join(__dirname, ".env"));
@@ -2372,6 +2378,14 @@ async function markInboundMediaHandoff({
     reason: handoffReason,
     correlationId,
   });
+  await maybeSendHandoffAdminAlert({
+    customer,
+    customerId: from,
+    businessAccountId,
+    reason: handoffReason,
+    lastCustomerMessage: inboundMediaPlaceholder(normalizeInboundMediaType(mediaType)),
+    correlationId,
+  });
   return customer;
 }
 
@@ -2441,6 +2455,14 @@ async function recordInboundMediaHandoff({
     customerId: from,
     businessAccountId,
     result: normalizedMediaType,
+    correlationId,
+  });
+  await maybeSendHandoffAdminAlert({
+    customer,
+    customerId: from,
+    businessAccountId,
+    reason: customer.handoffReason,
+    lastCustomerMessage: inboundMediaPlaceholder(normalizedMediaType),
     correlationId,
   });
   if (id) {
@@ -2716,6 +2738,14 @@ async function processInboundMessageCore({
         result: blocked.code,
         correlationId,
       });
+      await maybeSendHandoffAdminAlert({
+        customer: updatedCustomer,
+        customerId: from,
+        businessAccountId,
+        reason: blocked.message,
+        lastCustomerMessage: text,
+        correlationId,
+      });
       return {
         customer: updatedCustomer,
         order: null,
@@ -2806,6 +2836,7 @@ async function processInboundMessageCore({
     catalog: teamCatalog,
     faqLibrary: teamFaqLibrary,
     salesReplyLibrary: teamSalesReplyLibrary,
+    activeState,
     conversationContext,
     businessAccountId: knowledgeAccountId,
   });
@@ -2861,6 +2892,15 @@ async function processInboundMessageCore({
       correlationId,
     });
     if (businessAccountId !== DEMO_ACCOUNT_ID) await notifyAdmin(`Complaint handoff for ${from} (${categoryLabel}): ${text}`, { businessAccountId, correlationId });
+    await maybeSendHandoffAdminAlert({
+      customer: updatedCustomer,
+      customerId: from,
+      businessAccountId,
+      product,
+      reason: updatedCustomer.handoffReason,
+      lastCustomerMessage: text,
+      correlationId,
+    });
     if (outbound.length) {
       await sendOutbound(from, outbound, {
         businessAccountId,
@@ -2911,6 +2951,15 @@ async function processInboundMessageCore({
     if (businessAccountId !== DEMO_ACCOUNT_ID) {
       await notifyAdmin(`Delivery reschedule requested for ${from}: ${text}`, { businessAccountId, correlationId });
     }
+    await maybeSendHandoffAdminAlert({
+      customer: updatedCustomer,
+      customerId: from,
+      businessAccountId,
+      product: routedProduct,
+      reason: updatedCustomer.handoffReason,
+      lastCustomerMessage: text,
+      correlationId,
+    });
     if (outbound.length) {
       await sendOutbound(from, outbound, {
         businessAccountId,
@@ -3230,6 +3279,17 @@ async function processInboundMessageCore({
   if (!flowsOnlyMode && (sendPlan.handoffRequired || repeatHandoffRequired) && !sendPlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
     await notifyAdmin(`Human handoff requested for ${from}: ${repeatHandoffReason || sendPlan.handoffReason || "No reason supplied."}`, { businessAccountId, correlationId });
   }
+  if (!flowsOnlyMode && (sendPlan.handoffRequired || repeatHandoffRequired)) {
+    await maybeSendHandoffAdminAlert({
+      customer: updatedCustomer,
+      customerId: from,
+      businessAccountId,
+      product,
+      reason: repeatHandoffReason || sendPlan.handoffReason || updatedCustomer.handoffReason || "",
+      lastCustomerMessage: text,
+      correlationId,
+    });
+  }
 
   const outbound = openingFlowAlreadyReserved
     ? []
@@ -3470,6 +3530,14 @@ async function handleOrderStatusRoute({
     if (businessAccountId !== DEMO_ACCOUNT_ID) {
       await notifyAdmin(`Order status request needs admin check for ${from}: ${text}`, { businessAccountId, correlationId });
     }
+    await maybeSendHandoffAdminAlert({
+      customer: updatedCustomer,
+      customerId: from,
+      businessAccountId,
+      reason: ORDER_LOOKUP_HANDOFF_REASON,
+      lastCustomerMessage: text,
+      correlationId,
+    });
     return {
       customer: updatedCustomer,
       order: latestOrder || null,
@@ -3545,6 +3613,14 @@ async function handleOrderStatusRoute({
       { businessAccountId, correlationId }
     );
   }
+  await maybeSendHandoffAdminAlert({
+    customer: updatedCustomer,
+    customerId: from,
+    businessAccountId,
+    reason: ORDER_LOOKUP_HANDOFF_REASON,
+    lastCustomerMessage: text,
+    correlationId,
+  });
   await delayBeforeStatusReply(from, alreadyHandedOff ? "order lookup update" : "order lookup handoff");
   await sendOutbound(from, outbound, {
     businessAccountId,
@@ -3628,6 +3704,7 @@ async function maybeClassifyCustomerMessageRoute({
   catalog: activeCatalog,
   faqLibrary: activeFaqLibrary,
   salesReplyLibrary: activeSalesReplyLibrary,
+  activeState = "",
   conversationContext = [],
   businessAccountId = config.accountId,
 }) {
@@ -3643,6 +3720,7 @@ async function maybeClassifyCustomerMessageRoute({
       customerMessage,
       normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
       productName: product?.name || "",
+      activeState,
       conversationContext,
       faqTopics,
       salesIntents,
@@ -7302,6 +7380,59 @@ async function notifyAdmin(body, meta = {}) {
   }
   await store.appendOutbox({ to: "admin", channel: "admin", type: "text", body, ...meta });
   console.log(`Admin notification:\n${body}`);
+}
+
+async function maybeSendHandoffAdminAlert({
+  customer = null,
+  customerId = "",
+  businessAccountId = config.accountId,
+  product = null,
+  reason = "",
+  lastCustomerMessage = "",
+  correlationId = "",
+} = {}) {
+  if (!customer || businessAccountId === DEMO_ACCOUNT_ID) return;
+  const teamSettings = await adminAccounts.getTeamSettings(businessAccountId);
+  if (!shouldSendHandoffAlert(customer, teamSettings)) return;
+  const alert = handoffAlertSettings(teamSettings);
+  const alertCustomerId = customerId || customer.id || "";
+  const resolvedProduct = product || await productForHandoffAlert(customer, businessAccountId);
+  const now = new Date();
+  const body = formatHandoffAlert({
+    accountId: businessAccountId,
+    customer,
+    customerId: alertCustomerId,
+    productName: resolvedProduct?.name || resolvedProduct?.productName || "",
+    reason: reason || customer.handoffReason || "",
+    lastCustomerMessage,
+    now,
+  });
+  try {
+    await sendOutbound(alert.number, [textMessage(body)], {
+      businessAccountId,
+      correlationId,
+      channel: "admin",
+      purpose: "handoff_admin_alert",
+      skipFailureRecord: true,
+    });
+    if (alertCustomerId) {
+      await store.updateCustomer(alertCustomerId, () => handoffAlertPatch(customer, now), businessAccountId);
+    }
+  } catch (error) {
+    await recordSystemError("handoff_admin_alert", error, `Customer: ${alertCustomerId || "unknown"}`, businessAccountId);
+  }
+}
+
+async function productForHandoffAlert(customer = {}, businessAccountId = config.accountId) {
+  const productId = customer.productId || customer.pendingOrder?.productId || customer.pendingUpsell?.productId || "";
+  if (!productId) return null;
+  try {
+    const content = await getTeamContent(businessAccountId);
+    const products = content?.catalog?.products || [];
+    return products.find((item) => item.id === productId || item.product_id === productId) || null;
+  } catch {
+    return null;
+  }
 }
 
 async function sendOutbound(to, messages, meta = {}) {
@@ -11025,6 +11156,16 @@ function superAdminSystemHtml() {
             <option value="gpt-5.4-mini">GPT-5.4 mini</option>
           </select>
         </label>
+        <label for="team-handoff-alert-number">WhatsApp Handoff Alert Number
+          <input id="team-handoff-alert-number" name="handoffAlertNumber" inputmode="tel" autocomplete="off" placeholder="673xxxxxxx" />
+        </label>
+        <label for="team-handoff-alert-cooldown">Handoff Alert Cooldown Minutes
+          <input id="team-handoff-alert-cooldown" name="handoffAlertCooldownMinutes" type="number" min="0" max="1440" placeholder="10" />
+        </label>
+        <label class="checkbox-row" for="team-handoff-alert-enabled">
+          <input id="team-handoff-alert-enabled" name="handoffAlertEnabled" type="checkbox" />
+          Enable WhatsApp alerts when AI needs human handoff
+        </label>
         <div class="actions">
           <button class="primary" type="submit">Save Team Settings</button>
           <span id="team-settings-state"></span>
@@ -11111,6 +11252,9 @@ function superAdminSystemHtml() {
       document.querySelector("#team-openai-api-key").value = "";
       document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
       document.querySelector("#team-openai-model").value = settings.openaiModel || "";
+      document.querySelector("#team-handoff-alert-enabled").checked = Boolean(settings.handoffAlertEnabled);
+      document.querySelector("#team-handoff-alert-number").value = settings.handoffAlertNumber || "";
+      document.querySelector("#team-handoff-alert-cooldown").value = settings.handoffAlertCooldownMinutes || "";
       document.querySelector("#team-phone-number-id-current").textContent =
         settings.whatsappPhoneNumberId ? "Current: " + settings.whatsappPhoneNumberId : "No team-specific phone number ID saved.";
       document.querySelector("#team-access-token-current").textContent =
@@ -11136,7 +11280,10 @@ function superAdminSystemHtml() {
         publicBaseUrl,
         assetsBaseUrl,
         openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
-        openaiModel: document.querySelector("#team-openai-model").value
+        openaiModel: document.querySelector("#team-openai-model").value,
+        handoffAlertEnabled: document.querySelector("#team-handoff-alert-enabled").checked,
+        handoffAlertNumber: document.querySelector("#team-handoff-alert-number").value,
+        handoffAlertCooldownMinutes: document.querySelector("#team-handoff-alert-cooldown").value
       };
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
