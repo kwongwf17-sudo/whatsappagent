@@ -1034,12 +1034,17 @@ const server = http.createServer(async (req, res) => {
           name: body.name,
           accentColor: body.accentColor,
         });
+        const account = await adminAccounts.updateTeamSettings(adminSession.accountId, {
+          handoffAlertEnabled: body.handoffAlertEnabled,
+          handoffAlertNumber: body.handoffAlertNumber,
+          handoffAlertCooldownMinutes: body.handoffAlertCooldownMinutes,
+        });
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
           action: "dashboard_profile_updated",
           result: profile.name,
         });
-        return sendJson(res, 200, { profile });
+        return sendJson(res, 200, { profile, teamSettings: account.settings || {} });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -5813,6 +5818,7 @@ async function saveFollowupRuntimeSettings(businessAccountId = config.accountId,
 
 async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId, analyticsEndDate = analyticsDate) {
   const content = await getTeamContent(businessAccountId);
+  const teamSettings = await adminAccounts.getTeamSettings(businessAccountId);
   const teamCatalog = content.catalog;
   const [
     allCustomers,
@@ -5963,6 +5969,11 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     },
     analytics: buildAnalytics({ customers, orders, productById, now: analyticsDate, endDate: analyticsEndDate }),
     profile: normalizeDashboardProfile(dashboardProfile),
+    teamSettings: {
+      handoffAlertEnabled: Boolean(teamSettings.handoffAlertEnabled),
+      handoffAlertNumber: String(teamSettings.handoffAlertNumber || ""),
+      handoffAlertCooldownMinutes: Number(teamSettings.handoffAlertCooldownMinutes || 0) || "",
+    },
     orderStatusOptions: ORDER_STATUS_OPTIONS,
     orderStatusReplies,
     followupMessages: teamFollowupMessages({ catalog: teamCatalog }),
@@ -11156,16 +11167,6 @@ function superAdminSystemHtml() {
             <option value="gpt-5.4-mini">GPT-5.4 mini</option>
           </select>
         </label>
-        <label for="team-handoff-alert-number">WhatsApp Handoff Alert Number
-          <input id="team-handoff-alert-number" name="handoffAlertNumber" inputmode="tel" autocomplete="off" placeholder="673xxxxxxx" />
-        </label>
-        <label for="team-handoff-alert-cooldown">Handoff Alert Cooldown Minutes
-          <input id="team-handoff-alert-cooldown" name="handoffAlertCooldownMinutes" type="number" min="0" max="1440" placeholder="10" />
-        </label>
-        <label class="checkbox-row" for="team-handoff-alert-enabled">
-          <input id="team-handoff-alert-enabled" name="handoffAlertEnabled" type="checkbox" />
-          Enable WhatsApp alerts when AI needs human handoff
-        </label>
         <div class="actions">
           <button class="primary" type="submit">Save Team Settings</button>
           <span id="team-settings-state"></span>
@@ -11252,9 +11253,6 @@ function superAdminSystemHtml() {
       document.querySelector("#team-openai-api-key").value = "";
       document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
       document.querySelector("#team-openai-model").value = settings.openaiModel || "";
-      document.querySelector("#team-handoff-alert-enabled").checked = Boolean(settings.handoffAlertEnabled);
-      document.querySelector("#team-handoff-alert-number").value = settings.handoffAlertNumber || "";
-      document.querySelector("#team-handoff-alert-cooldown").value = settings.handoffAlertCooldownMinutes || "";
       document.querySelector("#team-phone-number-id-current").textContent =
         settings.whatsappPhoneNumberId ? "Current: " + settings.whatsappPhoneNumberId : "No team-specific phone number ID saved.";
       document.querySelector("#team-access-token-current").textContent =
@@ -11280,10 +11278,7 @@ function superAdminSystemHtml() {
         publicBaseUrl,
         assetsBaseUrl,
         openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
-        openaiModel: document.querySelector("#team-openai-model").value,
-        handoffAlertEnabled: document.querySelector("#team-handoff-alert-enabled").checked,
-        handoffAlertNumber: document.querySelector("#team-handoff-alert-number").value,
-        handoffAlertCooldownMinutes: document.querySelector("#team-handoff-alert-cooldown").value
+        openaiModel: document.querySelector("#team-openai-model").value
       };
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
@@ -11786,6 +11781,24 @@ function adminDashboardHtml() {
       font: inherit;
       background: #fff;
     }
+    .profile-form .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .profile-form .checkbox-label input {
+      width: auto;
+    }
+    .profile-section-title {
+      margin: 10px 0 0;
+      font-size: 14px;
+    }
+    .profile-help {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+      margin-top: -6px;
+    }
     .profile-form textarea {
       min-height: 110px;
       resize: vertical;
@@ -11951,6 +11964,18 @@ function adminDashboardHtml() {
       <form class="profile-form" id="profile-form">
         <label for="profile-name">Dashboard Name <input id="profile-name" name="name" maxlength="80" placeholder="AI Agent Monitor" /></label>
         <label for="profile-color">Dashboard Color <input id="profile-color" name="accentColor" type="color" value="#0071e3" /></label>
+        <h3 class="profile-section-title">WhatsApp Handoff Alert</h3>
+        <div class="profile-help">Send a WhatsApp alert to your admin number whenever AI marks a customer as needing human handoff.</div>
+        <label class="checkbox-label" for="profile-handoff-alert-enabled">
+          <input id="profile-handoff-alert-enabled" name="handoffAlertEnabled" type="checkbox" />
+          Enable handoff alerts
+        </label>
+        <label for="profile-handoff-alert-number">Alert WhatsApp Number
+          <input id="profile-handoff-alert-number" name="handoffAlertNumber" inputmode="tel" autocomplete="off" placeholder="60123456789" />
+        </label>
+        <label for="profile-handoff-alert-cooldown">Cooldown Minutes
+          <input id="profile-handoff-alert-cooldown" name="handoffAlertCooldownMinutes" type="number" min="0" max="1440" placeholder="10" />
+        </label>
         <div class="profile-actions">
           <button type="submit">Save Profile</button>
           <span id="profile-state"></span>
@@ -12229,12 +12254,19 @@ function adminDashboardHtml() {
       document.querySelector("#profile-color").value = accentColor;
     }
 
+    function applyTeamSettings(settings = {}) {
+      document.querySelector("#profile-handoff-alert-enabled").checked = Boolean(settings.handoffAlertEnabled);
+      document.querySelector("#profile-handoff-alert-number").value = settings.handoffAlertNumber || "";
+      document.querySelector("#profile-handoff-alert-cooldown").value = settings.handoffAlertCooldownMinutes || "";
+    }
+
     async function loadDashboard() {
       const selectedDate = dashboardDate();
       const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
       const data = await response.json();
       dashboardData = data;
       applyDashboardProfile(data.profile);
+      applyTeamSettings(data.teamSettings || {});
       document.querySelector("#today-date").textContent = new Date().toLocaleDateString(undefined, {
         weekday: "short",
         year: "numeric",
@@ -12365,10 +12397,15 @@ function adminDashboardHtml() {
       try {
         const result = await request("/admin/profile", {
           name: document.querySelector("#profile-name").value,
-          accentColor: document.querySelector("#profile-color").value
+          accentColor: document.querySelector("#profile-color").value,
+          handoffAlertEnabled: document.querySelector("#profile-handoff-alert-enabled").checked,
+          handoffAlertNumber: document.querySelector("#profile-handoff-alert-number").value,
+          handoffAlertCooldownMinutes: document.querySelector("#profile-handoff-alert-cooldown").value
         });
         dashboardData.profile = result.profile;
+        dashboardData.teamSettings = result.teamSettings || dashboardData.teamSettings || {};
         applyDashboardProfile(result.profile);
+        applyTeamSettings(dashboardData.teamSettings);
         state.textContent = "Saved";
       } catch (error) {
         state.textContent = error.message;
