@@ -41,6 +41,7 @@ import {
   interpretCustomerImage,
   rerankKnowledgeRecords,
   searchVectorStore,
+  selectKnowledgeSalesFollowup,
   selectSalesReply,
   suggestTemplateImprovement,
   transcribeAudio,
@@ -379,7 +380,7 @@ async function readSeedFile(configuredPath, fileName) {
   }
 }
 const OPT_OUT_PATTERN =
-  /\b(stop|unsubscribe|remove|jangan message|jangan msg|jgn message|jgn msg|nda minat|ndak minat|tidak minat|tak minat|no longer interested|do not message|dont message)\b/i;
+  /\b(stop|unsubscribe|jangan message|jangan msg|jgn message|jgn msg|do not message|dont message|don't message)\b/i;
 
 async function loadFaqLibrary() {
   try {
@@ -448,13 +449,10 @@ function migrateCatalogSalesReplies() {
 }
 const OPT_OUT_INTENT_PATTERNS = [
   /\b(jangan|jgn|inda|nda|ndak|tidak|tak)\b.*\b(message|msg|mesej|contact|hubungi|whatsapp|wa|chat|follow\s*up|kacau)\b/i,
-  /\b(jangan|jgn)\b.*\b(lagi|again)\b/i,
   /\b(inda|nda|ndak|tidak|tak)\b.*\b(mau|mahu|nak|want)\b.*\b(contact|hubungi|message|msg|mesej|whatsapp|wa)\b/i,
   /\b(stop|berhenti)\b.*\b(message|msg|mesej|contact|hubungi|whatsapp|wa|follow\s*up)\b/i,
   /\b(remove|delete|padam|buang)\b.*\b(number|nombor|contact|list|database|data)\b/i,
-  /\b(not|no|bukan|nda|ind?a|tidak|tak)\b.*\b(interested|minat|berminat)\b/i,
-  /\b(sudah|suda)\b.*\b(tidak|tak|nda|ind?a)\b.*\b(minat|berminat)\b/i,
-  /\b(no need|dont need|don't need|x payah|tak payah|nda payah|inda payah)\b/i,
+  /\b(no need|dont need|don't need|x payah|tak payah|nda payah|inda payah)\b.*\b(message|msg|mesej|contact|hubungi|whatsapp|wa|follow\s*up)\b/i,
   /\b(jangan kacau|stop kacau|nda mau kana contact|inda mau kana contact|inda mahu kana contact)\b/i,
 ];
 const OPT_OUT_UNCERTAIN_PATTERNS = [
@@ -1072,6 +1070,12 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/admin/ai-suggestions-data") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      if (await isFlowsOnlyAutoReplyMode(adminSession.accountId)) {
+        return sendJson(res, 200, aiSuggestionsData(null, {
+          disabled: true,
+          disabledReason: "AI Suggestions are not available in Flows Only mode.",
+        }));
+      }
       const content = await getTeamContent(adminSession.accountId);
       return sendJson(res, 200, aiSuggestionsData(content));
     }
@@ -1080,6 +1084,9 @@ const server = http.createServer(async (req, res) => {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
+        if (await isFlowsOnlyAutoReplyMode(adminSession.accountId)) {
+          return sendJson(res, 403, { error: "AI Suggestions are not available in Flows Only mode." });
+        }
         const content = await getTeamContent(adminSession.accountId);
         const suggestion = approveAiSuggestion(body, content);
         await saveTeamContent(adminSession.accountId, content);
@@ -1099,6 +1106,9 @@ const server = http.createServer(async (req, res) => {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
+        if (await isFlowsOnlyAutoReplyMode(adminSession.accountId)) {
+          return sendJson(res, 403, { error: "AI Suggestions are not available in Flows Only mode." });
+        }
         const content = await getTeamContent(adminSession.accountId);
         const suggestion = rejectAiSuggestion(body, content);
         await saveTeamContent(adminSession.accountId, content);
@@ -3504,6 +3514,7 @@ async function processInboundMessageCore({
     : await maybeSelectApprovedSalesReply({
         customerMessage: text,
         conversationContext,
+        activeState,
         routeClassification,
         product,
         catalog: teamCatalog,
@@ -3555,6 +3566,18 @@ async function processInboundMessageCore({
         product,
         businessAccountId: knowledgeAccountId,
       });
+  const knowledgeAnswerForFollowup = approvedFaqMatch?.approvedReply ||
+    (ragAnswer?.replyType === "faq" && !ragAnswer?.handoffRequired ? ragAnswer.reply : "");
+  const knowledgeSalesFollowup = knowledgeAnswerForFollowup
+    ? await maybeSelectKnowledgeSalesFollowup({
+        customerMessage: text,
+        answer: knowledgeAnswerForFollowup,
+        conversationContext,
+        activeState,
+        product,
+        businessAccountId: knowledgeAccountId,
+      })
+    : "";
   if (openingFlowDecision.shouldSend) {
     console.log(`Prepending opening flow to ${from}: ${openingFlowDecision.reason}`);
   }
@@ -3574,6 +3597,7 @@ async function processInboundMessageCore({
     approvedFaqMatch,
     salesReplyMatch,
     ragAnswer,
+    knowledgeSalesFollowup,
     routeClassification,
     conversationContext,
     productResolution: { ...productResolution, product },
@@ -3956,6 +3980,7 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
 async function maybeSelectApprovedSalesReply({
   customerMessage,
   conversationContext = [],
+  activeState = "",
   routeClassification = null,
   product,
   catalog: activeCatalog,
@@ -3975,7 +4000,6 @@ async function maybeSelectApprovedSalesReply({
   const routedReply = findSalesReplyPrimaryIntentMatch(activeCatalog, product, routeClassification, {
     salesReplyLibrary: activeSalesReplyLibrary,
   });
-  if (routedReply && records.some((reply) => reply.id === routedReply.id)) return routedReply;
   try {
     const selected = await selectSalesReply({
       apiKey,
@@ -3985,14 +4009,52 @@ async function maybeSelectApprovedSalesReply({
       productName: product?.name || "",
       salesReplyRecords: records,
       conversationContext,
+      activeState,
+      routePrimaryIntent: routeClassification?.primaryIntent || "",
+      routeReason: routeClassification?.reason || "",
     });
-    if (!selected?.salesReplyId) return null;
+    if (!selected?.salesReplyId) {
+      return routedReply && records.some((reply) => reply.id === routedReply.id) ? routedReply : null;
+    }
     const record = records.find((reply) => reply.id === selected.salesReplyId);
     if (!record) return null;
     return record;
   } catch (error) {
     await recordSystemError("sales_reply_intent_selection", error, `Customer message: ${customerMessage}`, businessAccountId);
-    return null;
+    return routedReply && records.some((reply) => reply.id === routedReply.id) ? routedReply : null;
+  }
+}
+
+async function maybeSelectKnowledgeSalesFollowup({
+  customerMessage,
+  answer,
+  conversationContext = [],
+  activeState = "",
+  product,
+  businessAccountId = config.accountId,
+}) {
+  const configuredFollowup = String(product?.sales_prompt || product?.salesPrompt || "").trim();
+  if (!configuredFollowup || !String(answer || "").trim()) return "";
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return "";
+  const model = await openAiModelForAccount(businessAccountId);
+  try {
+    const selected = await selectKnowledgeSalesFollowup({
+      apiKey,
+      model,
+      customerMessage,
+      answer,
+      productName: product?.name || "",
+      activeState,
+      configuredFollowup,
+      conversationContext,
+    });
+    if (selected?.action === "contextual") return selected.followUp;
+    if (selected?.action === "none") return false;
+    return "";
+  } catch (error) {
+    await recordSystemError("knowledge_sales_followup_selection", error, `Customer message: ${customerMessage}`, businessAccountId);
+    return "";
   }
 }
 
@@ -7966,6 +8028,7 @@ async function maybeSendHandoffAdminAlert({
   correlationId = "",
 } = {}) {
   if (!customer || businessAccountId === DEMO_ACCOUNT_ID) return;
+  if (await isFlowsOnlyAutoReplyMode(businessAccountId)) return;
   const teamSettings = await adminAccounts.getTeamSettings(businessAccountId);
   if (!shouldSendHandoffAlert(customer, teamSettings)) return;
   const alert = handoffAlertSettings(teamSettings);
@@ -8459,6 +8522,20 @@ async function flushPendingCustomerBuffer(key) {
   const messages = Array.isArray(record.messages) ? record.messages.filter(Boolean) : [];
   const combinedText = messages.join("\n").trim();
   if (!combinedText) {
+    await store.deletePendingBuffer(key);
+    return;
+  }
+
+  if (record.type === PENDING_BUFFER_TYPE.OPENING_FLOW_INBOUND) {
+    await store.appendAuditLog({
+      actor: "ai_agent",
+      action: "opening_flow_deferred_inbound_consumed",
+      customerId: record.customerId,
+      result: `${messages.length}`,
+      reason: "Inbound message arrived while opening flow was sending; kept in chat history and not auto-replayed.",
+      businessAccountId: record.businessAccountId || config.accountId,
+      correlationId: record.correlationId || correlationIdForInbound("", record.customerId),
+    });
     await store.deletePendingBuffer(key);
     return;
   }
@@ -9671,6 +9748,7 @@ function faqLibraryData(content = defaultTeamContent) {
 }
 
 async function maybeSuggestTemplateFromManualReply(customer, replyText, businessAccountId) {
+  if (await isFlowsOnlyAutoReplyMode(businessAccountId)) return null;
   if (customer.handoffStatus !== "human_required") return null;
   const latestInbound = await latestInboundMessageForCustomer(customer.id, businessAccountId);
   const question = String(latestInbound?.body || "").trim();
@@ -9687,9 +9765,7 @@ async function maybeSuggestTemplateFromManualReply(customer, replyText, business
   });
   if (!decision || decision.type === "none") return null;
 
-  const suggestion = decision.type === "sales_reply"
-    ? upsertSuggestedSalesReply({ customer, question, replyText, salesIntent: decision.salesIntent }, content)
-    : upsertSuggestedFaq({ customer, question, replyText, decision }, content);
+  const suggestion = upsertSuggestedFaq({ customer, question, replyText, decision }, content);
   if (!suggestion) return null;
   await saveTeamContent(businessAccountId, content);
   await store.appendAuditLog({
@@ -9703,9 +9779,27 @@ async function maybeSuggestTemplateFromManualReply(customer, replyText, business
 }
 
 async function templateSuggestionDecision({ question, replyText, product, customer, businessAccountId }) {
+  if (shouldSkipTemplateSuggestionPair(question, replyText)) return null;
   const fallback = fallbackTemplateSuggestionDecision(question, customer);
   const apiKey = await openAiApiKeyForAccount(businessAccountId);
   if (!apiKey) return fallback;
+  const content = await getTeamContent(businessAccountId);
+  const existingGeneralFaqs = ((content.faqLibrary || faqLibrary).approved_faqs || [])
+    .filter((faq) => faq.active !== false && !faq.ai_suggestion)
+    .map((faq) => ({
+      id: faq.id,
+      topic: faq.topic,
+      exampleQuestions: faq.example_questions || [],
+    }));
+  const existingProductFaqs = product
+    ? ((product.approved_faqs || [])
+      .filter((faq) => faq.active !== false && !faq.ai_suggestion)
+      .map((faq) => ({
+        id: faq.id,
+        topic: faq.topic,
+        exampleQuestions: faq.example_questions || [],
+      })))
+    : [];
   try {
     const aiDecision = await suggestTemplateImprovement({
       apiKey,
@@ -9714,11 +9808,9 @@ async function templateSuggestionDecision({ question, replyText, product, custom
       adminReply: replyText,
       productName: product?.name || "",
       productId: product?.id || customer.productId || "",
-      salesIntents: SALES_INTENT_OPTIONS.map((item) => ({ id: item.key, label: item.label })),
+      existingGeneralFaqs,
+      existingProductFaqs,
     });
-    if (aiDecision.type === "sales_reply" && !SALES_INTENT_LABELS.has(aiDecision.salesIntent)) {
-      return fallback?.type === "sales_reply" ? fallback : null;
-    }
     return aiDecision.type === "none" ? null : aiDecision;
   } catch (error) {
     await recordSystemError("manual_reply_template_suggestion_ai", error, `Customer: ${customer.id}`, businessAccountId);
@@ -9727,12 +9819,9 @@ async function templateSuggestionDecision({ question, replyText, product, custom
 }
 
 function fallbackTemplateSuggestionDecision(question, customer = {}) {
+  if (isLikelySalesReplyLearningQuestion(question)) return null;
   if (isGeneralBusinessQuestion(question)) return { type: "faq", scope: "general", topic: "", salesIntent: "" };
-  const salesIntent = normalizeSalesIntent(question);
-  if (SALES_INTENT_LABELS.has(salesIntent)) {
-    return { type: "sales_reply", scope: "general", topic: SALES_INTENT_LABELS.get(salesIntent), salesIntent };
-  }
-  return customer.productId ? { type: "faq", scope: "product", topic: "", salesIntent: "" } : null;
+  return null;
 }
 
 async function latestInboundMessageForCustomer(customerId, businessAccountId) {
@@ -9753,7 +9842,13 @@ function upsertSuggestedFaq({ customer, question, replyText, decision = {} }, co
   if (scope === "product" && !product) return null;
   const records = scope === "general" ? ((content.faqLibrary || faqLibrary).approved_faqs ||= []) : (product.approved_faqs ||= []);
   const normalizedQuestion = normalizeLearnedText(question);
+  const targetFaqId = String(decision.existingTopicId || decision.existing_topic_id || "").trim();
+  const targetFaq = targetFaqId
+    ? records.find((faq) => faq.id === targetFaqId && faq.active !== false && !faq.ai_suggestion)
+    : null;
   const existing = records.find((faq) =>
+    faq.ai_suggestion === true &&
+    String(faq.target_faq_id || "") === targetFaqId &&
     (faq.example_questions || []).some((example) => normalizeLearnedText(example) === normalizedQuestion)
   );
 
@@ -9764,6 +9859,7 @@ function upsertSuggestedFaq({ customer, question, replyText, decision = {} }, co
     existing.suggestion_status = "pending";
     existing.suggested_from = "manual_reply";
     existing.source_customer_id = customer.id;
+    existing.target_faq_id = targetFaqId;
     existing.updatedAt = new Date().toISOString();
     return aiSuggestionRow({ ...existing, scope, productId }, "faq");
   }
@@ -9771,7 +9867,7 @@ function upsertSuggestedFaq({ customer, question, replyText, decision = {} }, co
   const faq = saveApprovedFaq({
     scope,
     productId,
-    topic: decision.topic || `Suggested: ${question.slice(0, 80)}`,
+    topic: targetFaq?.topic || decision.topic || `Suggested: ${question.slice(0, 80)}`,
     exampleQuestions: [question],
     approvedReply: replyText,
     active: false,
@@ -9780,6 +9876,11 @@ function upsertSuggestedFaq({ customer, question, replyText, decision = {} }, co
     suggestedFrom: "manual_reply",
     sourceCustomerId: customer.id,
   }, content);
+  if (targetFaqId) {
+    faq.target_faq_id = targetFaqId;
+    const savedIndex = records.findIndex((record) => record.id === faq.id);
+    if (savedIndex >= 0) records[savedIndex].target_faq_id = targetFaqId;
+  }
   return aiSuggestionRow(faq, "faq");
 }
 
@@ -9814,6 +9915,40 @@ function upsertSuggestedSalesReply({ customer, question, replyText, salesIntent 
 
 function shouldSkipLearningQuestion(question) {
   return /\b(full\s*name|phone\s*number|address|alamat|order\s*package|complaint|refund|rosak|marah|angry)\b/i.test(question);
+}
+
+function shouldSkipTemplateSuggestionPair(question, replyText) {
+  const combined = `${question}\n${replyText}`;
+  if (shouldSkipLearningQuestion(combined)) return true;
+  if (containsPrivateOrOrderDetails(combined)) return true;
+  if (isLikelySalesReplyLearningQuestion(question)) return true;
+  if (isOperationalManualReply(replyText)) return true;
+  return false;
+}
+
+function containsPrivateOrOrderDetails(value) {
+  const text = String(value || "");
+  if (/\b(?:name|nama|alamat|address|phone|number|nombor|no\.?|kampong|kampung|kpg|kg|simpang|spg|jalan|jln|rpn|postcode|poskod)\b/i.test(text)) return true;
+  if (/\b\d{6,8}\b/.test(text)) return true;
+  if (/\b(?:package|pakej|order option|option)\s*[:\-]?\s*[a-z]\b/i.test(text)) return true;
+  if (/\b(?:\d+\s*x|x\s*\d+|unit|pcs)\b/i.test(text) && /\b(?:order|ambil|mau|nak|beli|py\d+|\$\d+|bnd\s*\d+)\b/i.test(text)) return true;
+  return false;
+}
+
+function isLikelySalesReplyLearningQuestion(question) {
+  const text = normalizeLearnedText(question);
+  if (!text) return false;
+  if (SALES_INTENT_LABELS.has(normalizeSalesIntent(text))) return true;
+  return /\b(mahal|murah|discount|kurang|nego|fikir|tanya dulu|nanti dulu|belum|payday|gaji|salary|budget|duit|wang|nda minat|inda minat|tidak mau|tak mau|not interested|next time|lain kali|bulan depan|minggu depan)\b/i.test(text);
+}
+
+function isOperationalManualReply(replyText) {
+  const text = String(replyText || "").trim();
+  if (!text) return true;
+  if (/\b(wait|tunggu|send|hantar|i send|saya send|nanti saya|kami check|check dulu|update|manual|admin|team)\b/i.test(text)) return true;
+  if (/\b(?:boleh|buleh|yes|ya|awu|ok|okay|ada|nda ya|tidak|no)\b[.! ]*$/i.test(text) && text.split(/\s+/).filter(Boolean).length <= 4) return true;
+  if (/\?$/.test(text) && /\b(want|mau|nak|ambil|order|minat|package|pakej)\b/i.test(text)) return true;
+  return false;
 }
 
 function normalizeLearnedText(value) {
@@ -10027,7 +10162,16 @@ function deleteSalesReply(body, content = defaultTeamContent) {
   return { ...deleted, scope, productId: deleted.productId || productId };
 }
 
-function aiSuggestionsData(content = defaultTeamContent) {
+function aiSuggestionsData(content = defaultTeamContent, options = {}) {
+  if (options.disabled) {
+    return {
+      pending: [],
+      count: 0,
+      products: [],
+      disabled: true,
+      disabledReason: options.disabledReason || "AI Suggestions are disabled.",
+    };
+  }
   const teamCatalog = content.catalog || catalog;
   const teamFaqLibrary = content.faqLibrary || faqLibrary;
   const rows = [];
@@ -10038,9 +10182,6 @@ function aiSuggestionsData(content = defaultTeamContent) {
     for (const faq of product.approved_faqs || []) {
       if (isPendingAiSuggestion(faq)) rows.push(aiSuggestionRow({ ...faq, scope: "product", productId: product.id, productName: product.name }, "faq"));
     }
-  }
-  for (const reply of (content.salesReplyLibrary || salesReplyLibrary).sales_replies || []) {
-    if (isPendingAiSuggestion(reply)) rows.push(aiSuggestionRow({ ...reply, scope: "general", productId: "" }, "sales_reply"));
   }
   rows.sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")));
   return {
@@ -10075,6 +10216,24 @@ function aiSuggestionRow(record = {}, type = "faq") {
 
 function approveAiSuggestion(body, content = defaultTeamContent) {
   const match = findAiSuggestionRecord(body, content);
+  if (match.type === "faq" && match.record.target_faq_id) {
+    const target = match.records.find((record) =>
+      record.id === match.record.target_faq_id &&
+      !isPendingAiSuggestion(record)
+    );
+    if (!target) throw new Error("Existing FAQ topic for this suggestion was not found.");
+    const existingExamples = new Set((target.example_questions || []).map(normalizeLearnedText));
+    const mergedExamples = [...(target.example_questions || [])];
+    for (const example of match.record.example_questions || []) {
+      if (!existingExamples.has(normalizeLearnedText(example))) mergedExamples.push(example);
+    }
+    target.example_questions = mergedExamples;
+    if (match.record.approved_reply) target.approved_reply = match.record.approved_reply;
+    target.updatedAt = new Date().toISOString();
+    const [removed] = match.records.splice(match.index, 1);
+    removed.suggestion_status = "approved";
+    return aiSuggestionRow({ ...target, scope: match.scope, productId: match.productId, productName: match.productName }, match.type);
+  }
   match.record.active = true;
   match.record.suggestion_status = "approved";
   match.record.updatedAt = new Date().toISOString();
@@ -17442,6 +17601,11 @@ function aiSuggestionsPageHtml() {
     async function load() {
       const response = await fetch('/admin/ai-suggestions-data');
       const data = await response.json();
+      if (data.disabled) {
+        document.querySelector("#state").textContent = data.disabledReason || "AI Suggestions disabled.";
+        document.querySelector("#suggestions").innerHTML = '<div class="empty">' + esc(data.disabledReason || "AI Suggestions are disabled.") + '</div>';
+        return;
+      }
       document.querySelector("#state").textContent = "Pending suggestions: " + data.count;
       render(data.pending || []);
     }
