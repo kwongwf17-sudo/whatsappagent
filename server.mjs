@@ -35,6 +35,7 @@ import {
   createCustomerServiceResponse,
   createComplaintHandoffReply,
   createSalesIntentRepeatReply,
+  classifySalesReplyExpectedAction,
   detectComplaintIntent,
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
@@ -1334,11 +1335,21 @@ const server = http.createServer(async (req, res) => {
           handoffReason: "",
           lastTemplateSuggestionId: templateSuggestion?.id || customer.lastTemplateSuggestionId || "",
         }), adminSession.accountId);
+        const recoveredHandled = await markRecoveredMessagesHandledByAdmin({
+          customerId,
+          businessAccountId: adminSession.accountId,
+          actor: `admin:${adminSession.accountId}`,
+          reason: "Manual text reply sent from chat inbox.",
+        });
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
           action: "manual_reply_sent",
           customerId,
-          result: templateSuggestion ? `sent_via_whatsapp_api; template_suggestion:${templateSuggestion.id}` : "sent_via_whatsapp_api",
+          result: [
+            "sent_via_whatsapp_api",
+            templateSuggestion ? `template_suggestion:${templateSuggestion.id}` : "",
+            recoveredHandled ? `recovered_handled:${recoveredHandled}` : "",
+          ].filter(Boolean).join("; "),
           businessAccountId: adminSession.accountId,
         });
         return sendJson(res, 200, { ok: true, customerId, templateSuggestion });
@@ -1416,6 +1427,12 @@ const server = http.createServer(async (req, res) => {
             followupBlockedReason: current.optedOut ? current.followupBlockedReason : "",
           }),
         }), adminSession.accountId);
+        const recoveredHandled = await markRecoveredMessagesHandledByAdmin({
+          customerId,
+          businessAccountId: adminSession.accountId,
+          actor,
+          reason: "Manual media reply sent from chat inbox.",
+        });
         await store.appendAuditLog({
           actor,
           action: "manual_media_reply_sent",
@@ -1423,6 +1440,7 @@ const server = http.createServer(async (req, res) => {
           result: [
             `${media.type}:${mediaUrl}`,
             openComplaints.length ? `resolved_complaints:${openComplaints.length}` : "",
+            recoveredHandled ? `recovered_handled:${recoveredHandled}` : "",
           ].filter(Boolean).join("; "),
           businessAccountId: adminSession.accountId,
         });
@@ -1485,11 +1503,20 @@ const server = http.createServer(async (req, res) => {
           productId: product.id,
           ...openingFlowPackageInterestPatch(product, sentAt),
         }), adminSession.accountId);
+        const recoveredHandled = await markRecoveredMessagesHandledByAdmin({
+          customerId,
+          businessAccountId: adminSession.accountId,
+          actor: `admin:${adminSession.accountId}`,
+          reason: "Manual opening flow sent from chat inbox.",
+        });
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
           action: "manual_opening_flow_sent",
           customerId,
-          result: `${product.id}:${openingMessages.length}`,
+          result: [
+            `${product.id}:${openingMessages.length}`,
+            recoveredHandled ? `recovered_handled:${recoveredHandled}` : "",
+          ].filter(Boolean).join("; "),
           businessAccountId: adminSession.accountId,
         });
         return sendJson(res, 200, { ok: true, customerId, productId: product.id, sent: openingMessages.length });
@@ -2408,6 +2435,66 @@ async function recordRecoveredWebMessage({
     correlationId,
   });
   return { imported: true, correlationId };
+}
+
+async function markRecoveredMessagesHandledByAdmin({
+  customerId = "",
+  businessAccountId = config.accountId,
+  actor = "admin",
+  reason = "Manual admin handling completed recovered message.",
+} = {}) {
+  const id = String(customerId || "").trim();
+  if (!id) return 0;
+  const messages = await store.listOutbox(businessAccountId);
+  const recoveredMessages = messages
+    .filter((message) =>
+      message.direction === "inbound" &&
+      message.channel === "customer" &&
+      message.from === id &&
+      message.recoveredAfterReconnect &&
+      message.recoveryImportOnly &&
+      message.id
+    )
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  let handled = 0;
+  for (const message of recoveredMessages) {
+    const processId = `${message.id}:safe_process`;
+    const existing = await store.getProcessedMessage(processId, businessAccountId).catch(() => null);
+    if (existing?.processingStatus === "completed") continue;
+    const correlationId = existing?.correlationId || correlationIdForInbound(processId, id);
+    if (!existing) {
+      await store.claimProcessedMessage(processId, businessAccountId, {
+        customerId: id,
+        correlationId,
+        recoveredAfterReconnect: true,
+        safeAutoProcess: false,
+        manuallyHandled: true,
+        sourceMessageId: message.id,
+      });
+    }
+    await store.completeProcessedMessage(processId, businessAccountId, {
+      correlationId,
+      customerId: id,
+      recoveredAfterReconnect: true,
+      safeAutoProcess: false,
+      manuallyHandled: true,
+      manuallyHandledBy: actor,
+      manuallyHandledReason: reason,
+      sourceMessageId: message.id,
+    }).catch(() => {});
+    handled += 1;
+  }
+  if (handled) {
+    await store.appendAuditLog({
+      actor,
+      action: "web_recovery_message_manually_handled",
+      customerId: id,
+      result: String(handled),
+      reason,
+      businessAccountId,
+    });
+  }
+  return handled;
 }
 
 async function safelyProcessRecoveredMessage({
@@ -3522,6 +3609,16 @@ async function processInboundMessageCore({
         businessAccountId: knowledgeAccountId,
       });
   const selectedSalesReply = exactSalesReply || vectorSalesReply;
+  const salesReplyExpectedAction = selectedSalesReply
+    ? await maybeClassifySalesReplyExpectedAction({
+        customerMessage: text,
+        conversationContext,
+        activeState,
+        product,
+        salesReply: selectedSalesReply,
+        businessAccountId: knowledgeAccountId,
+      })
+    : null;
   const routedApprovedFaq = faqSalesResponse || selectedSalesReply || !allowKnowledgeRoute
     ? null
     : findApprovedFaqPrimaryIntentMatch(teamCatalog, product, routeClassification, {
@@ -3553,6 +3650,7 @@ async function processInboundMessageCore({
         approvedReply: selectedSalesReply.approved_reply,
         repeatAction: selectedSalesReply.repeat_action,
         afterReply: selectedSalesReply.after_reply || selectedSalesReply.afterReply || "",
+        expectsPackageInterest: Boolean(salesReplyExpectedAction?.expectsAction),
       }
     : null;
   const ragAnswer = faqSalesResponse || exactApprovedFaq || selectedSalesReply || !allowKnowledgeRoute
@@ -3939,9 +4037,18 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
     customerBeforeClear.complaintStatus === "open" ||
     String(customerBeforeClear.handoffReason || "").startsWith("Complaint")
   );
+  const manualProductResolution = !customerBeforeClear.productId
+    ? await maybeResolveProductFromManualBusinessReply({
+        customerId: from,
+        currentText: body,
+        source,
+        businessAccountId,
+      })
+    : null;
   const shouldKeepProductRequiredHandoff = Boolean(
     customerBeforeClear.handoffStatus === "human_required" &&
     !customerBeforeClear.productId &&
+    !manualProductResolution?.product?.id &&
     !wasComplaintHandoff
   );
   await store.updateCustomer(from, (customer) => ({
@@ -3949,6 +4056,7 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
     handoffReason: shouldKeepProductRequiredHandoff
       ? "Manual phone reply recorded, but product must be selected before follow-up can resume."
       : "",
+    ...(manualProductResolution?.product?.id ? { productId: manualProductResolution.product.id } : {}),
     ...(shouldKeepProductRequiredHandoff ? {} : {
       handoffAcknowledgedAt: now,
       handoffAcknowledgedBy: actor,
@@ -3971,11 +4079,128 @@ async function handleManualBusinessMessage({ id, from, text, source = {}, busine
       id || "",
       templateSuggestion ? `template_suggestion:${templateSuggestion.id}` : "",
       openComplaints.length ? `resolved_complaints:${openComplaints.length}` : "",
+      manualProductResolution?.product?.id ? `product_locked:${manualProductResolution.product.id}:${manualProductResolution.reason}` : "",
       shouldKeepProductRequiredHandoff ? "product_required_before_handoff_clear" : "",
     ].filter(Boolean).join("; "),
     businessAccountId,
   });
 }
+
+async function maybeResolveProductFromManualBusinessReply({
+  customerId = "",
+  currentText = "",
+  source = {},
+  businessAccountId = config.accountId,
+} = {}) {
+  const text = String(currentText || "").trim();
+  const id = String(customerId || "").trim();
+  if (!id || !text) return null;
+  const content = await getTeamContent(businessAccountId);
+  const activeCatalog = content.catalog || catalog;
+  const recentManualText = await recentManualBusinessTextForCustomer(id, businessAccountId, text);
+  const productResolution = resolveProduct(activeCatalog, recentManualText, source || {}, "");
+  if (hasConfidentProductResolution(productResolution) && productResolution.matchSource !== "existing_customer_product") {
+    return {
+      product: productResolution.product,
+      reason: productResolution.matchSource || "manual_reply_product_text",
+      confidence: productResolution.confidence || 0,
+    };
+  }
+  const flowMatch = bestManualOpeningFlowProductMatch(activeCatalog, recentManualText);
+  if (flowMatch?.product?.id) return flowMatch;
+  return null;
+}
+
+async function recentManualBusinessTextForCustomer(customerId, businessAccountId, currentText = "") {
+  const messages = await store.listOutbox(businessAccountId);
+  const cutoffMs = Date.now() - 15 * 60 * 1000;
+  const recent = messages
+    .filter((message) =>
+      message.direction === "outbound" &&
+      message.channel === "business_admin" &&
+      message.to === customerId &&
+      message.body &&
+      (!message.createdAt || Date.parse(message.createdAt) >= cutoffMs)
+    )
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))
+    .slice(-8)
+    .map((message) => message.body || message.caption || "")
+    .filter(Boolean);
+  if (!recent.some((item) => item === currentText)) recent.push(currentText);
+  return recent.join("\n");
+}
+
+function bestManualOpeningFlowProductMatch(activeCatalog = {}, text = "") {
+  const normalizedText = normalizeManualProductText(text);
+  if (!normalizedText) return null;
+  const candidates = (activeCatalog.products || [])
+    .filter((product) => product.openingFlowEnabled !== false)
+    .map((product) => manualOpeningFlowProductCandidate(product, normalizedText))
+    .filter(Boolean)
+    .sort((left, right) => right.confidence - left.confidence);
+  const [best, second] = candidates;
+  if (!best || best.confidence < 0.75) return null;
+  if (second && best.confidence - second.confidence < 0.15) return null;
+  return {
+    product: best.product,
+    reason: "manual_opening_flow_similarity",
+    confidence: best.confidence,
+  };
+}
+
+function manualOpeningFlowProductCandidate(product = {}, normalizedText = "") {
+  const messages = Array.isArray(product.opening_flow) && product.opening_flow.length
+    ? product.opening_flow
+    : buildProductOpeningFlow(productFlowEditorData(product));
+  const segments = messages
+    .map((message) => String(message.body || message.caption || "").trim())
+    .filter(Boolean);
+  const exactSegments = segments.filter((segment) => {
+    const normalizedSegment = normalizeManualProductText(segment);
+    return normalizedSegment.length >= 8 && normalizedText.includes(normalizedSegment);
+  }).length;
+  const tokenSource = [
+    product.name,
+    product.id,
+    product.sku,
+    product.sku_code,
+    product.skuCode,
+    ...(product.aliases || []),
+    ...(product.ad_keywords || []),
+    ...segments,
+  ].filter(Boolean).join(" ");
+  const tokens = [...new Set(manualProductTokens(tokenSource))];
+  if (!tokens.length && !exactSegments) return null;
+  const matched = tokens.filter((token) => normalizedText.includes(token)).length;
+  const denominator = Math.max(4, Math.min(20, tokens.length));
+  const tokenScore = Math.min(1, matched / denominator);
+  const exactScore = Math.min(1, exactSegments / Math.max(2, Math.min(5, segments.length || 1)));
+  const confidence = Math.max(tokenScore, exactScore, (tokenScore * 0.7) + (exactScore * 0.3));
+  return confidence > 0 ? { product, confidence } : null;
+}
+
+function manualProductTokens(value = "") {
+  return normalizeManualProductText(value)
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !MANUAL_PRODUCT_STOP_WORDS.has(token));
+}
+
+function normalizeManualProductText(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[-_]+/g, " ")
+    .replace(/[^\p{L}\p{N}\s$]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const MANUAL_PRODUCT_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "you", "want", "order", "size", "free", "cash", "delivery",
+  "packaging", "discreet", "customer", "feedback", "guarantee", "limited", "promotion",
+  "promo", "original", "price", "today", "only", "get", "topup", "bottle", "pcs", "unit",
+  "units", "bnd", "b$", "private", "cod", "all", "brunei", "hari", "ani", "saja",
+]);
 
 async function maybeSelectApprovedSalesReply({
   customerMessage,
@@ -4022,6 +4247,46 @@ async function maybeSelectApprovedSalesReply({
   } catch (error) {
     await recordSystemError("sales_reply_intent_selection", error, `Customer message: ${customerMessage}`, businessAccountId);
     return routedReply && records.some((reply) => reply.id === routedReply.id) ? routedReply : null;
+  }
+}
+
+async function maybeClassifySalesReplyExpectedAction({
+  customerMessage,
+  conversationContext = [],
+  activeState = "",
+  product,
+  salesReply,
+  businessAccountId = config.accountId,
+}) {
+  if (!salesReply?.approved_reply) return null;
+  const afterReply = String(salesReply.after_reply || salesReply.afterReply || "").trim().toUpperCase();
+  if (afterReply === "CLOSE_SALES_CONVERSATION") {
+    return {
+      expectsAction: false,
+      expectedActionType: "none",
+      confidence: "high",
+      reason: "Sales reply closes the conversation.",
+    };
+  }
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return null;
+  const model = await openAiModelForAccount(businessAccountId);
+  try {
+    return await classifySalesReplyExpectedAction({
+      apiKey,
+      model,
+      approvedReply: salesReply.approved_reply,
+      salesIntent: salesReply.sales_intent || "",
+      objectionType: salesReply.objection_type || "",
+      afterReply: salesReply.after_reply || salesReply.afterReply || "",
+      productName: product?.name || "",
+      customerMessage,
+      activeState,
+      conversationContext,
+    });
+  } catch (error) {
+    await recordSystemError("sales_reply_expected_action", error, `Customer message: ${customerMessage}`, businessAccountId);
+    return null;
   }
 }
 

@@ -174,6 +174,11 @@ async function generateVectorKnowledgeFiles(outputDir, accountId = "") {
     "utf8"
   );
   await writeFile(
+    path.join(outputDir, "product-opening-flow-knowledge.md"),
+    renderProductOpeningFlowKnowledge(content.catalog),
+    "utf8"
+  );
+  await writeFile(
     path.join(outputDir, "product-image-knowledge.md"),
     renderProductImageKnowledge(content.catalog),
     "utf8"
@@ -292,6 +297,79 @@ function renderProductImageKnowledge(catalog = {}) {
     "",
     ...sections,
   ].join("\n");
+}
+
+function renderProductOpeningFlowKnowledge(catalog = {}) {
+  const sections = [];
+  for (const product of catalog.products || []) {
+    const blocks = productOpeningFlowKnowledgeBlocks(product);
+    if (!blocks.length) continue;
+    sections.push(
+      `## Product: ${product.name || product.id}`,
+      `Product ID: ${product.id || ""}`,
+      product.sku ? `Product SKU: ${product.sku}` : "",
+      "",
+      ...blocks.map((block, index) => renderOpeningFlowKnowledgeBlock(block, product, index)),
+    );
+  }
+  return [
+    "# Vector Store Knowledge: Product Opening Flow",
+    "",
+    "Use these approved product opening-flow text blocks and image captions only for their matching product.",
+    "These records come from enabled opening-flow content that the business sends to customers. Do not use disabled blocks or image URLs as knowledge.",
+    "",
+    ...sections,
+  ].filter(Boolean).join("\n");
+}
+
+function productOpeningFlowKnowledgeBlocks(product = {}) {
+  if (Array.isArray(product.opening_flow_blocks) && product.opening_flow_blocks.length) {
+    return product.opening_flow_blocks
+      .filter((block) => block && block.enabled !== false)
+      .map((block, index) => {
+        const type = block.type === "image" ? "image_caption" : "text";
+        const content = type === "image_caption"
+          ? String(block.caption || "").trim()
+          : String(block.body || "").trim();
+        if (!content) return null;
+        return {
+          id: block.id || `${type}_${index + 1}`,
+          type,
+          label: String(block.label || "").trim(),
+          content,
+        };
+      })
+      .filter(Boolean);
+  }
+  return (Array.isArray(product.opening_flow) ? product.opening_flow : [])
+    .map((message, index) => {
+      const type = message?.type === "image" || message?.type === "video" ? "image_caption" : "text";
+      const content = String(type === "image_caption" ? message?.caption || "" : message?.body || "").trim();
+      if (!content) return null;
+      return {
+        id: `legacy_${type}_${index + 1}`,
+        type,
+        label: type === "image_caption" ? "Image caption" : "Opening flow text",
+        content,
+      };
+    })
+    .filter(Boolean);
+}
+
+function renderOpeningFlowKnowledgeBlock(block, product, index) {
+  const typeLabel = block.type === "image_caption" ? "image caption" : "text";
+  return [
+    `### Opening Flow ${typeLabel}: ${block.id || index + 1}`,
+    "Scope: product",
+    "Knowledge type: product_opening_flow",
+    `Product ID: ${product.id || ""}`,
+    `Product Name: ${product.name || ""}`,
+    block.label ? `Label: ${block.label}` : "",
+    `Content type: ${typeLabel}`,
+    `Approved opening-flow content: ${block.content}`,
+    `Search text: ${[product.name, product.id, product.sku, block.label, block.content].filter(Boolean).join(" | ")}`,
+    "",
+  ].filter(Boolean).join("\n");
 }
 
 function orderOptionsForProductKnowledge(product = {}) {
