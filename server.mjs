@@ -165,6 +165,7 @@ const config = {
   messageSequenceDelayMs: Number(getEnv("WHATSAPP_SEQUENCE_DELAY_MS", "1500")),
   orderDetailBufferMs: Number(getEnv("ORDER_DETAIL_BUFFER_MS", "60000")),
   messageMergeBufferMs: Number(getEnv("MESSAGE_MERGE_BUFFER_MS", "10000")),
+  messageMergeMaxWaitMs: Number(getEnv("MESSAGE_MERGE_MAX_WAIT_MS", "30000")),
   deliveryWaitTimeoutMs: Number(getEnv("WHATSAPP_DELIVERY_WAIT_TIMEOUT_MS", "15000")),
   webProcessFromMeMessages: parseBool(getEnv("WHATSAPP_WEB_PROCESS_FROM_ME", "false")),
   webLogRawInbound: parseBool(getEnv("WHATSAPP_WEB_LOG_RAW_INBOUND", "false")),
@@ -1959,6 +1960,7 @@ if (req.method === "GET" && url.pathname === "/admin/customer/export") {
         followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
       await clearPendingCustomerBuffers(adminSession.accountId, customerId);
+      await cancelPendingFollowupsForCustomer(customerId, adminSession.accountId, "Customer submitted order.");
       await store.appendAuditLog({
         action: "manual_order_submitted",
         customerId,
@@ -3649,6 +3651,7 @@ async function processInboundMessageCore({
         intent: selectedSalesReply.intent || "",
         approvedReply: selectedSalesReply.approved_reply,
         repeatAction: selectedSalesReply.repeat_action,
+        sameIntentAgainInstruction: selectedSalesReply.same_intent_again_instruction || selectedSalesReply.sameIntentAgainInstruction || "",
         afterReply: selectedSalesReply.after_reply || selectedSalesReply.afterReply || "",
         expectsPackageInterest: Boolean(salesReplyExpectedAction?.expectsAction),
       }
@@ -3713,6 +3716,7 @@ async function processInboundMessageCore({
       customerMessage: text,
       salesIntent: plan.repeatedSalesReply.salesIntent,
       approvedReply: plan.repeatedSalesReply.approvedReply,
+      instruction: plan.repeatedSalesReply.instruction,
       repeatAction,
       productName: product.name,
       businessAccountId: knowledgeAccountId,
@@ -4527,6 +4531,7 @@ async function maybeCreateSalesIntentRepeatReply({
   customerMessage,
   salesIntent,
   approvedReply,
+  instruction = "",
   repeatAction = "openai_acknowledge",
   productName = "",
   businessAccountId = config.accountId,
@@ -4541,6 +4546,7 @@ async function maybeCreateSalesIntentRepeatReply({
       customerMessage,
       salesIntent,
       approvedReply,
+      instruction,
       repeatAction,
       productName,
     });
@@ -5157,6 +5163,7 @@ async function submitOrderFromDraft(customer, product, orderDraft, rawMessage = 
     followupBlocked: true,
     followupBlockedReason: "order_submitted",
   }), businessAccountId);
+  await cancelPendingFollowupsForCustomer(customer.id, businessAccountId, "Customer submitted order.");
   const outbound = orderSubmittedCustomerMessages(product);
   await sendOutbound(customer.id, outbound, { businessAccountId, correlationId, purpose: "order_closing_sequence" });
   const adminMessage = formatAdminOrderMessage(product, orderDraft, customer.id);
@@ -8723,6 +8730,27 @@ async function clearPendingCustomerBuffers(businessAccountId, customerId) {
   ]);
 }
 
+async function cancelPendingFollowupsForCustomer(customerId, businessAccountId = config.accountId, reason = "Customer no longer eligible for follow-up.") {
+  const id = String(customerId || "").trim();
+  if (!id) return [];
+  const cancellableStatuses = new Set(["queued", "retry_pending", "processing", "held_template"]);
+  const queue = await operations.listFollowupQueue(businessAccountId);
+  const updates = queue
+    .filter((item) =>
+      item.customerId === id &&
+      cancellableStatuses.has(String(item.status || "queued"))
+    )
+    .map((item) => ({
+      id: item.id,
+      patch: {
+        status: "cancelled",
+        lastError: reason,
+      },
+    }));
+  if (!updates.length) return [];
+  return operations.updateFollowupDispatches(updates);
+}
+
 function durableBufferArgs(args = {}) {
   return {
     id: String(args.id || ""),
@@ -8832,17 +8860,25 @@ function openingFlowInboundBufferDelayMs() {
 
 async function bufferMergedCustomerMessage(args, customer) {
   const delayMs = Math.max(0, Number(config.messageMergeBufferMs) || 0);
+  const maxWaitMs = Math.max(delayMs, Number(config.messageMergeMaxWaitMs) || 0);
   const key = pendingCustomerBufferKey(PENDING_BUFFER_TYPE.MESSAGE_MERGE, args.businessAccountId, args.from);
   const existing = pendingMessageMergeBuffers.get(key);
   if (existing?.timer) clearTimeout(existing.timer);
   const saved = await store.updatePendingBuffer(key, (stored) => {
     const messages = [...(stored?.messages || []), String(args.text || "").trim()].filter(Boolean);
     const sources = [...(stored?.sources || []), args.source || {}];
+    const startedAt = stored?.startedAt || new Date().toISOString();
+    const quietDueAt = Date.now() + delayMs;
+    const maxDueAt = Date.parse(startedAt) + maxWaitMs;
+    const dueAt = Number.isFinite(maxDueAt)
+      ? new Date(Math.min(quietDueAt, maxDueAt)).toISOString()
+      : new Date(quietDueAt).toISOString();
     return {
       type: PENDING_BUFFER_TYPE.MESSAGE_MERGE,
       businessAccountId: args.businessAccountId || config.accountId,
       customerId: args.from,
-      dueAt: new Date(Date.now() + delayMs).toISOString(),
+      startedAt,
+      dueAt,
       messages,
       sources,
       args: durableBufferArgs(args),
@@ -10348,6 +10384,12 @@ function saveSalesReply(body, content = defaultTeamContent) {
   }
   const index = records.findIndex((reply) => reply.id === id);
   const existing = index >= 0 ? records[index] : {};
+  const hasRepeatInstruction =
+    Object.hasOwn(body, "sameIntentAgainInstruction") ||
+    Object.hasOwn(body, "same_intent_again_instruction");
+  const sameIntentAgainInstruction = hasRepeatInstruction
+    ? String(body.sameIntentAgainInstruction || body.same_intent_again_instruction || "").trim()
+    : String(existing.same_intent_again_instruction || existing.sameIntentAgainInstruction || "").trim();
   const saved = {
     id,
     sales_intent: salesIntent,
@@ -10356,6 +10398,7 @@ function saveSalesReply(body, content = defaultTeamContent) {
     example_messages: exampleMessages,
     approved_reply: approvedReply,
     repeat_action: repeatAction,
+    same_intent_again_instruction: sameIntentAgainInstruction,
     after_reply: afterReply,
     scope: storageScope,
     productId: "",
@@ -14631,6 +14674,10 @@ function replyLibraryPageHtml() {
             <span class="field-help">Choose "Wait for customer" to keep normal follow-ups active. Choose "Close sales conversation" to stop sales follow-ups and sales prompts after this approved reply. "Same Intent Again" only applies if the same intent appears later.</span>
           </label>
           <label class="field wide" for="sales-repeat-action">Same Intent Again <select id="sales-repeat-action"></select></label>
+          <label class="field wide" for="sales-repeat-instruction">Same Intent Again Instruction
+            <textarea id="sales-repeat-instruction"></textarea>
+            <span class="field-help">Optional. If blank, OpenAI uses the default acknowledgement. If filled, OpenAI follows this guidance for repeated customer intent.</span>
+          </label>
         </div>
         <div class="editor-actions">
           <label for="sales-active"><input id="sales-active" type="checkbox" checked /> Active</label>
@@ -14807,11 +14854,11 @@ function replyLibraryPageHtml() {
       document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions("WAIT_FOR_CUSTOMER"); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions("WAIT_FOR_CUSTOMER"); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-repeat-instruction").value = ""; document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions(salesAfterReplyKey(reply)); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions(salesAfterReplyKey(reply)); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-repeat-instruction").value = reply.same_intent_again_instruction || reply.sameIntentAgainInstruction || ""; document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -14839,7 +14886,7 @@ function replyLibraryPageHtml() {
         const selectedIntent = selectedSalesIntent();
         const displayName = selectedIntentKey ? salesIntentLabel(selectedIntentKey, selectedIntent) : newIntentName;
         const salesIntent = selectedIntentKey || stableKey(newIntentName || displayName, "sales_intent");
-        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, afterReply: document.querySelector("#sales-after-reply").value, repeatAction: document.querySelector("#sales-repeat-action").value, active: document.querySelector("#sales-active").checked }) });
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, afterReply: document.querySelector("#sales-after-reply").value, repeatAction: document.querySelector("#sales-repeat-action").value, sameIntentAgainInstruction: document.querySelector("#sales-repeat-instruction").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
     }
