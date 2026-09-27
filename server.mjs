@@ -5851,6 +5851,7 @@ async function getDueFollowupsForTeams(now = new Date()) {
     const teamCatalog = teamContent.catalog;
     const product = teamCatalog.products.find((item) => item.id === customer.productId);
     if (!product) continue;
+    if (hasPendingOpeningFlow(customer)) continue;
     if (customer.handoffStatus === "human_required") continue;
     const anotherDateItem = anotherDatePurchaseFollowupItem(customer, product, teamContent, now);
     if (anotherDateItem) {
@@ -5960,6 +5961,24 @@ async function dispatchFollowupQueue(now = new Date()) {
         lastError: !customer ? "Customer no longer exists." : "Customer no longer eligible for follow-up.",
       });
       result.cancelled.push(sentItem);
+      continue;
+    }
+    if (hasPendingOpeningFlow(customer)) {
+      const pendingDueAt = validDateOrNull(customer.pendingOpeningFlow?.dueAt);
+      const retryAt = pendingDueAt && pendingDueAt > now
+        ? pendingDueAt
+        : new Date(now.getTime() + Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
+      updateDispatch(item.id, {
+        status: "queued",
+        availableAt: retryAt.toISOString(),
+        lastError: "Waiting for opening flow to send before follow-up.",
+      });
+      result.paused.push({
+        customerId: item.customerId,
+        followupKey: item.followupKey,
+        productId: item.productId,
+        pausedUntil: retryAt.toISOString(),
+      });
       continue;
     }
     if (item.productId && customer.productId && item.productId !== customer.productId) {
@@ -8181,6 +8200,10 @@ function followupAnchorAt(customer = {}, item = {}) {
     if (openingSentAt) return openingSentAt.toISOString();
   }
   return customer.firstSeenAt;
+}
+
+function hasPendingOpeningFlow(customer = {}) {
+  return Boolean(customer.pendingOpeningFlow?.productId || customer.pendingOpeningFlow?.dueAt);
 }
 
 function localCalendarDayDiff(start, end) {
