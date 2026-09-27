@@ -1046,6 +1046,7 @@ const server = http.createServer(async (req, res) => {
           handoffAlertEnabled: body.handoffAlertEnabled,
           handoffAlertNumber: body.handoffAlertNumber,
           handoffAlertCooldownMinutes: body.handoffAlertCooldownMinutes,
+          skuPrefix: body.skuPrefix,
         });
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
@@ -2246,13 +2247,25 @@ function shouldStartNewProductJourney(customer = {}, product = null) {
   );
 }
 
-function productDetectionSource(customer = {}, source = {}) {
+function productDetectionSource(customer = {}, source = {}, settings = {}) {
   return {
     ...(customer?.leadSource && typeof customer.leadSource === "object" ? customer.leadSource : {}),
     ...(customer?.source && typeof customer.source === "object" ? customer.source : {}),
     ...(customer?.lastInboundSource && typeof customer.lastInboundSource === "object" ? customer.lastInboundSource : {}),
     ...(source && typeof source === "object" ? source : {}),
+    ...skuPrefixSource(settings),
   };
+}
+
+function skuPrefixSource(settings = {}) {
+  const prefixes = [
+    ...(Array.isArray(settings.skuPrefixes) ? settings.skuPrefixes : []),
+    settings.skuPrefix,
+  ]
+    .flatMap((value) => String(value || "").split(/[,\s]+/))
+    .map((value) => value.toUpperCase().replace(/[^A-Z]/g, ""))
+    .filter(Boolean);
+  return prefixes.length ? { skuPrefixes: [...new Set(prefixes)] } : {};
 }
 
 function hasConfidentProductResolution(productResolution = null) {
@@ -3127,11 +3140,12 @@ async function processInboundMessageCore({
   const teamCatalog = content.catalog;
   const teamFaqLibrary = content.faqLibrary;
   const teamSalesReplyLibrary = content.salesReplyLibrary;
+  const teamSettings = await adminAccounts.getTeamSettings(businessAccountId).catch(() => ({}));
   const existingCustomer = await store.getCustomer(from, businessAccountId);
   const firstEligibleInbound = typeof isFirstEligibleInbound === "boolean"
     ? isFirstEligibleInbound
     : !existingCustomer || Number(existingCustomer.inboundCount || 0) === 0;
-  const initialDetectionSource = productDetectionSource(existingCustomer, source);
+  const initialDetectionSource = productDetectionSource(existingCustomer, source, teamSettings);
   const initialProductResolution = resolveProduct(teamCatalog, text, initialDetectionSource, existingCustomer?.productId || "");
   const initialActiveState = conversationActiveState(existingCustomer || {});
   const initialOpeningFlowDecision = getOpeningFlowDecision({
@@ -3233,7 +3247,7 @@ async function processInboundMessageCore({
 
   const conversationContext = await recentConversationContext(from, businessAccountId);
   const activeState = conversationActiveState(customer);
-  const detectionSource = productDetectionSource(customer, source);
+  const detectionSource = productDetectionSource(customer, source, teamSettings);
   const sourceMatchedProduct = findProductMatch(teamCatalog, "", detectionSource);
   const contextMatchedProduct = customer.productId
     ? sourceMatchedProduct
@@ -13092,6 +13106,11 @@ function adminDashboardHtml() {
       <form class="profile-form" id="profile-form">
         <label for="profile-name">Dashboard Name <input id="profile-name" name="name" maxlength="80" placeholder="AI Agent Monitor" /></label>
         <label for="profile-color">Dashboard Color <input id="profile-color" name="accentColor" type="color" value="#0071e3" /></label>
+        <h3 class="profile-section-title">Product Detection</h3>
+        <div class="profile-help">Use the account SKU prefix from ad/source text to lock the correct product before fuzzy matching.</div>
+        <label for="profile-sku-prefix">Product SKU Prefix
+          <input id="profile-sku-prefix" name="skuPrefix" maxlength="8" placeholder="SS" />
+        </label>
         <h3 class="profile-section-title">WhatsApp Handoff Alert</h3>
         <div class="profile-help">Send a WhatsApp alert to your admin number whenever AI marks a customer as needing human handoff.</div>
         <label class="checkbox-label" for="profile-handoff-alert-enabled">
@@ -13383,6 +13402,7 @@ function adminDashboardHtml() {
     }
 
     function applyTeamSettings(settings = {}) {
+      document.querySelector("#profile-sku-prefix").value = settings.skuPrefix || (settings.skuPrefixes || []).join(", ");
       document.querySelector("#profile-handoff-alert-enabled").checked = Boolean(settings.handoffAlertEnabled);
       document.querySelector("#profile-handoff-alert-number").value = settings.handoffAlertNumber || "";
       document.querySelector("#profile-handoff-alert-cooldown").value = settings.handoffAlertCooldownMinutes || "";
@@ -13564,6 +13584,7 @@ function adminDashboardHtml() {
         const result = await request("/admin/profile", {
           name: document.querySelector("#profile-name").value,
           accentColor: document.querySelector("#profile-color").value,
+          skuPrefix: document.querySelector("#profile-sku-prefix").value,
           handoffAlertEnabled: document.querySelector("#profile-handoff-alert-enabled").checked,
           handoffAlertNumber: document.querySelector("#profile-handoff-alert-number").value,
           handoffAlertCooldownMinutes: document.querySelector("#profile-handoff-alert-cooldown").value
