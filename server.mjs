@@ -3507,7 +3507,7 @@ async function processInboundMessageCore({
     };
   }
 
-  if (customer.pendingUpsell) {
+  if (customer.pendingUpsell && shouldHandlePendingUpsellForRoute(customer, routedProduct, text, routeClassification)) {
     const upsellProduct = teamCatalog.products.find((item) => item.id === customer.pendingUpsell?.productId) || routedProduct;
     const upsellResult = await handlePendingUpsellReply({
       customer,
@@ -4763,7 +4763,7 @@ async function retrieveAndRerankVectorStoreKnowledge({
       apiKey,
       vectorStoreId,
       query: retrievalQuery,
-      maxResults: 8,
+      maxResults: 20,
     }), routeClassification, product),
     routeClassification
   );
@@ -5272,6 +5272,26 @@ async function handlePendingUpsellReply({
     ? pending.originalOrderDraft
     : orderDraftWithOption(pending.originalOrderDraft, selectedOption);
   return finalizePendingUpsell(customer, product, selectedDraft, `upsell_${decision.decision}`, businessAccountId, correlationId);
+}
+
+function shouldHandlePendingUpsellForRoute(customer = {}, product = {}, text = "", routeClassification = null) {
+  if (!customer.pendingUpsell) return false;
+  const messageType = String(routeClassification?.messageType || "").trim();
+  const confidence = String(routeClassification?.confidence || "").trim();
+  if (
+    confidence !== "low" &&
+    ["product_question", "general_faq", "order_status", "complaint", "human_request", "sales_reply"].includes(messageType)
+  ) {
+    return false;
+  }
+  if (confidence !== "low" && messageType === "purchase_intent") return true;
+  const options = dashboardOrderOptions(product);
+  if (matchUpsellOptionReply(text, options)) return true;
+  const normalized = normalizeCustomerMessage(text);
+  return Boolean(
+    /\b(yes|ya|yea|yup|ok|okay|awu|mau|mahu|nak|want|ambil|confirm|upgrade|topup|tambah|add|add-on|addon|kekal|stay|same|lama|asal|original|no|inda|nda|tidak|tak)\b/i.test(normalized) &&
+      /\b(package|pakej|paket|option|pilihan|unit|set|combo|add|add-on|addon|lubricant|topup|upgrade|kekal|same|original)\b/i.test(normalized)
+  );
 }
 
 function matchUpsellOptionReply(text, options = []) {
