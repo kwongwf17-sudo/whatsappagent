@@ -22,7 +22,6 @@ import {
   findSalesReplyPrimaryIntentMatch,
   normalizeCustomerMessage,
   productIntro,
-  PRODUCT_CONTEXT_CLARIFICATION_REPLY,
   salesReplyRecordsForProduct,
   formatStockArrivalMessage,
   getOpeningFlowDecision,
@@ -1048,6 +1047,7 @@ const server = http.createServer(async (req, res) => {
           handoffAlertNumber: body.handoffAlertNumber,
           handoffAlertCooldownMinutes: body.handoffAlertCooldownMinutes,
           skuPrefix: body.skuPrefix,
+          skuPrefixes: body.skuPrefixes,
         });
         await store.appendAuditLog({
           actor: `admin:${adminSession.accountId}`,
@@ -3292,7 +3292,7 @@ async function processInboundMessageCore({
     }, customer, bufferProduct);
   }
 
-  if (shouldClarifyOpeningFlowProductWithoutAi({
+  if (shouldHandoffOpeningFlowProductWithoutAi({
     customer,
     activeState,
     firstEligibleInbound,
@@ -3301,7 +3301,7 @@ async function processInboundMessageCore({
     optOutIntent,
     text,
   })) {
-    return await handleOpeningFlowProductClarification({
+    return await handleOpeningFlowProductHandoff({
       from,
       customer,
       text,
@@ -4208,7 +4208,7 @@ async function handleOpeningFlowOnlyRoute({
   };
 }
 
-function shouldClarifyOpeningFlowProductWithoutAi({
+function shouldHandoffOpeningFlowProductWithoutAi({
   customer = {},
   activeState = "",
   firstEligibleInbound = false,
@@ -4228,40 +4228,44 @@ function shouldClarifyOpeningFlowProductWithoutAi({
   return true;
 }
 
-async function handleOpeningFlowProductClarification({
+async function handleOpeningFlowProductHandoff({
   from,
   customer,
   text,
   businessAccountId = config.accountId,
   correlationId = "",
 }) {
+  const reason = "Opening flow product detection is not confident.";
   const updatedCustomer = await store.updateCustomer(from, () => ({
-    awaitingProductClarification: true,
-    productClarificationReason: "opening_flow_product_not_confident",
-    handoffStatus: "",
-    handoffReason: "",
+    awaitingProductClarification: false,
+    productClarificationReason: "",
+    handoffStatus: "human_required",
+    handoffReason: reason,
+    handoffSeverity: handoffSeverityForReason(reason),
   }), businessAccountId);
   await store.appendAuditLog({
     actor: "ai_agent",
-    action: "opening_flow_product_clarification",
+    action: "opening_flow_product_handoff",
     customerId: from,
     result: "no_confident_product_context",
     reason: text,
     businessAccountId,
     correlationId,
   });
-  const outbound = [textMessage(PRODUCT_CONTEXT_CLARIFICATION_REPLY)];
-  await sendOutbound(from, outbound, {
+  await maybeSendHandoffAdminAlert({
+    customer: updatedCustomer,
+    customerId: from,
     businessAccountId,
+    reason,
+    lastCustomerMessage: text,
     correlationId,
-    purpose: "opening_flow_product_clarification",
   });
   return {
     customer: updatedCustomer,
     order: null,
-    messages: outbound,
-    handoffRequired: false,
-    handoffReason: "",
+    messages: [],
+    handoffRequired: true,
+    handoffReason: reason,
   };
 }
 
@@ -13386,9 +13390,9 @@ function adminDashboardHtml() {
         <label for="profile-name">Dashboard Name <input id="profile-name" name="name" maxlength="80" placeholder="AI Agent Monitor" /></label>
         <label for="profile-color">Dashboard Color <input id="profile-color" name="accentColor" type="color" value="#0071e3" /></label>
         <h3 class="profile-section-title">Product Detection</h3>
-        <div class="profile-help">Use the account SKU prefix from ad/source text to lock the correct product before fuzzy matching.</div>
-        <label for="profile-sku-prefix">Product SKU Prefix
-          <input id="profile-sku-prefix" name="skuPrefix" maxlength="8" placeholder="SS" />
+        <div class="profile-help">Exact Product SKU Code on each product is checked first from ad/source text. Use this only as an optional fallback for account-level SKU prefixes. Separate multiple prefixes with comma or space.</div>
+        <label for="profile-sku-prefix">Optional SKU Prefix Fallback
+          <input id="profile-sku-prefix" name="skuPrefix" maxlength="120" placeholder="PY, SS" />
         </label>
         <h3 class="profile-section-title">WhatsApp Handoff Alert</h3>
         <div class="profile-help">Send a WhatsApp alert to your admin number whenever AI marks a customer as needing human handoff.</div>
@@ -13681,10 +13685,20 @@ function adminDashboardHtml() {
     }
 
     function applyTeamSettings(settings = {}) {
-      document.querySelector("#profile-sku-prefix").value = settings.skuPrefix || (settings.skuPrefixes || []).join(", ");
+      document.querySelector("#profile-sku-prefix").value = (settings.skuPrefixes || []).length
+        ? (settings.skuPrefixes || []).join(", ")
+        : (settings.skuPrefix || "");
       document.querySelector("#profile-handoff-alert-enabled").checked = Boolean(settings.handoffAlertEnabled);
       document.querySelector("#profile-handoff-alert-number").value = settings.handoffAlertNumber || "";
       document.querySelector("#profile-handoff-alert-cooldown").value = settings.handoffAlertCooldownMinutes || "";
+    }
+
+    function profileSkuPrefixes() {
+      const prefixes = document.querySelector("#profile-sku-prefix").value
+        .split(/[,\\s]+/)
+        .map(value => value.toUpperCase().replace(/[^A-Z]/g, ""))
+        .filter(Boolean);
+      return [...new Set(prefixes)];
     }
 
     async function loadDashboard() {
@@ -13860,10 +13874,12 @@ function adminDashboardHtml() {
       const state = document.querySelector("#profile-state");
       state.textContent = "Saving...";
       try {
+        const skuPrefixes = profileSkuPrefixes();
         const result = await request("/admin/profile", {
           name: document.querySelector("#profile-name").value,
           accentColor: document.querySelector("#profile-color").value,
-          skuPrefix: document.querySelector("#profile-sku-prefix").value,
+          skuPrefix: skuPrefixes[0] || "",
+          skuPrefixes,
           handoffAlertEnabled: document.querySelector("#profile-handoff-alert-enabled").checked,
           handoffAlertNumber: document.querySelector("#profile-handoff-alert-number").value,
           handoffAlertCooldownMinutes: document.querySelector("#profile-handoff-alert-cooldown").value
