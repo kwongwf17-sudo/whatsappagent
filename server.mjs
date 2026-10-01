@@ -34,6 +34,7 @@ import {
   classifyUpsellDecision,
   createCustomerServiceResponse,
   createComplaintHandoffReply,
+  createEducationalSalesReply,
   createSalesIntentRepeatReply,
   classifySalesReplyExpectedAction,
   detectComplaintIntent,
@@ -481,6 +482,17 @@ const SALES_AFTER_REPLY_OPTIONS = [
   { key: "CLOSE_SALES_CONVERSATION", label: "Close sales conversation" },
 ];
 const SALES_AFTER_REPLY_LABELS = new Map(SALES_AFTER_REPLY_OPTIONS.map((item) => [item.key, item.label]));
+const SALES_SIMILAR_REPLY_ACTION_OPTIONS = [
+  { key: "openai_rewrite", label: "OpenAI rewrite" },
+  { key: "alternate_reply", label: "Use alternate reply" },
+];
+const SALES_SIMILAR_REPLY_ACTION_LABELS = new Map(SALES_SIMILAR_REPLY_ACTION_OPTIONS.map((item) => [item.key, item.label]));
+const SALES_REPLY_MODE_OPTIONS = [
+  { key: "approved", label: "Approved sales replies" },
+  { key: "education", label: "Product knowledge educational selling" },
+  { key: "hybrid", label: "Hybrid" },
+];
+const SALES_REPLY_MODE_LABELS = new Map(SALES_REPLY_MODE_OPTIONS.map((item) => [item.key, item.label]));
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1664,17 +1676,37 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/admin/sales-replies-data") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const content = await getTeamContent(adminSession.accountId);
-      return sendJson(res, 200, salesRepliesData(content));
+      const settings = await adminAccounts.getTeamSettings(adminSession.accountId);
+      return sendJson(res, 200, salesRepliesData(content, settings));
     }
 
-if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
+    if (req.method === "POST" && url.pathname === "/admin/sales-replies/settings") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const account = await adminAccounts.updateTeamSettings(adminSession.accountId, {
+          salesReplyMode: body.salesReplyMode,
+          salesEducationInstruction: body.salesEducationInstruction,
+        });
+        const content = await getTeamContent(adminSession.accountId);
+        return sendJson(res, 200, {
+          settings: salesReplyUiSettings(account.settings || {}),
+          data: salesRepliesData(content, account.settings || {}),
+        });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
       try {
         const content = await getTeamContent(adminSession.accountId);
         const salesReply = saveSalesReply(body, content);
         await saveTeamContent(adminSession.accountId, content);
-        return sendJson(res, 200, { salesReply, data: salesRepliesData(content) });
+        const settings = await adminAccounts.getTeamSettings(adminSession.accountId);
+        return sendJson(res, 200, { salesReply, data: salesRepliesData(content, settings) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -1687,7 +1719,8 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         const content = await getTeamContent(adminSession.accountId);
         const deleted = deleteSalesReply(body, content);
         await saveTeamContent(adminSession.accountId, content);
-        return sendJson(res, 200, { deleted, data: salesRepliesData(content) });
+        const settings = await adminAccounts.getTeamSettings(adminSession.accountId);
+        return sendJson(res, 200, { deleted, data: salesRepliesData(content, settings) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -1700,7 +1733,8 @@ if (req.method === "POST" && url.pathname === "/admin/sales-replies/save") {
         const content = await getTeamContent(adminSession.accountId);
         const orderFormFollowups = updateOrderFormFollowupSettings(content, body.orderFormFollowups || body);
         await saveTeamContent(adminSession.accountId, content);
-        return sendJson(res, 200, { orderFormFollowups, data: salesRepliesData(content) });
+        const settings = await adminAccounts.getTeamSettings(adminSession.accountId);
+        return sendJson(res, 200, { orderFormFollowups, data: salesRepliesData(content, settings) });
       } catch (error) {
         return sendJson(res, 400, { error: error.message });
       }
@@ -3654,7 +3688,16 @@ async function processInboundMessageCore({
         salesReplyLibrary: teamSalesReplyLibrary,
         businessAccountId: knowledgeAccountId,
       });
-  const selectedSalesReply = exactSalesReply || vectorSalesReply;
+  const selectedSalesReply = await resolveSalesReplyForSending({
+    salesReply: exactSalesReply || vectorSalesReply,
+    customerMessage: text,
+    conversationContext,
+    routeClassification,
+    product,
+    salesReplyMode: teamSettings.salesReplyMode,
+    educationInstruction: teamSettings.salesEducationInstruction,
+    businessAccountId: knowledgeAccountId,
+  });
   const salesReplyExpectedAction = selectedSalesReply
     ? await maybeClassifySalesReplyExpectedAction({
         customerMessage: text,
@@ -4831,6 +4874,125 @@ async function maybeCreateSalesIntentRepeatReply({
   }
 }
 
+async function maybeCreateProductKnowledgeSalesReply({
+  customerMessage,
+  salesIntent = "",
+  routeClassification = null,
+  product,
+  businessAccountId = config.accountId,
+  instruction = "",
+}) {
+  const apiKey = await openAiApiKeyForAccount(businessAccountId);
+  if (!apiKey) return null;
+  const vectorStoreId = await vectorStoreIdForAccount(businessAccountId);
+  if (!vectorStoreId) return null;
+  const model = await openAiModelForAccount(businessAccountId);
+  try {
+    const retrievalQuery = buildKnowledgeRetrievalQuery(
+      [salesIntent, customerMessage].filter(Boolean).join(" | "),
+      product,
+      routeClassification || { messageType: "product_question", primaryIntent: salesIntent, confidence: "medium" }
+    );
+    const topKnowledgeRecords = await retrieveAndRerankVectorStoreKnowledge({
+      apiKey,
+      model,
+      vectorStoreId,
+      customerMessage,
+      retrievalQuery,
+      routeClassification: routeClassification || { messageType: "product_question", primaryIntent: salesIntent, confidence: "medium" },
+      product,
+      businessAccountId,
+    });
+    if (!topKnowledgeRecords.length) return null;
+    const answer = await createEducationalSalesReply({
+      apiKey,
+      model,
+      customerMessage,
+      normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
+      salesIntent,
+      productName: product?.name || "",
+      productId: product?.id || "",
+      rerankedKnowledgeContext: formatRerankedKnowledgeContext(topKnowledgeRecords.slice(0, 3)),
+      instruction,
+    });
+    const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
+    if (!answer || !safeReply || answer.handoffRequired || answer.handoff_required) return null;
+    return {
+      reply: safeReply,
+      rerankedKnowledgeIds: topKnowledgeRecords.map((record) => record.id).filter(Boolean),
+    };
+  } catch (error) {
+    await recordSystemError("sales_education_reply", error, `Product: ${product?.id || ""}`, businessAccountId);
+    return null;
+  }
+}
+
+async function resolveSalesReplyForSending({
+  salesReply,
+  customerMessage,
+  conversationContext = [],
+  routeClassification = null,
+  product,
+  salesReplyMode = "approved",
+  educationInstruction = "",
+  businessAccountId = config.accountId,
+}) {
+  if (!salesReply) return null;
+  const normalizedMode = normalizeSalesReplyMode(salesReplyMode);
+  const salesIntent = salesReply.sales_intent || salesReply.objection_type || "";
+  if (["education", "hybrid"].includes(normalizedMode)) {
+    const educationReply = await maybeCreateProductKnowledgeSalesReply({
+      customerMessage,
+      salesIntent,
+      routeClassification,
+      product,
+      businessAccountId,
+      instruction: educationInstruction,
+    });
+    if (educationReply?.reply) {
+      return {
+        ...salesReply,
+        approved_reply: educationReply.reply,
+        sales_reply_source: "product_knowledge_education",
+        sales_reply_knowledge_ids: educationReply.rerankedKnowledgeIds || [],
+      };
+    }
+    if (normalizedMode === "education") return null;
+  }
+
+  const alreadySentSimilar = hasSimilarSalesReplyInRecentContext(salesReply.approved_reply, conversationContext);
+  if (!String(salesReply.approved_reply || "").trim()) return null;
+  if (!alreadySentSimilar) return salesReply;
+
+  const alternateReply = String(salesReply.alternate_approved_reply || salesReply.alternateApprovedReply || "").trim();
+  const similarAction = normalizeSalesSimilarReplyAction(salesReply.similar_reply_action || salesReply.similarReplyAction);
+  if (similarAction === "alternate_reply" && alternateReply) {
+    return {
+      ...salesReply,
+      approved_reply: alternateReply,
+      sales_reply_source: "alternate_approved_reply",
+    };
+  }
+
+  const rewritten = await maybeCreateSalesIntentRepeatReply({
+    customerMessage,
+    salesIntent,
+    approvedReply: salesReply.approved_reply,
+    instruction: "A similar sales reply was already sent earlier in this chat. Acknowledge the customer naturally and continue without repeating the same wording or same question.",
+    repeatAction: "openai_acknowledge",
+    productName: product?.name || "",
+    businessAccountId,
+  });
+  if (rewritten) {
+    return {
+      ...salesReply,
+      approved_reply: rewritten,
+      sales_reply_source: "openai_similar_reply_rewrite",
+    };
+  }
+  return salesReply;
+}
+
 async function maybeClassifyCustomerMessageRoute({
   customerMessage,
   customerId,
@@ -5080,6 +5242,39 @@ function sanitizeProductKnowledgeReply(reply) {
     .filter((sentence) => !/\b(claim\s*produk|claimed?|visible text|promotional image|poster|chunk|extracted)\b/i.test(sentence))
     .filter((sentence) => !/\bblackheads?\s*out\s*in\s*5\s*minutes?\b/i.test(sentence))
     .join(" ")
+    .trim();
+}
+
+function hasSimilarSalesReplyInRecentContext(reply, conversationContext = []) {
+  const target = normalizeReplySimilarityText(reply);
+  if (!target) return false;
+  return (conversationContext || [])
+    .filter((message) => String(message?.role || "").toLowerCase() !== "customer")
+    .some((message) => salesReplyTextsAreSimilar(target, normalizeReplySimilarityText(message?.text || "")));
+}
+
+function salesReplyTextsAreSimilar(normalizedTarget, normalizedSeen) {
+  if (!normalizedTarget || !normalizedSeen) return false;
+  if (normalizedTarget === normalizedSeen) return true;
+  if (normalizedTarget.length >= 24 && normalizedSeen.includes(normalizedTarget)) return true;
+  if (normalizedSeen.length >= 24 && normalizedTarget.includes(normalizedSeen)) return true;
+  const targetTokens = new Set(normalizedTarget.split(" ").filter((token) => token.length > 2));
+  const seenTokens = new Set(normalizedSeen.split(" ").filter((token) => token.length > 2));
+  if (targetTokens.size < 4 || seenTokens.size < 4) return false;
+  let overlap = 0;
+  for (const token of targetTokens) {
+    if (seenTokens.has(token)) overlap += 1;
+  }
+  return overlap / Math.max(targetTokens.size, seenTokens.size) >= 0.72;
+}
+
+function normalizeReplySimilarityText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, " ")
+    .replace(/[^a-z0-9$]+/g, " ")
+    .replace(/\b(ya|yh|ah|bah|kita|ku|saya|sy|boleh|bolih|ok|okay)\b/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -6191,7 +6386,17 @@ async function dispatchFollowupQueue(now = new Date()) {
     dispatchUpdates.push({ id, patch });
   };
 
+  const batchByAccount = new Map();
   for (const item of batch) {
+    const accountId = item.businessAccountId || config.accountId;
+    if (!batchByAccount.has(accountId)) batchByAccount.set(accountId, []);
+    batchByAccount.get(accountId).push(item);
+  }
+
+  await Promise.all([...batchByAccount.values()].map(dispatchAccountBatch));
+
+  async function dispatchAccountBatch(accountBatch) {
+    for (const item of accountBatch) {
     const itemAccountId = item.businessAccountId || config.accountId;
     if (!accountSettingsById.has(itemAccountId)) {
       try {
@@ -6412,6 +6617,7 @@ async function dispatchFollowupQueue(now = new Date()) {
         lastError: error.message,
       });
       result.failed.push(sentItem);
+    }
     }
   }
   await operations.updateFollowupDispatches(dispatchUpdates);
@@ -10650,19 +10856,28 @@ function deleteApprovedFaq(body, content = defaultTeamContent) {
   return { ...deleted, scope, productId };
 }
 
-function salesRepliesData(content = defaultTeamContent) {
+function salesRepliesData(content = defaultTeamContent, settings = {}) {
   const teamSalesReplyLibrary = content.salesReplyLibrary || salesReplyLibrary;
   return {
+    settings: salesReplyUiSettings(settings),
     general: (teamSalesReplyLibrary.sales_replies || [])
       .filter((reply) => (reply.scope || "business") !== "product")
       .map((reply) => ({
         ...reply,
         after_reply: normalizeSalesAfterReplyAction(reply.after_reply || reply.afterReply),
+        similar_reply_action: normalizeSalesSimilarReplyAction(reply.similar_reply_action || reply.similarReplyAction),
         scope: "general",
         productId: "",
       })),
     products: [],
     orderFormFollowups: orderFormFollowupSettings(content),
+  };
+}
+
+function salesReplyUiSettings(settings = {}) {
+  return {
+    salesReplyMode: normalizeSalesReplyMode(settings.salesReplyMode),
+    salesEducationInstruction: String(settings.salesEducationInstruction || "").trim(),
   };
 }
 
@@ -10676,13 +10891,14 @@ function saveSalesReply(body, content = defaultTeamContent) {
   const objectionType = salesIntentLabel || SALES_INTENT_LABELS.get(salesIntent) || readableStorageLabel(salesIntent);
   const intent = String(body.intent || "").trim() || salesIntentDescription(salesIntent) || `Customer sales response or hesitation: ${objectionType}`;
   const approvedReply = String(body.approvedReply || "").trim();
+  const alternateApprovedReply = String(body.alternateApprovedReply || body.alternate_approved_reply || "").trim();
   const repeatAction = normalizeSalesRepeatAction(body.repeatAction);
+  const similarReplyAction = normalizeSalesSimilarReplyAction(body.similarReplyAction || body.similar_reply_action);
   const afterReply = normalizeSalesAfterReplyAction(body.afterReply || body.after_reply);
   const exampleMessages = Array.isArray(body.exampleMessages)
     ? body.exampleMessages.map((message) => String(message).trim()).filter(Boolean)
     : String(body.exampleMessages || "").split(/\r?\n/).map((message) => message.trim()).filter(Boolean);
   if (!salesIntent) throw new Error("Sales intent is required.");
-  if (!approvedReply) throw new Error("Approved reply is required.");
   if (!exampleMessages.length) throw new Error("Add at least one example customer message.");
   const records = (teamSalesReplyLibrary.sales_replies ||= []);
   const existingId = String(body.id || "").trim();
@@ -10715,6 +10931,8 @@ function saveSalesReply(body, content = defaultTeamContent) {
     intent,
     example_messages: exampleMessages,
     approved_reply: approvedReply,
+    alternate_approved_reply: alternateApprovedReply,
+    similar_reply_action: similarReplyAction,
     repeat_action: repeatAction,
     same_intent_again_instruction: sameIntentAgainInstruction,
     after_reply: afterReply,
@@ -10741,6 +10959,16 @@ function normalizeSalesRepeatAction(value) {
 function normalizeSalesAfterReplyAction(value) {
   const action = String(value || "WAIT_FOR_CUSTOMER").trim().toUpperCase();
   return SALES_AFTER_REPLY_LABELS.has(action) ? action : "WAIT_FOR_CUSTOMER";
+}
+
+function normalizeSalesSimilarReplyAction(value) {
+  const action = String(value || "openai_rewrite").trim();
+  return SALES_SIMILAR_REPLY_ACTION_LABELS.has(action) ? action : "openai_rewrite";
+}
+
+function normalizeSalesReplyMode(value) {
+  const mode = String(value || "approved").trim();
+  return SALES_REPLY_MODE_LABELS.has(mode) ? mode : "approved";
 }
 
 function normalizeSalesIntent(value) {
@@ -10854,7 +11082,6 @@ function approveAiSuggestion(body, content = defaultTeamContent) {
       if (!existingExamples.has(normalizeLearnedText(example))) mergedExamples.push(example);
     }
     target.example_questions = mergedExamples;
-    if (match.record.approved_reply) target.approved_reply = match.record.approved_reply;
     target.updatedAt = new Date().toISOString();
     const [removed] = match.records.splice(match.index, 1);
     removed.suggestion_status = "approved";
@@ -11931,7 +12158,7 @@ async function persistSalesReplies() {
   await writeFile(config.salesRepliesPath, contents, "utf8");
 }
 
-function loginHtml(next, error = "", accountId = config.accountId) {
+function loginHtml(next, error = "", accountId = "") {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -12021,7 +12248,7 @@ function orderAdminDashboardHtml() {
   <style>
     :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; color: #1d1d1f; background: #f5f5f7; --surface:#fff; --surface-soft:#fbfbfd; --line:#d2d2d7; --muted:#6e6e73; --accent:#0071e3; }
     * { box-sizing: border-box; }
-    body { margin: 0; background: #f5f5f7; }
+    body { margin: 0; background: #f5f5f7; min-height: 100vh; display: grid; grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden; }
     header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
     h1 { margin: 0; font-size: 20px; }
     .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
@@ -13233,6 +13460,113 @@ function adminDashboardHtml() {
       align-items: center;
       gap: 10px;
     }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(0, 0, 0, .42);
+      z-index: 50;
+    }
+    .modal-backdrop.open {
+      display: flex;
+    }
+    .manual-order-modal {
+      width: min(760px, 100%);
+      max-height: min(88vh, 860px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      background: #fff;
+      border: 1px solid #d2d2d7;
+      border-radius: 10px;
+      box-shadow: 0 22px 70px rgba(0, 0, 0, .24);
+      overflow: hidden;
+    }
+    .modal-head, .modal-actions {
+      padding: 14px 16px;
+      background: var(--surface-soft);
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .modal-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .modal-head h3 {
+      margin: 0 0 3px;
+      font-size: 18px;
+    }
+    .modal-head .muted {
+      font-size: 12px;
+    }
+    .modal-close {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 7px 10px;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }
+    .modal-body {
+      overflow: auto;
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+    .manual-order-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .manual-order-grid label {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .manual-order-grid label.wide {
+      grid-column: 1 / -1;
+    }
+    .manual-order-grid input,
+    .manual-order-grid select,
+    .manual-order-grid textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    .manual-order-grid textarea {
+      min-height: 96px;
+      resize: vertical;
+      line-height: 1.38;
+    }
+    #manual-order-paste {
+      min-height: 150px;
+    }
+    .modal-actions {
+      border-top: 1px solid #e5e5ea;
+      border-bottom: 0;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 9px;
+    }
+    .modal-actions .secondary {
+      background: #fff;
+      color: #1d1d1f;
+      border-color: var(--line);
+    }
+    #manual-order-state {
+      margin-right: auto;
+      color: var(--muted);
+      font-size: 12px;
+    }
     #profile-state {
       color: var(--muted);
       font-size: 13px;
@@ -13285,6 +13619,9 @@ function adminDashboardHtml() {
       .dashboard-header-row { align-items: stretch; flex-direction: column; }
       .dashboard-date-panel { min-width: 0; text-align: left; }
       .dashboard-date-panel label { justify-content: flex-start; }
+      .modal-backdrop { align-items: stretch; padding: 10px; }
+      .manual-order-modal { max-height: none; }
+      .manual-order-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -13419,6 +13756,57 @@ function adminDashboardHtml() {
       </form>
     </section>
   </main>
+  <div class="modal-backdrop" id="manual-order-modal" aria-hidden="true">
+    <form class="manual-order-modal" id="manual-order-form">
+      <div class="modal-head">
+        <div>
+          <h3>Manual Order Submission</h3>
+          <div class="muted" id="manual-order-customer-label">Paste full order details, extract, review, then submit.</div>
+        </div>
+        <button class="modal-close" id="manual-order-close" type="button">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="manual-order-grid">
+          <label class="wide" for="manual-order-product">Product
+            <select id="manual-order-product" required></select>
+          </label>
+          <label class="wide" for="manual-order-paste">Paste Full Order Details
+            <textarea id="manual-order-paste" placeholder="Paste name, phone, address, package, quantity, price, and reference code here"></textarea>
+          </label>
+          <label for="manual-order-option">Order Option / Package
+            <select id="manual-order-option"></select>
+          </label>
+          <label for="manual-order-qty">Qty
+            <input id="manual-order-qty" type="number" min="1" step="1" value="1" />
+          </label>
+          <label for="manual-order-name">Name
+            <input id="manual-order-name" autocomplete="off" />
+          </label>
+          <label for="manual-order-phone">Phone
+            <input id="manual-order-phone" autocomplete="off" />
+          </label>
+          <label class="wide" for="manual-order-address">Address
+            <textarea id="manual-order-address"></textarea>
+          </label>
+          <label for="manual-order-addon">Add-on
+            <input id="manual-order-addon" autocomplete="off" />
+          </label>
+          <label for="manual-order-price">Price / Reference
+            <input id="manual-order-price" autocomplete="off" />
+          </label>
+          <label class="wide" for="manual-order-code">Reference Code
+            <input id="manual-order-code" autocomplete="off" />
+          </label>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <span id="manual-order-state"></span>
+        <button class="secondary" id="manual-order-extract" type="button">Extract Details</button>
+        <button class="secondary" id="manual-order-cancel" type="button">Cancel</button>
+        <button id="manual-order-submit" type="submit">Submit Order</button>
+      </div>
+    </form>
+  </div>
   <script>
     const sections = {
       customers: document.querySelector("#customers .table-wrap"),
@@ -13443,6 +13831,21 @@ function adminDashboardHtml() {
     let activeHandoffDate = localDateInput(new Date());
     let activeOrdersDate = localDateInput(new Date());
     const bulkSelections = new Map();
+    let manualOrderCustomerId = "";
+    const manualOrderModal = document.querySelector("#manual-order-modal");
+    const manualOrderForm = document.querySelector("#manual-order-form");
+    const manualOrderProduct = document.querySelector("#manual-order-product");
+    const manualOrderOption = document.querySelector("#manual-order-option");
+    const manualOrderPaste = document.querySelector("#manual-order-paste");
+    const manualOrderQty = document.querySelector("#manual-order-qty");
+    const manualOrderName = document.querySelector("#manual-order-name");
+    const manualOrderPhone = document.querySelector("#manual-order-phone");
+    const manualOrderAddress = document.querySelector("#manual-order-address");
+    const manualOrderAddOn = document.querySelector("#manual-order-addon");
+    const manualOrderPrice = document.querySelector("#manual-order-price");
+    const manualOrderCode = document.querySelector("#manual-order-code");
+    const manualOrderState = document.querySelector("#manual-order-state");
+    const manualOrderCustomerLabel = document.querySelector("#manual-order-customer-label");
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, function(ch) {
@@ -13956,59 +14359,253 @@ function adminDashboardHtml() {
       };
     }
 
-    async function markCustomerOrderSubmitted(customerId) {
-      const defaults = customerDefaultsForManualOrder(customerId);
+    function selectedManualOrderProduct() {
+      return findDashboardProduct(manualOrderProduct.value) || ((dashboardData.products || [])[0] || null);
+    }
+
+    function selectedManualOrderOption() {
+      return findDashboardOrderOption(selectedManualOrderProduct(), manualOrderOption.value) || {};
+    }
+
+    function renderManualOrderProducts(selectedProductId) {
       const products = dashboardData ? dashboardData.products || [] : [];
-      if (!products.length) return alert("No products found.");
-      const defaultProduct = findDashboardProduct(defaults.productId) || products[0];
-      const productList = products.map(product => product.id + " = " + product.name).join("\\n");
-      const productInput = prompt("Which product? Type product id or name:\\n\\n" + productList, defaultProduct.id);
-      if (productInput === null) return;
-      const product = findDashboardProduct(productInput) || defaultProduct;
-      const options = product.orderOptions || [];
-      const optionList = options.map(option => option.id + " = " + option.name + (option.price ? " (" + option.price + ")" : "")).join("\\n");
-      const optionInput = options.length
-        ? prompt("Which order option/package? Type id or name:\\n\\n" + optionList, options[0].id)
-        : "";
-      if (optionInput === null) return;
-      const option = findDashboardOrderOption(product, optionInput) || options[0] || {};
-      const name = prompt("Customer full name:", defaults.name || "");
-      if (name === null) return;
-      const phone = prompt("Customer phone number:", defaults.phone || customerId);
-      if (phone === null) return;
-      const address = prompt("Customer full address:", defaults.address || "");
-      if (address === null) return;
-      const quantity = prompt("Quantity/unit count:", option.quantity || 1);
-      if (quantity === null) return;
-      if (!String(name).trim() || !String(phone).trim() || !String(address).trim()) {
-        return alert("Name, phone, and address are required.");
+      manualOrderProduct.innerHTML = products.map(product =>
+        '<option value="' + esc(product.id) + '">' + esc(product.name || product.id) + '</option>'
+      ).join("");
+      if (selectedProductId && products.some(product => product.id === selectedProductId)) {
+        manualOrderProduct.value = selectedProductId;
+      } else if (products[0]) {
+        manualOrderProduct.value = products[0].id;
       }
-      await request("/admin/customer/mark-order-submitted", {
-        customerId,
-        productId: product.id,
-        orderOptionId: option.id || "",
-        orderOptionName: option.name || "",
-        orderOptionPrice: option.price || "",
-        quantity,
-        name,
+      renderManualOrderOptions();
+    }
+
+    function renderManualOrderOptions(selectedOptionId = "") {
+      const product = selectedManualOrderProduct();
+      const options = product ? product.orderOptions || [] : [];
+      manualOrderOption.innerHTML =
+        '<option value="">No option / type manually</option>' +
+        options.map(option => '<option value="' + esc(option.id) + '">' + esc(option.name || option.id) + (option.price ? " (" + esc(option.price) + ")" : "") + '</option>').join("");
+      if (selectedOptionId && options.some(option => option.id === selectedOptionId)) {
+        manualOrderOption.value = selectedOptionId;
+      }
+      const option = selectedManualOrderOption();
+      if (option.quantity && (!manualOrderQty.value || Number(manualOrderQty.value) <= 1)) {
+        manualOrderQty.value = option.quantity || 1;
+      }
+      if (option.price && !manualOrderPrice.value) {
+        manualOrderPrice.value = option.price;
+      }
+    }
+
+    function openManualOrderModal(customerId) {
+      const defaults = customerDefaultsForManualOrder(customerId);
+      manualOrderCustomerId = customerId;
+      manualOrderCustomerLabel.textContent = "Customer: " + customerId;
+      manualOrderPaste.value = "";
+      manualOrderName.value = defaults.name || "";
+      manualOrderPhone.value = defaults.phone || customerId;
+      manualOrderAddress.value = defaults.address || "";
+      manualOrderAddOn.value = "";
+      manualOrderPrice.value = "";
+      manualOrderCode.value = "";
+      manualOrderQty.value = 1;
+      renderManualOrderProducts(defaults.productId);
+      manualOrderState.textContent = "";
+      manualOrderModal.classList.add("open");
+      manualOrderModal.setAttribute("aria-hidden", "false");
+      setTimeout(() => manualOrderPaste.focus(), 0);
+    }
+
+    function closeManualOrderModal() {
+      manualOrderModal.classList.remove("open");
+      manualOrderModal.setAttribute("aria-hidden", "true");
+      manualOrderCustomerId = "";
+      manualOrderState.textContent = "";
+    }
+
+    function normalizeManualOrderText(value) {
+      return String(value || "").toLowerCase().replace(/[^a-z0-9$]+/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    function extractManualOrderPhone(lines) {
+      for (const line of lines) {
+        const match = line.match(/(?:\\+?673[-\\s]?)?\\b\\d{7,8}\\b/);
+        if (match) return match[0].replace(/\\D/g, "");
+      }
+      return "";
+    }
+
+    function extractManualOrderQuantity(text) {
+      const patterns = [
+        /\\b(\\d+)\\s*x\\b/i,
+        /\\bx\\s*(\\d+)\\s*(?:unit|pcs|set)?\\b/i,
+        /\\b(\\d+)\\s*(?:unit|pcs|set)\\b/i,
+      ];
+      for (const pattern of patterns) {
+        const match = text.match(pattern);
+        if (match) return Math.max(1, Number(match[1] || 1) || 1);
+      }
+      return 1;
+    }
+
+    function extractManualOrderPackage(text) {
+      const match = text.match(/order\\s*package\\s*:\\s*([a-z0-9]+)/i);
+      return match ? match[1].trim() : "";
+    }
+
+    function extractManualOrderPrice(text) {
+      const match = text.match(/\\$\\s*\\d+(?:\\.\\d{1,2})?/);
+      return match ? match[0].replace(/\\s+/g, "") : "";
+    }
+
+    function extractManualOrderCode(lines) {
+      const codePattern = /\\b[A-Z]{1,8}\\d[A-Z0-9()/-]*(?:\\s+\\d{1,2}\\/\\d{1,2})?\\b/;
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const match = lines[index].match(codePattern);
+        if (match) return match[0].trim();
+      }
+      return "";
+    }
+
+    function isManualOrderNoiseLine(line) {
+      return /^(free\\s+delivery|cod|free\\s+delivery\\s*&\\s*cod)$/i.test(line.trim());
+    }
+
+    function isManualOrderCodeLine(line, code) {
+      return Boolean(code && line.trim().toLowerCase() === code.toLowerCase());
+    }
+
+    function isManualOrderOrderLine(line) {
+      return /\\$\\s*\\d+|order\\s*package|\\b\\d+\\s*x\\b|\\bx\\s*\\d+\\s*(?:unit|pcs|set)?\\b|\\b\\d+\\s*(?:unit|pcs|set)\\b/i.test(line);
+    }
+
+    function matchManualOrderOption(product, parsed) {
+      const options = product ? product.orderOptions || [] : [];
+      if (!options.length) return null;
+      const packageCode = normalizeManualOrderText(parsed.packageCode);
+      const orderText = normalizeManualOrderText(parsed.orderText);
+      const haystack = normalizeManualOrderText([parsed.packageCode, parsed.orderText, parsed.raw].filter(Boolean).join(" "));
+      return options.find(option => {
+        const id = normalizeManualOrderText(option.id);
+        const name = normalizeManualOrderText(option.name);
+        if (packageCode && (id === packageCode || name === packageCode || name === "package " + packageCode)) return true;
+        if (orderText && (orderText.includes(name) || name.includes(orderText))) return true;
+        return Boolean((id && haystack.includes(id)) || (name && haystack.includes(name)));
+      }) || null;
+    }
+
+    function parseManualOrderPaste(raw, product) {
+      const lines = String(raw || "").split(/\\r?\\n/).map(line => line.trim()).filter(Boolean);
+      const text = lines.join("\\n");
+      const phone = extractManualOrderPhone(lines);
+      const quantity = extractManualOrderQuantity(text);
+      const packageCode = extractManualOrderPackage(text);
+      const price = extractManualOrderPrice(text);
+      const referenceCode = extractManualOrderCode(lines);
+      const nameLine = lines.find(line =>
+        line !== phone &&
+        !line.match(/(?:\\+?673[-\\s]?)?\\b\\d{7,8}\\b/) &&
+        !isManualOrderOrderLine(line) &&
+        !isManualOrderNoiseLine(line) &&
+        !isManualOrderCodeLine(line, referenceCode)
+      ) || "";
+      const orderLines = lines.filter(line =>
+        isManualOrderOrderLine(line) &&
+        !line.match(/order\\s*package\\s*:/i) &&
+        !isManualOrderCodeLine(line, referenceCode)
+      );
+      const addressLines = lines.filter(line =>
+        line !== nameLine &&
+        !line.match(/(?:\\+?673[-\\s]?)?\\b\\d{7,8}\\b/) &&
+        !isManualOrderOrderLine(line) &&
+        !isManualOrderNoiseLine(line) &&
+        !isManualOrderCodeLine(line, referenceCode)
+      );
+      const parsed = {
+        raw,
+        name: nameLine,
         phone,
-        address,
-        rawMessage: "Manual admin order submission"
-      });
-      await loadDashboard();
+        address: addressLines.join(" "),
+        quantity,
+        packageCode,
+        price,
+        referenceCode,
+        orderText: orderLines.join(" "),
+      };
+      parsed.option = matchManualOrderOption(product, parsed);
+      return parsed;
+    }
+
+    function extractManualOrderIntoFields() {
+      const product = selectedManualOrderProduct();
+      const parsed = parseManualOrderPaste(manualOrderPaste.value, product);
+      if (parsed.name) manualOrderName.value = parsed.name;
+      if (parsed.phone) manualOrderPhone.value = parsed.phone;
+      if (parsed.address) manualOrderAddress.value = parsed.address;
+      if (parsed.quantity) manualOrderQty.value = parsed.quantity;
+      if (parsed.price) manualOrderPrice.value = parsed.price;
+      if (parsed.referenceCode) manualOrderCode.value = parsed.referenceCode;
+      if (parsed.option) {
+        renderManualOrderOptions(parsed.option.id);
+        if (parsed.option.price && !parsed.price) manualOrderPrice.value = parsed.option.price;
+      }
+      manualOrderState.textContent = parsed.option
+        ? "Extracted and matched option: " + (parsed.option.name || parsed.option.id)
+        : "Extracted details. Please choose/check the order option.";
+    }
+
+    async function markCustomerOrderSubmitted(customerId) {
+      openManualOrderModal(customerId);
+    }
+
+    async function submitManualOrder(event) {
+      event.preventDefault();
+      if (!manualOrderCustomerId) return;
+      const product = selectedManualOrderProduct();
+      const option = selectedManualOrderOption();
+      const name = manualOrderName.value.trim();
+      const phone = manualOrderPhone.value.trim();
+      const address = manualOrderAddress.value.trim();
+      if (!product) {
+        manualOrderState.textContent = "Choose a product.";
+        return;
+      }
+      if (!name || !phone || !address) {
+        manualOrderState.textContent = "Name, phone, and address are required.";
+        return;
+      }
+      manualOrderState.textContent = "Submitting order...";
+      document.querySelector("#manual-order-submit").disabled = true;
+      try {
+        await request("/admin/customer/mark-order-submitted", {
+          customerId: manualOrderCustomerId,
+          productId: product.id,
+          orderOptionId: option.id || "",
+          orderOptionName: option.name || "",
+          orderOptionPrice: manualOrderPrice.value.trim() || option.price || "",
+          addOnChoice: manualOrderAddOn.value.trim(),
+          quantity: manualOrderQty.value,
+          name,
+          phone,
+          address,
+          rawMessage: manualOrderPaste.value.trim() || "Manual admin order submission"
+        });
+        closeManualOrderModal();
+        await loadDashboard();
+      } catch (error) {
+        manualOrderState.textContent = error.message;
+      } finally {
+        document.querySelector("#manual-order-submit").disabled = false;
+      }
     }
 
     function bindManualOrderButtons() {
       document.querySelectorAll("button[data-manual-order-customer]").forEach(button => button.addEventListener("click", async () => {
-        button.disabled = true;
-        button.textContent = "Submitting...";
         try {
           await markCustomerOrderSubmitted(button.dataset.manualOrderCustomer);
         } catch (error) {
           alert(error.message);
-        } finally {
-          button.disabled = false;
-          button.textContent = "Mark Order Submitted";
         }
       }));
     }
@@ -14453,6 +15050,22 @@ function adminDashboardHtml() {
     document.querySelectorAll('.tab').forEach(button => {
       button.addEventListener('click', () => openDashboardTab(button.dataset.tab));
     });
+    manualOrderProduct.addEventListener("change", () => {
+      manualOrderPrice.value = "";
+      renderManualOrderOptions();
+    });
+    manualOrderOption.addEventListener("change", () => {
+      const option = selectedManualOrderOption();
+      if (option.quantity) manualOrderQty.value = option.quantity;
+      if (option.price) manualOrderPrice.value = option.price;
+    });
+    document.querySelector("#manual-order-extract").addEventListener("click", extractManualOrderIntoFields);
+    document.querySelector("#manual-order-close").addEventListener("click", closeManualOrderModal);
+    document.querySelector("#manual-order-cancel").addEventListener("click", closeManualOrderModal);
+    manualOrderModal.addEventListener("click", event => {
+      if (event.target === manualOrderModal) closeManualOrderModal();
+    });
+    manualOrderForm.addEventListener("submit", submitManualOrder);
     setupDashboardDate();
     const requestedTab = new URLSearchParams(window.location.search).get("tab");
     if (requestedTab && document.getElementById(requestedTab)) openDashboardTab(requestedTab);
@@ -14480,9 +15093,9 @@ function adminChatPageHtml() {
     nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
     nav a, button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font: inherit; font-weight: 600; cursor: pointer; }
     nav a:hover, button:hover { border-color: #a8a8ad; }
-    main { max-width: 1320px; margin: 0 auto; padding: 18px; }
-    .chat-shell { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); min-height: calc(100vh - 150px); border: 1px solid #e5e5ea; border-radius: 10px; background: var(--surface); overflow: hidden; }
-    .sidebar { border-right: 1px solid #e5e5ea; background: var(--soft); display: grid; grid-template-rows: auto 1fr; min-width: 0; }
+    main { width: min(1320px, 100%); min-height: 0; margin: 0 auto; padding: 18px; overflow: hidden; }
+    .chat-shell { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); height: 100%; min-height: 0; border: 1px solid #e5e5ea; border-radius: 10px; background: var(--surface); overflow: hidden; }
+    .sidebar { border-right: 1px solid #e5e5ea; background: var(--soft); display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
     .sidebar-tools { padding: 12px; border-bottom: 1px solid #e5e5ea; display: grid; gap: 8px; }
     .sidebar-tools label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weight: 700; }
     .sidebar-tools input { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; }
@@ -14491,13 +15104,13 @@ function adminChatPageHtml() {
     .customer-item:hover, .customer-item.active { background: #fff; }
     .customer-item strong { display: block; overflow-wrap: anywhere; }
     .customer-item span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .pane { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+    .pane { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
     .chat-header { padding: 14px 16px; border-bottom: 1px solid #e5e5ea; background: #fff; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .chat-header strong { display: block; overflow-wrap: anywhere; }
     .chat-header span { color: var(--muted); font-size: 13px; }
     .chat-header-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
     .chat-header-actions .danger { border-color: #fecaca; background: #fee2e2; color: #991b1b; }
-    .thread { padding: 18px; overflow: auto; background: #f7f7f8; }
+    .thread { min-height: 0; padding: 18px; overflow: auto; background: #f7f7f8; scroll-behavior: auto; }
     .row { display: flex; margin: 0 0 10px; }
     .row.customer { justify-content: flex-start; }
     .row.agent, .row.staff, .row.admin { justify-content: flex-end; }
@@ -14522,7 +15135,7 @@ function adminChatPageHtml() {
     .composer button { min-width: 80px; background: var(--accent); border-color: var(--accent); color: #fff; }
     .composer button.secondary { background: #fff; border-color: var(--line); color: #1d1d1f; min-width: 142px; }
     .empty { color: var(--muted); padding: 18px; }
-    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } .chat-header { align-items: flex-start; flex-direction: column; } .composer-tools { grid-template-columns: 1fr; } .composer-row { flex-wrap: wrap; } textarea { flex-basis: 100%; } }
+    @media (max-width: 820px) { body { overflow: auto; } main { padding: 0; overflow: visible; } .chat-shell { min-height: calc(100vh - 122px); grid-template-columns: 1fr; border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } .chat-header { align-items: flex-start; flex-direction: column; } .composer-tools { grid-template-columns: 1fr; } .composer-row { flex-wrap: wrap; } textarea { flex-basis: 100%; } }
   </style>
 </head>
 <body>
@@ -14681,6 +15294,14 @@ function adminChatPageHtml() {
       const file = selectedMediaFile();
       mediaLabel.childNodes[0].nodeValue = file ? file.name : "Attach photo/video";
     }
+    function scrollThreadToLatest() {
+      requestAnimationFrame(() => {
+        thread.scrollTop = thread.scrollHeight;
+        setTimeout(() => {
+          thread.scrollTop = thread.scrollHeight;
+        }, 0);
+      });
+    }
     function customerRows() {
       const q = search.value.trim().toLowerCase();
       const rows = data ? data.customers || [] : [];
@@ -14741,6 +15362,7 @@ function adminChatPageHtml() {
         .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
       if (!messages.length) {
         thread.innerHTML = '<div class="empty">No messages for this customer on ' + esc(selectedChatDate()) + '.</div>';
+        scrollThreadToLatest();
         return;
       }
       thread.innerHTML = messages.map(message => {
@@ -14763,7 +15385,7 @@ function adminChatPageHtml() {
       thread.querySelectorAll("button[data-process-recovered]").forEach(button => {
         button.addEventListener("click", () => processRecoveredMessage(button.dataset.recoveredCustomer, button.dataset.processRecovered));
       });
-      thread.scrollTop = thread.scrollHeight;
+      scrollThreadToLatest();
     }
     function render() {
       renderList();
@@ -14991,6 +15613,22 @@ function replyLibraryPageHtml() {
     <section>
       <h2>General Sales Replies</h2>
       <div class="note">For sales objections and hesitation replies that can apply across products. Sales replies are general only.</div>
+      <form id="sales-settings-form" class="editor">
+        <div class="fields">
+          <label class="field wide" for="sales-reply-mode">Sales Reply Mode
+            <select id="sales-reply-mode"></select>
+            <span class="field-help">Approved replies uses fixed saved replies. Product knowledge educational selling answers sales hesitations using approved product knowledge. Hybrid tries product knowledge first, then falls back to the approved reply.</span>
+          </label>
+          <label class="field wide" for="sales-education-instruction">Product Knowledge Educational Selling Instruction
+            <textarea id="sales-education-instruction"></textarea>
+            <span class="field-help">Optional guidance for educational selling. The bot still only uses approved active-product knowledge.</span>
+          </label>
+        </div>
+        <div class="editor-actions">
+          <button class="primary" id="save-sales-settings" type="submit">Save Sales Settings</button>
+        </div>
+        <div id="sales-settings-state"></div>
+      </form>
       <div class="table-wrap" id="sales-list"></div>
     </section>
     <section>
@@ -15007,7 +15645,15 @@ function replyLibraryPageHtml() {
             <span class="field-help">Example: Wants to ask husband first. This creates the stable intent used by the sales classifier.</span>
           </label>
           <label class="field wide" for="sales-examples">Example Customer Messages <textarea id="sales-examples" required></textarea></label>
-          <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved" required></textarea></label>
+          <label class="field wide" for="sales-approved">Approved Sales Reply <textarea class="reply" id="sales-approved"></textarea></label>
+          <label class="field wide" for="sales-similar-action">If Similar Reply Was Already Sent Before
+            <select id="sales-similar-action"></select>
+            <span class="field-help">This applies to the first sales-reply send for another intent when the saved reply is similar to a previous message.</span>
+          </label>
+          <label class="field wide" for="sales-alternate-approved">Alternate Approved Sales Reply
+            <textarea class="reply" id="sales-alternate-approved"></textarea>
+            <span class="field-help">Used only when the selected action is "Use alternate reply" and a similar approved reply was already sent earlier.</span>
+          </label>
           <label class="field wide" for="sales-after-reply">After Reply
             <select id="sales-after-reply"></select>
             <span class="field-help">Choose "Wait for customer" to keep normal follow-ups active. Choose "Close sales conversation" to stop sales follow-ups and sales prompts after this approved reply. "Same Intent Again" only applies if the same intent appears later.</span>
@@ -15057,6 +15703,8 @@ function replyLibraryPageHtml() {
     const salesIntentOptions = ${JSON.stringify(SALES_INTENT_OPTIONS)};
     const salesRepeatActionOptions = ${JSON.stringify(SALES_REPEAT_ACTION_OPTIONS)};
     const salesAfterReplyOptions = ${JSON.stringify(SALES_AFTER_REPLY_OPTIONS)};
+    const salesSimilarReplyActionOptions = ${JSON.stringify(SALES_SIMILAR_REPLY_ACTION_OPTIONS)};
+    const salesReplyModeOptions = ${JSON.stringify(SALES_REPLY_MODE_OPTIONS)};
     function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]); }
     function readableLabel(value) {
       return String(value || "").replace(/[_-]+/g, " ").replace(/\\s+/g, " ").trim().replace(/\\b\\w/g, ch => ch.toUpperCase());
@@ -15100,6 +15748,13 @@ function replyLibraryPageHtml() {
     function salesAfterReplyLabel(key) { return (salesAfterReplyOptions.find(item => item.key === key) || {}).label || key || ""; }
     function renderSalesAfterReplyOptions(selected) {
       return salesAfterReplyOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
+    }
+    function salesSimilarReplyActionKey(reply) { return reply.similar_reply_action || reply.similarReplyAction || "openai_rewrite"; }
+    function renderSalesSimilarReplyActionOptions(selected) {
+      return salesSimilarReplyActionOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
+    }
+    function renderSalesReplyModeOptions(selected) {
+      return salesReplyModeOptions.map(item => '<option value="' + esc(item.key) + '"' + (item.key === selected ? ' selected' : '') + '>' + esc(item.label) + '</option>').join('');
     }
     function faqTopicKey(faq) { return faq.topic_key || faq.topicKey || faq.id || ""; }
     function renderFaqTopicOptions(selected) {
@@ -15149,6 +15804,9 @@ function replyLibraryPageHtml() {
     }
     function renderSales() {
       document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(document.querySelector("#sales-intent-key").value);
+      const settings = salesLibrary.settings || {};
+      document.querySelector("#sales-reply-mode").innerHTML = renderSalesReplyModeOptions(settings.salesReplyMode || "approved");
+      document.querySelector("#sales-education-instruction").value = settings.salesEducationInstruction || "";
       document.querySelector("#sales-list").innerHTML = renderSalesRows(salesLibrary.general || []);
       document.querySelectorAll(".edit-sales").forEach(button => button.addEventListener("click", () => editSales(button.dataset.id)));
       document.querySelectorAll(".delete-sales").forEach(button => button.addEventListener("click", () => deleteSales(button.dataset.id, button.dataset.label)));
@@ -15193,11 +15851,11 @@ function replyLibraryPageHtml() {
       document.querySelector("#faq-id").value = faq.id; document.querySelector("#faq-topic-key").innerHTML = renderFaqTopicOptions(faqTopicKey(faq)); document.querySelector("#faq-new-topic").value = ""; document.querySelector("#faq-examples").value = (faq.example_questions || []).join("\\n"); document.querySelector("#faq-reply").value = faq.approved_reply || ""; document.querySelector("#faq-active").checked = faq.active !== false; document.querySelector("#faq-title").textContent = "Edit General FAQ"; document.querySelector("#faq-state").textContent = ""; syncFaqTopicFields();
     }
     function newSales() {
-      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions("WAIT_FOR_CUSTOMER"); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-repeat-instruction").value = ""; document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = ""; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(""); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = ""; document.querySelector("#sales-approved").value = ""; document.querySelector("#sales-similar-action").innerHTML = renderSalesSimilarReplyActionOptions("openai_rewrite"); document.querySelector("#sales-alternate-approved").value = ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions("WAIT_FOR_CUSTOMER"); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions("openai_acknowledge"); document.querySelector("#sales-repeat-instruction").value = ""; document.querySelector("#sales-active").checked = true; document.querySelector("#sales-title").textContent = "New General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     function editSales(id) {
       const reply = (salesLibrary.general || []).find(item => item.id === id); if (!reply) return;
-      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions(salesAfterReplyKey(reply)); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-repeat-instruction").value = reply.same_intent_again_instruction || reply.sameIntentAgainInstruction || ""; document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
+      document.querySelector("#sales-id").value = reply.id; document.querySelector("#sales-intent-key").innerHTML = renderSalesIntentOptions(salesIntentKey(reply)); document.querySelector("#sales-new-intent").value = ""; document.querySelector("#sales-examples").value = (reply.example_messages || []).join("\\n"); document.querySelector("#sales-approved").value = reply.approved_reply || ""; document.querySelector("#sales-similar-action").innerHTML = renderSalesSimilarReplyActionOptions(salesSimilarReplyActionKey(reply)); document.querySelector("#sales-alternate-approved").value = reply.alternate_approved_reply || reply.alternateApprovedReply || ""; document.querySelector("#sales-after-reply").innerHTML = renderSalesAfterReplyOptions(salesAfterReplyKey(reply)); document.querySelector("#sales-repeat-action").innerHTML = renderSalesRepeatActionOptions(salesRepeatActionKey(reply)); document.querySelector("#sales-repeat-instruction").value = reply.same_intent_again_instruction || reply.sameIntentAgainInstruction || ""; document.querySelector("#sales-active").checked = reply.active !== false; document.querySelector("#sales-title").textContent = "Edit General Sales Reply"; document.querySelector("#sales-state").textContent = ""; syncSalesIntentFields();
     }
     async function loadFaq() {
       const response = await fetch("/admin/faq-library-data"); faqLibrary = await response.json(); if (!response.ok) throw new Error(faqLibrary.error || "Could not load FAQ library"); renderFaq();
@@ -15225,9 +15883,28 @@ function replyLibraryPageHtml() {
         const selectedIntent = selectedSalesIntent();
         const displayName = selectedIntentKey ? salesIntentLabel(selectedIntentKey, selectedIntent) : newIntentName;
         const salesIntent = selectedIntentKey || stableKey(newIntentName || displayName, "sales_intent");
-        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, afterReply: document.querySelector("#sales-after-reply").value, repeatAction: document.querySelector("#sales-repeat-action").value, sameIntentAgainInstruction: document.querySelector("#sales-repeat-instruction").value, active: document.querySelector("#sales-active").checked }) });
+        const response = await fetch("/admin/sales-replies/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: document.querySelector("#sales-id").value, scope: "general", salesIntent, salesIntentLabel: displayName, objectionType: displayName, intent: displayName ? "Customer sales response or hesitation: " + displayName : "", exampleMessages: document.querySelector("#sales-examples").value.split(/\\r?\\n/), approvedReply: document.querySelector("#sales-approved").value, similarReplyAction: document.querySelector("#sales-similar-action").value, alternateApprovedReply: document.querySelector("#sales-alternate-approved").value, afterReply: document.querySelector("#sales-after-reply").value, repeatAction: document.querySelector("#sales-repeat-action").value, sameIntentAgainInstruction: document.querySelector("#sales-repeat-instruction").value, active: document.querySelector("#sales-active").checked }) });
         const result = await response.json(); if (!response.ok) throw new Error(result.error || "Save failed"); salesLibrary = result.data; renderSales(); editSales(result.salesReply.id); state.textContent = "Saved";
       } catch (error) { state.textContent = error.message; } finally { button.disabled = false; }
+    }
+    async function saveSalesSettings(event) {
+      event.preventDefault();
+      const button = document.querySelector("#save-sales-settings");
+      const state = document.querySelector("#sales-settings-state");
+      button.disabled = true;
+      state.textContent = "Saving...";
+      try {
+        const response = await fetch("/admin/sales-replies/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ salesReplyMode: document.querySelector("#sales-reply-mode").value, salesEducationInstruction: document.querySelector("#sales-education-instruction").value }) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Save failed");
+        salesLibrary = result.data;
+        renderSales();
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
     }
     async function deleteFaq(id, topic) {
       if (!window.confirm('Delete FAQ "' + (topic || id) + '"?')) return;
@@ -15247,6 +15924,7 @@ function replyLibraryPageHtml() {
     document.querySelector("#sales-intent-key").addEventListener("change", syncSalesIntentFields);
     document.querySelector("#faq-form").addEventListener("submit", saveFaq);
     document.querySelector("#sales-form").addEventListener("submit", saveSales);
+    document.querySelector("#sales-settings-form").addEventListener("submit", saveSalesSettings);
     document.querySelector("#order-form-followup-form").addEventListener("submit", saveOrderFormFollowups);
     Promise.all([loadFaq(), loadSales()]).then(() => { newFaq(); newSales(); document.querySelector("#page-state").textContent = "General replies ready"; }).catch(error => { document.querySelector("#page-state").textContent = error.message; });
   </script>
