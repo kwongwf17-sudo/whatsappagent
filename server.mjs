@@ -901,13 +901,18 @@ const server = http.createServer(async (req, res) => {
       await mkdir(targetDirectory, { recursive: true });
       const originalName = String(body.originalName || "").trim();
       const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName))) || "followup";
-      const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${originalBase}.${media.extension}`;
+      const assetKey = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${originalBase}`;
+      const filename = `${assetKey}.${media.extension}`;
+      await savePersistedProductImageAsset(adminSession.accountId, "followups", assetKey, {
+        image: media,
+        originalName,
+      });
       await writeFile(path.join(targetDirectory, filename), media.bytes);
       return sendJson(res, 200, {
         block: {
           id: `block_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`,
           type: media.type,
-          url: `/assets/${accountAssetId}/followups/${filename}`,
+          url: persistedProductImageUrl(adminSession.accountId, "followups", assetKey, media.extension),
           caption: "",
         },
       });
@@ -3183,12 +3188,16 @@ async function processInboundMessageCore({
   const initialDetectionSource = productDetectionSource(existingCustomer, source, teamSettings);
   const initialProductResolution = resolveProduct(teamCatalog, text, initialDetectionSource, existingCustomer?.productId || "");
   const initialActiveState = conversationActiveState(existingCustomer || {});
+  const initialNewProductJourneyOverride =
+    hasOpeningFlowProductClue(initialProductResolution) &&
+    shouldStartNewProductJourney(existingCustomer || {}, initialProductResolution.product);
   const initialOpeningFlowDecision = getOpeningFlowDecision({
     customer: existingCustomer || {},
     productResolution: initialProductResolution,
     customerMessage: text,
     source: initialDetectionSource,
     isFirstEligibleInbound: firstEligibleInbound,
+    allowActiveStateOverride: initialNewProductJourneyOverride,
   });
   const initialTextMatchedProduct = findProductMatch(teamCatalog, text, {});
   const initialIsProductNameOnlyOpening = isProductNameMessage(initialTextMatchedProduct || initialProductResolution.product, text);
@@ -3292,16 +3301,20 @@ async function processInboundMessageCore({
   const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, detectionSource, "");
   const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
   const earlyProductResolution = resolveProduct(teamCatalog, text, detectionSource, customer.productId);
+  const earlyNewProductJourneyOverride =
+    hasOpeningFlowProductClue(earlyProductResolution) &&
+    shouldStartNewProductJourney(customer, earlyProductResolution.product);
   const earlyOpeningFlowDecision = getOpeningFlowDecision({
     customer,
     productResolution: earlyProductResolution,
     customerMessage: text,
     source: detectionSource,
     isFirstEligibleInbound: firstEligibleInbound,
+    allowActiveStateOverride: earlyNewProductJourneyOverride,
   });
   const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
   const shouldPrioritizeOpeningFlow =
-    !activeState &&
+    (!activeState || earlyNewProductJourneyOverride) &&
     !customer.pendingOrder &&
     (
       earlyOpeningFlowDecision.shouldSend ||
@@ -3669,6 +3682,9 @@ async function processInboundMessageCore({
         customerMessage: text,
         source: detectionSource,
         isFirstEligibleInbound: firstEligibleInbound,
+        allowActiveStateOverride:
+          hasOpeningFlowProductClue({ ...productResolution, product }) &&
+          shouldStartNewProductJourney(customer, product),
       });
   const messageSource = openingFlowDecision.shouldSend ? { ...detectionSource, productNameMatch: true } : detectionSource;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
@@ -15137,7 +15153,7 @@ function adminChatPageHtml() {
     .composer button { min-width: 80px; background: var(--accent); border-color: var(--accent); color: #fff; }
     .composer button.secondary { background: #fff; border-color: var(--line); color: #1d1d1f; min-width: 142px; }
     .empty { color: var(--muted); padding: 18px; }
-    @media (max-width: 820px) { main { padding: 0; } .chat-shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); border-radius: 0; border-left: 0; border-right: 0; } .sidebar { max-height: 260px; border-right: 0; border-bottom: 1px solid #e5e5ea; } .chat-header { align-items: flex-start; flex-direction: column; } .composer-tools { grid-template-columns: 1fr; } .composer-row { flex-wrap: wrap; } textarea { flex-basis: 100%; } }
+    @media (max-width: 820px) { html, body { height: auto; min-height: 100%; } body { display: block; overflow: auto; } main { height: auto; min-height: 0; padding: 0; overflow: visible; } .chat-shell { display: block; height: auto; min-height: 0; border-radius: 0; border-left: 0; border-right: 0; overflow: visible; } .sidebar { display: block; max-height: none; border-right: 0; border-bottom: 1px solid #e5e5ea; } .customer-list { max-height: 320px; overflow: auto; } .pane { display: block; min-height: 0; } .thread { min-height: 260px; max-height: 55vh; } .chat-header { align-items: flex-start; flex-direction: column; } .composer-tools { grid-template-columns: 1fr; } .composer-row { flex-wrap: wrap; } textarea { flex-basis: 100%; } }
   </style>
 </head>
 <body>
