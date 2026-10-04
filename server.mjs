@@ -6267,6 +6267,10 @@ async function runDueFollowups(
   { respectOperationalControl = true, dispatchQueued = true, queueOnly = false } = {}
 ) {
   const deletedCustomers = queueOnly ? [] : await store.deleteStaleUnresponsiveCustomers(now);
+  const shouldDispatchQueued = dispatchQueued && !queueOnly;
+  const dispatched = shouldDispatchQueued
+    ? await dispatchFollowupQueue(now)
+    : { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], paused: [] };
   const pendingOpeningFlows = queueOnly ? 0 : await runPendingOpeningFlows(now, { respectOperationalControl });
   const pendingOrderAutomations = queueOnly ? 0 : await runPendingOrderAutomations(now);
   const due = await getDueFollowupsForTeams(now);
@@ -6295,10 +6299,6 @@ async function runDueFollowups(
     })),
     now
   );
-  const shouldDispatchQueued = dispatchQueued && !queueOnly;
-  const dispatched = shouldDispatchQueued
-    ? await dispatchFollowupQueue(now)
-    : { sent: [], failed: [], cancelled: [], heldForApprovedTemplate: [], paused: [] };
   return {
     dispatchQueued: shouldDispatchQueued,
     sent: dispatched.sent.length,
