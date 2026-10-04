@@ -6483,7 +6483,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       const pendingDueAt = validDateOrNull(customer.pendingOpeningFlow?.dueAt);
       const retryAt = pendingDueAt && pendingDueAt > now
         ? pendingDueAt
-        : new Date(now.getTime() + Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
+        : new Date(now.getTime() + 30 * 60 * 1000);
       updateDispatch(item.id, {
         status: "queued",
         availableAt: retryAt.toISOString(),
@@ -6580,7 +6580,7 @@ async function dispatchFollowupQueue(now = new Date()) {
       .slice(0, Math.max(sequenceIndex, 0))
       .find((entry) => !customer.followupsSent?.[entry.key]);
     if (previousUnsent) {
-      const retryAt = new Date(now.getTime() + Math.max(config.followupIntervalMinutes, 1) * 60 * 1000);
+      const retryAt = blockedFollowupRecheckAt(customer, previousUnsent, followupSequence, now);
       updateDispatch(item.id, {
         status: "queued",
         availableAt: retryAt.toISOString(),
@@ -8709,6 +8709,34 @@ function effectiveFollowupDueAt(customer, item, sequence = []) {
   if (item.customSchedule && scheduledDueAt > previousSentAt) return scheduledDueAt;
   const previousGateAt = followupDueAfterPreviousSent(previousSentAt, item);
   return scheduledDueAt > previousGateAt ? scheduledDueAt : previousGateAt;
+}
+
+function blockedFollowupRecheckAt(customer, missingItem, sequence = [], now = new Date()) {
+  const dueAt = effectiveFollowupDueAt(customer, missingItem, sequence);
+  if (dueAt && dueAt > now) return dueAt;
+  if (missingItem?.customSchedule && missingItem.timingType === "delay_after_opening") {
+    return new Date(now.getTime() + 30 * 60 * 1000);
+  }
+  const nowLocal = followupZonedDateParts(now);
+  const sendHour = clampNumber(missingItem?.sendHour, 0, 23, 20);
+  const sendMinute = clampNumber(missingItem?.sendMinute, 0, 59, 0);
+  let recheckAt = followupZonedLocalToDate({
+    ...nowLocal,
+    hour: sendHour,
+    minute: sendMinute,
+    second: 0,
+    millisecond: 0,
+  });
+  if (recheckAt <= now) {
+    recheckAt = followupZonedLocalToDate(addFollowupLocalDays({
+      ...nowLocal,
+      hour: sendHour,
+      minute: sendMinute,
+      second: 0,
+      millisecond: 0,
+    }, 1));
+  }
+  return recheckAt;
 }
 
 function followupAnchorAt(customer = {}, item = {}) {
