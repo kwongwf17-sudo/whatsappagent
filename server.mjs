@@ -102,6 +102,14 @@ function resolveSeedPath(envName, fileName) {
   return configuredPath;
 }
 
+function resolveWebSessionDir() {
+  const configured = getEnv("WHATSAPP_WEB_SESSION_DIR", "");
+  if (configured) return path.resolve(configured);
+  const railwayVolume = getEnv("RAILWAY_VOLUME_MOUNT_PATH", "");
+  if (railwayVolume) return path.resolve(railwayVolume, "whatsapp-web-session");
+  return path.resolve(path.join(__dirname, "data", "whatsapp-web-session"));
+}
+
 const config = {
   demoMode,
   transportMode,
@@ -148,7 +156,7 @@ const config = {
   teamContentAccountsTableName: getEnv("WHATSAPP_TEAM_CONTENT_ACCOUNTS_TABLE", "team_content_accounts"),
   teamContentProductsTableName: getEnv("WHATSAPP_TEAM_CONTENT_PRODUCTS_TABLE", "team_content_products"),
   assetsDir: path.resolve(getEnv("WHATSAPP_ASSETS_DIR", path.join(__dirname, "assets"))),
-  webSessionDir: path.resolve(getEnv("WHATSAPP_WEB_SESSION_DIR", path.join(__dirname, "data", "whatsapp-web-session"))),
+  webSessionDir: resolveWebSessionDir(),
   catalogPath: resolveSeedPath("PRODUCT_CATALOG_PATH", "product_catalog.json"),
   generalFaqsPath: resolveSeedPath("GENERAL_FAQS_PATH", "general_faqs.json"),
   salesRepliesPath: resolveSeedPath("SALES_REPLIES_PATH", "sales_replies.json"),
@@ -1032,6 +1040,39 @@ const server = http.createServer(async (req, res) => {
       } catch (error) {
         await recordSystemError("broadcast_create", error, "", adminSession?.accountId || config.accountId);
         return sendJson(res, 400, { error: error.message || "Broadcast creation failed." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/broadcast/cancel") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        const body = await readJsonBody(req);
+        const result = await operations.cancelBroadcastCampaign(body.campaignId || body.id, adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "broadcast_cancelled",
+          result: `${result.campaign?.id || body.campaignId || body.id}:${result.cancelledItems} item(s)`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, result);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || "Broadcast cancel failed." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/broadcast/clear-history") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        const result = await operations.clearBroadcastHistory(adminSession.accountId);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "broadcast_history_cleared",
+          result: `${result.campaigns} campaign(s), ${result.queueItems} item(s)`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, result);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || "Broadcast history clear failed." });
       }
     }
 
@@ -7829,10 +7870,11 @@ function phoneNumberFromImportedCustomerId(customerId = "") {
 
 async function buildBroadcastData(businessAccountId = config.accountId) {
   const content = await getTeamContent(businessAccountId);
-  const [customers, orders, campaigns] = await Promise.all([
+  const [customers, orders, campaigns, broadcastQueue] = await Promise.all([
     store.listCustomers(new Date(), businessAccountId),
     store.listOrders(businessAccountId),
     operations.listBroadcastCampaigns(businessAccountId),
+    operations.listBroadcastQueue(businessAccountId),
   ]);
   const productById = new Map((content.catalog.products || []).map((product) => [product.id, product]));
   const ordersByCustomer = groupBy(orders, (order) => order.customerId);
@@ -7858,6 +7900,23 @@ async function buildBroadcastData(businessAccountId = config.accountId) {
       String(right.lastMessageAt || right.firstSeenAt || "").localeCompare(String(left.lastMessageAt || left.firstSeenAt || ""))
     ),
     campaigns: campaigns.slice(0, 50),
+    broadcastQueue: broadcastQueue.slice(0, 1000).map((item) => ({
+      id: item.id,
+      campaignId: item.campaignId,
+      customerId: item.customerId,
+      to: item.to || item.customerId,
+      phone: item.phone || "",
+      customerName: item.customerName || "",
+      productId: item.productId || "",
+      labelDisplay: item.labelDisplay || "",
+      status: item.status || "",
+      attempts: Number(item.attempts || 0),
+      scheduledAt: item.scheduledAt || "",
+      sentAt: item.sentAt || "",
+      updatedAt: item.updatedAt || "",
+      lastError: item.lastError || "",
+      directRecipient: Boolean(item.directRecipient),
+    })),
   };
 }
 
@@ -7925,6 +7984,7 @@ async function createBroadcastCampaignForAccount(businessAccountId = config.acco
     name: recipient.name,
     productId: recipient.productId,
     labelDisplay: recipient.labelDisplay,
+    directRecipient: Boolean(recipient.directRecipient),
   })), new Date());
   void requestBroadcastRun().catch((error) => recordSystemError("broadcast_run", error, result.campaign.id, businessAccountId));
   return {
@@ -7939,13 +7999,18 @@ function selectBroadcastRecipients(customers = [], body = {}) {
   const selectedIds = new Set(asArray(body.selectedCustomerIds).map(String).filter(Boolean));
   const pastedTokens = parseBroadcastRecipientTokens(body.pastedRecipients || body.recipientText || "");
   const pastedMatches = new Set();
+  const directRecipients = [];
   const unmatched = [];
   for (const token of pastedTokens) {
     const match = customers.find((customer) => broadcastCustomerMatchesToken(customer, token));
     if (match) pastedMatches.add(match.id);
-    else unmatched.push(token.original);
+    else {
+      const direct = broadcastDirectRecipientFromToken(token);
+      if (direct) directRecipients.push(direct);
+      else unmatched.push(token.original);
+    }
   }
-  const explicitMode = selectedIds.size > 0 || pastedMatches.size > 0;
+  const explicitMode = selectedIds.size > 0 || pastedMatches.size > 0 || directRecipients.length > 0;
   const recipients = [];
   const seen = new Set();
   for (const customer of customers) {
@@ -7956,6 +8021,11 @@ function selectBroadcastRecipients(customers = [], body = {}) {
     if (seen.has(customer.id)) continue;
     seen.add(customer.id);
     recipients.push(customer);
+  }
+  for (const recipient of directRecipients) {
+    if (seen.has(recipient.id)) continue;
+    seen.add(recipient.id);
+    recipients.push(recipient);
   }
   return {
     count: recipients.length,
@@ -8021,6 +8091,39 @@ function broadcastCustomerMatchesToken(customer = {}, token = {}) {
   return phones.some((phone) => phone === token.digits || phone.endsWith(token.digits) || token.digits.endsWith(phone));
 }
 
+function broadcastDirectRecipientFromToken(token = {}) {
+  if (!token.original) return null;
+  if (token.lower.includes("@")) {
+    if (/^[0-9]+@lid$/i.test(token.lower)) {
+      return broadcastDirectRecipient(token.lower, token.original, "Direct @lid recipient");
+    }
+    const jid = normalizeImportedCustomerId(token.original);
+    return jid ? broadcastDirectRecipient(jid, phoneNumberFromImportedCustomerId(jid) || token.original, "Direct phone recipient") : null;
+  }
+  if (!token.digits || token.digits.length < 7 || token.digits.length > 18) return null;
+  const jid = normalizeImportedCustomerId(token.digits);
+  return jid ? broadcastDirectRecipient(jid, token.digits, "Direct phone recipient") : null;
+}
+
+function broadcastDirectRecipient(customerId = "", phone = "", status = "Direct recipient") {
+  return {
+    id: customerId,
+    whatsappId: customerId,
+    phone: phone || customerId,
+    name: "",
+    productId: "",
+    product: "",
+    skuCode: "",
+    labelDisplay: "",
+    status,
+    orderCount: 0,
+    optedOut: false,
+    lastMessageAt: "",
+    firstSeenAt: "",
+    directRecipient: true,
+  };
+}
+
 function cleanBroadcastMessageMode(value = "") {
   return String(value || "") === "opening_flow" ? "opening_flow" : "text";
 }
@@ -8083,13 +8186,13 @@ async function runDueBroadcasts(now = new Date()) {
     try {
       const account = await adminAccounts.getAccount(item.businessAccountId || config.accountId);
       if (!account || account.active === false) throw new Error("Business account is disabled.");
-      const customer = await store.getCustomer(item.customerId, item.businessAccountId || config.accountId);
-      if (!customer) {
+      const customer = item.directRecipient ? null : await store.getCustomer(item.customerId, item.businessAccountId || config.accountId);
+      if (!item.directRecipient && !customer) {
         await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer not found." } }]);
         summary.skipped += 1;
         continue;
       }
-      if (customer.optedOut) {
+      if (customer?.optedOut) {
         await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer opted out." } }]);
         summary.skipped += 1;
         continue;
@@ -13906,6 +14009,11 @@ function superAdminAccountsHtml() {
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
     }
+    function localDateTimeToIso(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toISOString();
+    }
     async function request(path, body) {
       const response = await fetch(path, {
         method: "POST",
@@ -14459,6 +14567,7 @@ function broadcastPageHtml() {
     nav { display:flex; flex-wrap:wrap; gap:8px; padding:10px 22px 14px; background:rgba(251,251,253,.9); border-bottom:1px solid rgba(210,210,215,.8); }
     nav a, button { border:1px solid var(--line); border-radius:8px; padding:8px 11px; background:var(--surface); color:#1d1d1f; text-decoration:none; font:inherit; font-weight:700; cursor:pointer; }
     nav a.active, button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button.danger { border-color:#fecaca; background:#fff5f5; color:#991b1b; }
     button:disabled { opacity:.55; cursor:not-allowed; }
     main { width:min(1440px,100%); margin:0 auto; padding:22px; display:grid; gap:16px; }
     section { background:#fff; border:1px solid #e5e5ea; border-radius:8px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,.03); }
@@ -14487,6 +14596,8 @@ function broadcastPageHtml() {
     th, td { padding:9px 10px; border-bottom:1px solid #f0f0f2; text-align:left; vertical-align:top; font-size:13px; }
     th { background:var(--soft); color:var(--muted); text-transform:uppercase; font-size:12px; position:sticky; top:0; }
     .summary { display:flex; flex-wrap:wrap; gap:8px; padding:12px 14px; border-bottom:1px solid #f0f0f2; }
+    .section-actions { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid #f0f0f2; }
+    .section-actions h2 { padding:0; border:0; background:transparent; }
     .split { display:grid; grid-template-columns:minmax(320px,1fr) minmax(360px,1.3fr); gap:16px; }
     .hidden { display:none !important; }
     .customer-list { border:1px solid #e5e5ea; border-radius:8px; overflow:hidden; }
@@ -14552,6 +14663,10 @@ function broadcastPageHtml() {
         </div>
       </div>
       <div class="summary" id="audience-summary"><span class="pill">Loading customers...</span></div>
+      <div class="actions" style="padding:0 14px 12px">
+        <button id="select-visible-customers" type="button">Select All Showing</button>
+        <button id="clear-selected-customers" type="button">Clear Selection</button>
+      </div>
       <div class="customer-list">
         <div class="table-wrap" id="customer-table"></div>
       </div>
@@ -14595,15 +14710,19 @@ function broadcastPageHtml() {
       </div>
     </section>
     <section>
-      <h2>Recent Broadcasts</h2>
+      <div class="section-actions">
+        <h2>Recent Broadcasts</h2>
+        <button id="clear-broadcast-history" class="danger" type="button">Clear Completed History</button>
+      </div>
       <div class="table-wrap" id="campaign-table"></div>
     </section>
   </main>
   <script>
-    let data = { products: [], stages: [], customers: [], campaigns: [] };
+    let data = { products: [], stages: [], customers: [], campaigns: [], broadcastQueue: [] };
     let selectedIds = new Set();
     let latestPreview = null;
     let uploadedMedia = null;
+    let expandedCampaignId = "";
     const stateEl = document.querySelector("#broadcast-state");
     const mediaStateEl = document.querySelector("#media-state");
 
@@ -14642,7 +14761,7 @@ function broadcastPageHtml() {
         openingFlowProductId: document.querySelector("#opening-product").value,
         text: document.querySelector("#message-text").value,
         media: uploadedMedia,
-        scheduledAt: document.querySelector("#scheduled-at").value
+        scheduledAt: localDateTimeToIso(document.querySelector("#scheduled-at").value)
       };
     }
     function syncMessageMode() {
@@ -14729,23 +14848,18 @@ function broadcastPageHtml() {
     }
     function filteredCustomers() {
       const filters = audienceFilters();
-      const pasted = pastedRecipientMatches();
-      if (pasted.tokens.length) {
-        return (data.customers || []).filter(customer => pasted.matchedIds.has(customer.id));
-      }
       return (data.customers || []).filter(customer => customerMatchesAudience(customer, filters));
     }
     function renderCustomers() {
-      const customers = filteredCustomers().slice(0, 300);
+      const filtered = filteredCustomers();
+      const customers = filtered.slice(0, 300);
       const pasted = pastedRecipientMatches();
-      if (pasted.tokens.length) {
-        selectedIds = new Set(pasted.matchedIds);
-      }
+      const exactCount = pasted.tokens.length;
       document.querySelector("#audience-summary").innerHTML = [
         '<span class="pill">Customers ' + esc((data.customers || []).length) + '</span>',
         '<span class="pill ok">Selected ' + esc(selectedIds.size) + '</span>',
-        '<span class="pill">Showing ' + esc(customers.length) + '</span>',
-        pasted.unmatched.length ? '<span class="pill warn">Unmatched ' + esc(pasted.unmatched.length) + '</span>' : ''
+        exactCount ? '<span class="pill">Pasted exact ' + esc(exactCount) + '</span>' : '',
+        '<span class="pill">Showing ' + esc(filtered.length) + '</span>'
       ].filter(Boolean).join("");
       document.querySelector("#customer-table").innerHTML = customers.length ? '<table><thead><tr><th></th><th>Phone</th><th>Name</th><th>Product</th><th>Stage</th><th>Status</th><th>Last Message</th></tr></thead><tbody>' +
         customers.map(customer => '<tr><td><input type="checkbox" data-id="' + esc(customer.id) + '"' + (selectedIds.has(customer.id) ? ' checked' : '') + ' /></td><td>' + esc(customer.phone || customer.id) + '<br><span class="muted">' + esc(customer.id) + '</span></td><td>' + esc(customer.name || '') + '</td><td>' + esc([customer.skuCode, customer.product].filter(Boolean).join(" - ")) + '</td><td>' + esc(customer.labelDisplay || '') + '</td><td>' + esc(customer.optedOut ? 'opted out' : customer.status || '') + '</td><td>' + esc(fmt(customer.lastMessageAt)) + '</td></tr>').join("") +
@@ -14758,13 +14872,56 @@ function broadcastPageHtml() {
         renderCustomers();
       }));
     }
+    function selectVisibleCustomers() {
+      for (const customer of filteredCustomers()) {
+        selectedIds.add(customer.id);
+      }
+      latestPreview = null;
+      document.querySelector("#create-broadcast").disabled = true;
+      renderCustomers();
+    }
+    function clearSelectedCustomers() {
+      selectedIds = new Set();
+      latestPreview = null;
+      document.querySelector("#create-broadcast").disabled = true;
+      renderCustomers();
+    }
     function renderCampaigns() {
       const campaigns = data.campaigns || [];
       document.querySelector("#campaign-table").innerHTML = campaigns.length
-        ? '<table><thead><tr><th>Name</th><th>Status</th><th>Schedule</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Updated</th></tr></thead><tbody>' + campaigns.map(campaign =>
-            '<tr><td>' + esc(campaign.name || campaign.id) + '</td><td><span class="pill">' + esc(campaign.status || '') + '</span></td><td>' + esc(fmt(campaign.scheduledAt)) + '</td><td>' + esc(campaign.totalRecipients || 0) + '</td><td>' + esc(campaign.sent || 0) + '</td><td>' + esc(campaign.failed || 0) + '</td><td>' + esc(fmt(campaign.updatedAt)) + '</td></tr>'
+        ? '<table><thead><tr><th>Name</th><th>Status</th><th>Schedule</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Updated</th><th>Action</th></tr></thead><tbody>' + campaigns.map(campaign =>
+            campaignRowHtml(campaign)
           ).join("") + '</tbody></table>'
         : '<div class="form"><span class="muted">No broadcasts created yet.</span></div>';
+      document.querySelectorAll(".cancel-broadcast").forEach(button => {
+        button.addEventListener("click", () => cancelBroadcast(button.dataset.id));
+      });
+      document.querySelectorAll(".view-broadcast-history").forEach(button => {
+        button.addEventListener("click", () => {
+          expandedCampaignId = expandedCampaignId === button.dataset.id ? "" : button.dataset.id;
+          renderCampaigns();
+        });
+      });
+    }
+    function campaignRowHtml(campaign) {
+      const actions = [
+        '<button class="view-broadcast-history" type="button" data-id="' + esc(campaign.id) + '">' + esc(expandedCampaignId === campaign.id ? 'Hide History' : 'View History') + '</button>',
+        canCancelCampaign(campaign) ? '<button class="danger cancel-broadcast" type="button" data-id="' + esc(campaign.id) + '">Delete</button>' : ''
+      ].filter(Boolean).join(' ');
+      const main = '<tr><td>' + esc(campaign.name || campaign.id) + '</td><td><span class="pill">' + esc(campaign.status || '') + '</span></td><td>' + esc(fmt(campaign.scheduledAt)) + '</td><td>' + esc(campaign.totalRecipients || 0) + '</td><td>' + esc(campaign.sent || 0) + '</td><td>' + esc(campaign.failed || 0) + '</td><td>' + esc(fmt(campaign.updatedAt)) + '</td><td>' + actions + '</td></tr>';
+      return main + (expandedCampaignId === campaign.id ? broadcastHistoryRowHtml(campaign.id) : '');
+    }
+    function broadcastHistoryRowHtml(campaignId) {
+      const rows = (data.broadcastQueue || []).filter(item => item.campaignId === campaignId);
+      const inner = rows.length
+        ? '<table><thead><tr><th>Recipient</th><th>Status</th><th>Scheduled</th><th>Sent</th><th>Updated</th><th>Error</th></tr></thead><tbody>' + rows.map(item =>
+            '<tr><td>' + esc(item.phone || item.to || item.customerId) + '<br><span class="muted">' + esc(item.customerId || item.to || '') + '</span></td><td><span class="pill">' + esc(item.status || '') + '</span></td><td>' + esc(fmt(item.scheduledAt)) + '</td><td>' + esc(fmt(item.sentAt)) + '</td><td>' + esc(fmt(item.updatedAt)) + '</td><td>' + esc(item.lastError || '') + '</td></tr>'
+          ).join('') + '</tbody></table>'
+        : '<div class="empty">No recipient history for this broadcast.</div>';
+      return '<tr><td colspan="8">' + inner + '</td></tr>';
+    }
+    function canCancelCampaign(campaign) {
+      return ["scheduled", "queued"].includes(String(campaign.status || ""));
     }
     function renderPreview(preview) {
       latestPreview = preview;
@@ -14802,6 +14959,30 @@ function broadcastPageHtml() {
         stateEl.textContent = error.message;
       } finally {
         document.querySelector("#create-broadcast").disabled = !latestPreview?.count;
+      }
+    }
+    async function cancelBroadcast(campaignId) {
+      if (!campaignId) return;
+      if (!confirm("Delete this scheduled broadcast? It will not be sent.")) return;
+      stateEl.textContent = "Deleting broadcast...";
+      try {
+        await request("/admin/broadcast/cancel", { campaignId });
+        stateEl.textContent = "Scheduled broadcast deleted.";
+        await load();
+      } catch (error) {
+        stateEl.textContent = error.message;
+      }
+    }
+    async function clearBroadcastHistory() {
+      if (!confirm("Clear completed and cancelled broadcast history? Customer chat messages will stay.")) return;
+      stateEl.textContent = "Clearing broadcast history...";
+      try {
+        const result = await request("/admin/broadcast/clear-history", {});
+        stateEl.textContent = "Cleared " + result.campaigns + " broadcast(s).";
+        expandedCampaignId = "";
+        await load();
+      } catch (error) {
+        stateEl.textContent = error.message;
       }
     }
     async function uploadMedia(file) {
@@ -14850,8 +15031,11 @@ function broadcastPageHtml() {
     document.querySelector("#message-mode").addEventListener("change", syncMessageMode);
     document.querySelector("#preview-broadcast").addEventListener("click", previewBroadcast);
     document.querySelector("#create-broadcast").addEventListener("click", createBroadcast);
+    document.querySelector("#clear-broadcast-history").addEventListener("click", clearBroadcastHistory);
     document.querySelector("#media-file").addEventListener("change", event => uploadMedia(event.target.files[0]).catch(error => { mediaStateEl.textContent = error.message; }));
     document.querySelector("#audience-preset").addEventListener("change", syncAudiencePreset);
+    document.querySelector("#select-visible-customers").addEventListener("click", selectVisibleCustomers);
+    document.querySelector("#clear-selected-customers").addEventListener("click", clearSelectedCustomers);
     document.querySelectorAll("#product-filter,#stage-filter,#active-only,#include-submitted,#exclude-opted-out").forEach(element => {
       element.addEventListener("change", resetPreviewAndRenderCustomers);
       element.addEventListener("input", resetPreviewAndRenderCustomers);
@@ -17432,16 +17616,47 @@ function adminChatPageHtml() {
         }, 0);
       });
     }
+    function digitsOnly(value) {
+      return String(value || "").replace(/\D/g, "");
+    }
+    function significantPhoneDigits(value) {
+      return digitsOnly(value).replace(/^0+/, "");
+    }
+    function phoneDigitsMatch(left, right) {
+      const leftDigits = digitsOnly(left);
+      const rightDigits = digitsOnly(right);
+      if (!leftDigits || !rightDigits) return false;
+      if (leftDigits === rightDigits || leftDigits.endsWith(rightDigits) || rightDigits.endsWith(leftDigits)) return true;
+      const shortLeft = significantPhoneDigits(leftDigits);
+      const shortRight = significantPhoneDigits(rightDigits);
+      return Boolean(shortLeft && shortRight && (shortLeft === shortRight || shortLeft.endsWith(shortRight) || shortRight.endsWith(shortLeft)));
+    }
+    function customerMatchesSearch(customer, query) {
+      if (!query) return true;
+      const lower = query.toLowerCase();
+      const queryDigits = digitsOnly(query);
+      const textValues = [
+        customer.id,
+        customer.whatsappId,
+        customer.phone,
+        customer.product,
+        customer.skuCode,
+        customer.name,
+        customer.status,
+        customer.label,
+        customer.labelDisplay
+      ];
+      if (textValues.some(value => String(value || "").toLowerCase().includes(lower))) return true;
+      if (!queryDigits) return false;
+      return [customer.phone, customer.id, customer.whatsappId]
+        .some(value => phoneDigitsMatch(value, queryDigits));
+    }
     function customerRows() {
       const q = search.value.trim().toLowerCase();
       const rows = data ? data.customers || [] : [];
       return rows
         .filter(customer => customerHasConversationOnSelectedDate(customer))
-        .filter(customer => {
-          if (!q) return true;
-          return [customer.id, customer.product, customer.name, customer.status, customer.labelDisplay]
-            .some(value => String(value || "").toLowerCase().includes(q));
-        })
+        .filter(customer => customerMatchesSearch(customer, q))
         .sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
     }
     function renderList() {
@@ -17455,8 +17670,11 @@ function adminChatPageHtml() {
       }
       list.innerHTML = rows.map(customer => {
         const active = customer.id === activeCustomerId ? " active" : "";
+        const title = customer.phone && customer.phone !== customer.id ? customer.phone : customer.id;
+        const subtitleId = customer.phone && customer.phone !== customer.id ? '<span>' + esc(customer.id) + '</span>' : "";
         return '<button type="button" class="customer-item' + active + '" data-customer-id="' + esc(customer.id) + '">' +
-          '<strong>' + esc(customer.id) + '</strong>' +
+          '<strong>' + esc(title) + '</strong>' +
+          subtitleId +
           '<span>' + esc(customer.product || '-') + ' | ' + esc(customer.status || '-') + '</span>' +
           '<span>Last: ' + esc(fmtTime(customer.lastMessageAt)) + '</span>' +
         '</button>';
