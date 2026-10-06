@@ -57,6 +57,7 @@ import { OperationsStore } from "./lib/operations.mjs";
 import { TeamContentStore } from "./lib/team_content.mjs";
 import {
   hasOpeningFlowAlreadySent,
+  sameProductAdReentryPatch,
 } from "./lib/opening_flow_handler.mjs";
 import {
   customerOrderStatusReply,
@@ -169,6 +170,12 @@ const config = {
   followupActiveWindowMinutes: Number(getEnv("FOLLOWUP_ACTIVE_WINDOW_MINUTES", "10")),
   followupPauseWindowMinutes: Number(getEnv("FOLLOWUP_PAUSE_WINDOW_MINUTES", "5")),
   followupRetryMinutes: Number(getEnv("FOLLOWUP_RETRY_MINUTES", "5")),
+  broadcastSendsPerMinute: Number(getEnv("BROADCAST_SENDS_PER_MINUTE", getEnv("FOLLOWUP_SENDS_PER_MINUTE", "10"))),
+  broadcastSendDelayMinMs: Number(getEnv("BROADCAST_SEND_DELAY_MIN_MS", getEnv("FOLLOWUP_SEND_DELAY_MIN_MS", "2000"))),
+  broadcastSendDelayMaxMs: Number(getEnv("BROADCAST_SEND_DELAY_MAX_MS", getEnv("FOLLOWUP_SEND_DELAY_MAX_MS", "5000"))),
+  broadcastActiveWindowMinutes: Number(getEnv("BROADCAST_ACTIVE_WINDOW_MINUTES", "10")),
+  broadcastPauseWindowMinutes: Number(getEnv("BROADCAST_PAUSE_WINDOW_MINUTES", "5")),
+  broadcastIntervalMinutes: Number(getEnv("BROADCAST_INTERVAL_MINUTES", "1")),
   memoryDiagnosticsIntervalMinutes: Number(getEnv("MEMORY_DIAGNOSTICS_INTERVAL_MINUTES", "0")),
   businessTimeZone: getEnv("BUSINESS_TIME_ZONE", "Asia/Kuala_Lumpur"),
   openingFlowInitialDelayMs: Number(getEnv("OPENING_FLOW_INITIAL_DELAY_MS", "5000")),
@@ -357,6 +364,7 @@ let followupRunPromise = null;
 let broadcastRunPromise = null;
 const knowledgeSyncRuns = new Map();
 const followupPacingStartedAt = new Date();
+const broadcastPacingStartedAt = new Date();
 const webhookDiagnostics = {
   received: 0,
   invalidSignature: 0,
@@ -980,6 +988,24 @@ const server = http.createServer(async (req, res) => {
       } catch (error) {
         await recordSystemError("broadcast_data", error, "", adminSession?.accountId || config.accountId);
         return sendJson(res, 500, { error: error.message || "Unable to load broadcast data." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/broadcast/settings") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        const body = await readJsonBody(req);
+        await saveBroadcastRuntimeSettings(adminSession.accountId, body.settings || body);
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "broadcast_settings_updated",
+          result: "Broadcast sending settings updated",
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, await buildBroadcastData(adminSession.accountId));
+      } catch (error) {
+        await recordSystemError("broadcast_settings_save", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 400, { error: error.message || "Broadcast settings save failed." });
       }
     }
 
@@ -2341,6 +2367,19 @@ async function staffMonitoringIntervalMinutes() {
   return 5;
 }
 
+async function broadcastAutorunIntervalMinutes() {
+  try {
+    const accounts = await adminAccounts.listAccounts();
+    const intervals = accounts
+      .map((account) => Number(account.settings?.broadcastIntervalMinutes || 0))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (intervals.length) return Math.min(...intervals);
+  } catch (error) {
+    await recordSystemError("broadcast_interval_settings", error);
+  }
+  return Math.max(Number(config.broadcastIntervalMinutes) || 1, 1);
+}
+
 function scheduleFollowupAutorun() {
   void (async () => {
     const intervalMinutes = await followupAutorunIntervalMinutes();
@@ -2372,15 +2411,22 @@ function scheduleStaffMonitoring() {
 }
 
 function scheduleBroadcastAutorun() {
-  setTimeout(async () => {
-    try {
-      await requestBroadcastRun();
-    } catch (error) {
-      await recordSystemError("broadcast_run", error);
-    } finally {
-      scheduleBroadcastAutorun();
-    }
-  }, 60 * 1000);
+  void (async () => {
+    const intervalMinutes = await broadcastAutorunIntervalMinutes();
+    const pauseUntil = broadcastPauseUntil(new Date());
+    const delayMs = pauseUntil
+      ? Math.max(1000, pauseUntil.getTime() - Date.now())
+      : Math.max(intervalMinutes, 1) * 60 * 1000;
+    setTimeout(async () => {
+      try {
+        await requestBroadcastRun();
+      } catch (error) {
+        await recordSystemError("broadcast_run", error);
+      } finally {
+        scheduleBroadcastAutorun();
+      }
+    }, delayMs);
+  })();
 }
 
 function handleVerification(url, res) {
@@ -4136,6 +4182,7 @@ async function processInboundMessageCore({
           queuedAt: new Date().toISOString(),
           dueAt: "",
           reason: "opening_flow_send_in_progress",
+          sameProductAdReentry: Boolean(openingFlowDecision.sameProductAdReentry),
         },
         openingFlowInProgressAt: new Date().toISOString(),
         openingFlowFailedAt: "",
@@ -4269,6 +4316,7 @@ async function processInboundMessageCore({
             queuedAt: updatedCustomer.pendingOpeningFlow?.queuedAt || failedAt,
             dueAt: "",
             reason: "opening_flow_send_failed",
+            sameProductAdReentry: Boolean(openingFlowDecision.sameProductAdReentry),
             failedAt,
             sentCount,
             totalCount: outbound.length,
@@ -4298,6 +4346,7 @@ async function processInboundMessageCore({
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
+      ...(openingFlowDecision.sameProductAdReentry ? sameProductAdReentryPatch(openingFlowSentAt) : {}),
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt: openingFlowSentAt },
@@ -4369,6 +4418,7 @@ async function handleOpeningFlowOnlyRoute({
           queuedAt: new Date().toISOString(),
           dueAt: "",
           reason: "opening_flow_send_in_progress",
+          sameProductAdReentry: Boolean(openingFlowDecision.sameProductAdReentry),
         },
         openingFlowInProgressAt: new Date().toISOString(),
         openingFlowFailedAt: "",
@@ -4440,6 +4490,7 @@ async function handleOpeningFlowOnlyRoute({
           queuedAt: updatedCustomer.pendingOpeningFlow?.queuedAt || failedAt,
           dueAt: "",
           reason: "opening_flow_send_failed",
+          sameProductAdReentry: Boolean(openingFlowDecision.sameProductAdReentry),
           failedAt,
           sentCount,
           totalCount: outbound.length,
@@ -4470,6 +4521,7 @@ async function handleOpeningFlowOnlyRoute({
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
+      ...(openingFlowDecision.sameProductAdReentry ? sameProductAdReentryPatch(openingFlowSentAt) : {}),
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt: openingFlowSentAt },
@@ -6078,10 +6130,16 @@ function randomFollowupDelayMs() {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+function randomBroadcastDelayMs() {
+  const min = Math.max(0, Number(config.broadcastSendDelayMinMs) || 0);
+  const max = Math.max(min, Number(config.broadcastSendDelayMaxMs) || min);
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
 function followupPauseUntil(now = new Date()) {
   const activeMs = Math.max(1, Number(config.followupActiveWindowMinutes) || 10) * 60 * 1000;
   const pauseMs = Math.max(0, Number(config.followupPauseWindowMinutes) || 0) * 60 * 1000;
-  return followupPauseUntilForWindow(now, activeMs, pauseMs);
+  return pauseUntilForWindow(now, activeMs, pauseMs, followupPacingStartedAt);
 }
 
 function followupPauseUntilForSettings(now = new Date(), settings = {}) {
@@ -6093,14 +6151,32 @@ function followupPauseUntilForSettings(now = new Date(), settings = {}) {
     0,
     Number(settings.followupPauseWindowMinutes || 0) || Number(config.followupPauseWindowMinutes) || 0
   ) * 60 * 1000;
-  return followupPauseUntilForWindow(now, activeMs, pauseMs);
+  return pauseUntilForWindow(now, activeMs, pauseMs, followupPacingStartedAt);
 }
 
-function followupPauseUntilForWindow(now = new Date(), activeMs = 10 * 60 * 1000, pauseMs = 0) {
+function broadcastPauseUntil(now = new Date()) {
+  const activeMs = Math.max(1, Number(config.broadcastActiveWindowMinutes) || 10) * 60 * 1000;
+  const pauseMs = Math.max(0, Number(config.broadcastPauseWindowMinutes) || 0) * 60 * 1000;
+  return pauseUntilForWindow(now, activeMs, pauseMs, broadcastPacingStartedAt);
+}
+
+function broadcastPauseUntilForSettings(now = new Date(), settings = {}) {
+  const activeMs = Math.max(
+    1,
+    Number(settings.broadcastActiveWindowMinutes || 0) || Number(config.broadcastActiveWindowMinutes) || 10
+  ) * 60 * 1000;
+  const pauseMs = Math.max(
+    0,
+    Number(settings.broadcastPauseWindowMinutes || 0) || Number(config.broadcastPauseWindowMinutes) || 0
+  ) * 60 * 1000;
+  return pauseUntilForWindow(now, activeMs, pauseMs, broadcastPacingStartedAt);
+}
+
+function pauseUntilForWindow(now = new Date(), activeMs = 10 * 60 * 1000, pauseMs = 0, startedAt = new Date()) {
   if (!pauseMs) return null;
 
   const cycleMs = activeMs + pauseMs;
-  const elapsedMs = Math.max(0, now.getTime() - followupPacingStartedAt.getTime());
+  const elapsedMs = Math.max(0, now.getTime() - startedAt.getTime());
   const cyclePositionMs = elapsedMs % cycleMs;
   if (cyclePositionMs < activeMs) return null;
 
@@ -6251,6 +6327,7 @@ async function maybeGateOpeningFlow({ businessAccountId = config.accountId, cust
           queuedAt: new Date().toISOString(),
           dueAt: windowState.nextOpenAt.toISOString(),
           reason: "opening_flow_window_closed",
+          sameProductAdReentry: Boolean(openingFlowDecision.sameProductAdReentry),
         },
       },
       messages: remainingMessages,
@@ -6294,6 +6371,9 @@ function flowsOnlyOpeningPlan(plan = {}, openingFlowDecision = {}, openingFlowGa
   const customerPatch = {
     productId: productId || patch.productId || "",
   };
+  for (const key of ["label", "labelDisplay", "followupsSent", "followupBlocked", "followupBlockedReason", "productJourneyResetAt"]) {
+    if (Object.hasOwn(patch, key)) customerPatch[key] = patch[key];
+  }
   if (openingFlowGate.queued && patch.pendingOpeningFlow) {
     customerPatch.pendingOpeningFlow = patch.pendingOpeningFlow;
   } else {
@@ -6352,7 +6432,7 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
     }
     let reserveSkipped = "";
     await store.updateCustomer(customer.id, (currentCustomer) => {
-      if (hasOpeningFlowAlreadySent(currentCustomer, product)) {
+      if (hasOpeningFlowAlreadySent(currentCustomer, product) && !currentCustomer.pendingOpeningFlow?.sameProductAdReentry) {
         reserveSkipped = "already_sent";
         return {
           pendingOpeningFlow: null,
@@ -6435,6 +6515,7 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
+      ...(pending.sameProductAdReentry ? sameProductAdReentryPatch(sentAt) : {}),
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt },
@@ -7425,12 +7506,17 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
 function buildCustomerImportData(content = defaultTeamContent) {
   const teamCatalog = content.catalog || catalog;
   const stageMap = new Map();
+  stageMap.set(CUSTOMER_IMPORT_NEW_STAGE_KEY, {
+    key: CUSTOMER_IMPORT_NEW_STAGE_KEY,
+    label: "NEW",
+  });
   for (const product of teamCatalog.products || []) {
-    for (const item of productFollowupSequence(product)) {
+    for (const [index, item] of productFollowupSequence(product).entries()) {
+      if (index === 0) continue;
       if (!stageMap.has(item.key)) {
         stageMap.set(item.key, {
           key: item.key,
-          label: item.label || followupStageName(item.key),
+          label: customerImportSequenceStageLabel(index),
         });
       }
     }
@@ -7710,6 +7796,8 @@ function cleanCustomerImportMode(value) {
   return mode === "submitted_order" ? "submitted_order" : "continue_followups";
 }
 
+const CUSTOMER_IMPORT_NEW_STAGE_KEY = "__new_customer__";
+
 function cleanCustomerImportStageKey(value = "") {
   return String(value || "").trim();
 }
@@ -7748,7 +7836,8 @@ function parseCustomerImportRows(rawText = "", { mode = "continue_followups", cu
     const customerId = normalizeImportedCustomerId(phoneInput);
     const product = resolveCustomerImportProductBySku(skuCode, activeCatalog);
     const sequence = product ? productFollowupSequence(product) : [];
-    const hasSelectedStage = Boolean(selectedStageKey && sequence.some((item) => item.key === selectedStageKey));
+    const hasSelectedStage = selectedStageKey === CUSTOMER_IMPORT_NEW_STAGE_KEY ||
+      Boolean(selectedStageKey && sequence.some((item) => item.key === selectedStageKey));
     const errors = [];
     if (!customerId) errors.push("Customer phone/LID is invalid.");
     if (!name) errors.push("Name is required.");
@@ -7870,11 +7959,12 @@ function phoneNumberFromImportedCustomerId(customerId = "") {
 
 async function buildBroadcastData(businessAccountId = config.accountId) {
   const content = await getTeamContent(businessAccountId);
-  const [customers, orders, campaigns, broadcastQueue] = await Promise.all([
+  const [customers, orders, campaigns, broadcastQueue, teamSettings] = await Promise.all([
     store.listCustomers(new Date(), businessAccountId),
     store.listOrders(businessAccountId),
     operations.listBroadcastCampaigns(businessAccountId),
     operations.listBroadcastQueue(businessAccountId),
+    adminAccounts.getTeamSettings(businessAccountId),
   ]);
   const productById = new Map((content.catalog.products || []).map((product) => [product.id, product]));
   const ordersByCustomer = groupBy(orders, (order) => order.customerId);
@@ -7890,6 +7980,14 @@ async function buildBroadcastData(businessAccountId = config.accountId) {
   }
   return {
     generatedAt: new Date().toISOString(),
+    settings: {
+      broadcastSendsPerMinute: Number(teamSettings.broadcastSendsPerMinute || 0) || config.broadcastSendsPerMinute,
+      broadcastSendDelayMinMs: Number(teamSettings.broadcastSendDelayMinMs || 0) || config.broadcastSendDelayMinMs,
+      broadcastSendDelayMaxMs: Number(teamSettings.broadcastSendDelayMaxMs || 0) || config.broadcastSendDelayMaxMs,
+      broadcastActiveWindowMinutes: Number(teamSettings.broadcastActiveWindowMinutes || 0) || config.broadcastActiveWindowMinutes,
+      broadcastPauseWindowMinutes: Number(teamSettings.broadcastPauseWindowMinutes || 0) || config.broadcastPauseWindowMinutes,
+      broadcastIntervalMinutes: Number(teamSettings.broadcastIntervalMinutes || 0) || config.broadcastIntervalMinutes,
+    },
     products: (content.catalog.products || []).map((product) => ({
       id: product.id,
       name: product.name,
@@ -7968,7 +8066,7 @@ async function createBroadcastCampaignForAccount(businessAccountId = config.acco
   const content = await getTeamContent(businessAccountId);
   const messages = buildBroadcastMessages(body, content.catalog);
   if (!messages.length) throw new Error("Broadcast message is required.");
-  const scheduledAt = parseBroadcastScheduledAt(body.scheduledAt);
+  const scheduledAt = parseBroadcastScheduledAt(body.scheduledAt, body.scheduledAtTimezoneOffsetMinutes);
   const result = await operations.createBroadcastCampaign({
     businessAccountId,
     name: body.name,
@@ -8160,12 +8258,94 @@ function buildBroadcastMessages(body = {}, activeCatalog = catalog) {
   return messages;
 }
 
-function parseBroadcastScheduledAt(value = "") {
+function parseBroadcastScheduledAt(value = "", timezoneOffsetMinutes = null) {
   const text = String(value || "").trim();
   if (!text) return new Date().toISOString();
+  const explicitTimezone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const localParts = explicitTimezone ? null : parseLocalDateTimeParts(text);
+  const offset = Number(timezoneOffsetMinutes);
+  if (localParts && Number.isFinite(offset)) {
+    const utcMs = Date.UTC(
+      localParts.year,
+      localParts.month - 1,
+      localParts.day,
+      localParts.hour,
+      localParts.minute,
+      localParts.second || 0,
+      0
+    ) + offset * 60 * 1000;
+    const date = new Date(utcMs);
+    if (Number.isNaN(date.getTime())) throw new Error("Scheduled send time is invalid.");
+    return date.toISOString();
+  }
   const date = new Date(text);
   if (Number.isNaN(date.getTime())) throw new Error("Scheduled send time is invalid.");
   return date.toISOString();
+}
+
+function parseLocalDateTimeParts(value = "") {
+  const text = String(value || "").trim();
+  const iso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (iso) {
+    return normalizeLocalDateTimeParts({
+      year: iso[1],
+      month: iso[2],
+      day: iso[3],
+      hour: iso[4],
+      minute: iso[5],
+      second: iso[6] || 0,
+    });
+  }
+  const slash = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (slash) {
+    let hour = Number(slash[4]);
+    const meridiem = String(slash[7] || "").toUpperCase();
+    if (meridiem === "PM" && hour < 12) hour += 12;
+    if (meridiem === "AM" && hour === 12) hour = 0;
+    return normalizeLocalDateTimeParts({
+      year: slash[3],
+      month: slash[2],
+      day: slash[1],
+      hour,
+      minute: slash[5],
+      second: slash[6] || 0,
+    });
+  }
+  return null;
+}
+
+function normalizeLocalDateTimeParts(parts = {}) {
+  const parsed = {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+    second: Number(parts.second || 0),
+  };
+  if (
+    !Number.isInteger(parsed.year) ||
+    !Number.isInteger(parsed.month) ||
+    !Number.isInteger(parsed.day) ||
+    !Number.isInteger(parsed.hour) ||
+    !Number.isInteger(parsed.minute) ||
+    !Number.isInteger(parsed.second) ||
+    parsed.year < 2000 ||
+    parsed.year > 2100 ||
+    parsed.month < 1 ||
+    parsed.month > 12 ||
+    parsed.day < 1 ||
+    parsed.day > 31 ||
+    parsed.hour < 0 ||
+    parsed.hour > 23 ||
+    parsed.minute < 0 ||
+    parsed.minute > 59 ||
+    parsed.second < 0 ||
+    parsed.second > 59
+  ) {
+    throw new Error("Scheduled send time is invalid.");
+  }
+  return parsed;
 }
 
 async function requestBroadcastRun(now = new Date()) {
@@ -8177,53 +8357,114 @@ async function requestBroadcastRun(now = new Date()) {
 }
 
 async function runDueBroadcasts(now = new Date()) {
-  const limit = Math.max(1, Math.min(Number(config.followupSendsPerMinute) || 10, 20));
-  const batch = await operations.claimBroadcastBatch(limit, now);
-  const summary = { claimed: batch.length, sent: 0, skipped: 0, failed: 0 };
-  const touchedCampaigns = new Set();
+  const batch = await claimBroadcastDispatchBatch(now);
+  const summary = { claimed: batch.length, sent: 0, skipped: 0, failed: 0, paused: 0 };
+  const accountSettingsById = new Map();
+  const batchByAccount = new Map();
   for (const item of batch) {
-    touchedCampaigns.add(item.campaignId);
-    try {
-      const account = await adminAccounts.getAccount(item.businessAccountId || config.accountId);
-      if (!account || account.active === false) throw new Error("Business account is disabled.");
-      const customer = item.directRecipient ? null : await store.getCustomer(item.customerId, item.businessAccountId || config.accountId);
-      if (!item.directRecipient && !customer) {
-        await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer not found." } }]);
-        summary.skipped += 1;
-        continue;
-      }
-      if (customer?.optedOut) {
-        await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer opted out." } }]);
-        summary.skipped += 1;
-        continue;
-      }
-      await sendOutbound(item.to || item.customerId, item.messages || [], {
-        businessAccountId: item.businessAccountId || config.accountId,
-        purpose: "broadcast",
-        campaignId: item.campaignId,
-      });
-      await operations.updateBroadcastItems([{ id: item.id, patch: { status: "sent", sentAt: new Date().toISOString(), lastError: "" } }]);
-      summary.sent += 1;
-    } catch (error) {
-      const attempts = Number(item.attempts || 0);
-      const retry = attempts < 3;
-      await operations.updateBroadcastItems([{
-        id: item.id,
-        patch: {
-          status: retry ? "retry_pending" : "failed",
-          availableAt: new Date(Date.now() + Math.max(1, Number(config.followupRetryMinutes) || 5) * 60 * 1000).toISOString(),
-          lastError: error.message || "Broadcast send failed.",
-        },
-      }]);
-      summary.failed += 1;
-      await recordSystemError("broadcast_send", error, `Campaign: ${item.campaignId}; Customer: ${item.customerId}`, item.businessAccountId || config.accountId);
-    }
-    await wait(randomFollowupDelayMs());
+    const accountId = item.businessAccountId || config.accountId;
+    if (!batchByAccount.has(accountId)) batchByAccount.set(accountId, []);
+    batchByAccount.get(accountId).push(item);
+  }
+  const accountResults = await Promise.all([...batchByAccount.values()].map(dispatchBroadcastAccountBatch));
+  const touchedCampaigns = new Set();
+  for (const result of accountResults) {
+    summary.sent += result.sent;
+    summary.skipped += result.skipped;
+    summary.failed += result.failed;
+    summary.paused += result.paused;
+    for (const campaignId of result.touchedCampaigns) touchedCampaigns.add(campaignId);
   }
   for (const campaignId of touchedCampaigns) {
     await operations.refreshBroadcastCampaignStats(campaignId);
   }
   return summary;
+
+  async function dispatchBroadcastAccountBatch(accountBatch = []) {
+    const result = { sent: 0, skipped: 0, failed: 0, paused: 0, touchedCampaigns: new Set() };
+    for (const item of accountBatch) {
+      result.touchedCampaigns.add(item.campaignId);
+      const itemAccountId = item.businessAccountId || config.accountId;
+      if (!accountSettingsById.has(itemAccountId)) {
+        try {
+          accountSettingsById.set(itemAccountId, await adminAccounts.getTeamSettings(itemAccountId));
+        } catch {
+          accountSettingsById.set(itemAccountId, {});
+        }
+      }
+      const pauseUntil = broadcastPauseUntilForSettings(now, accountSettingsById.get(itemAccountId));
+      if (pauseUntil) {
+        await operations.updateBroadcastItems([{
+          id: item.id,
+          patch: {
+            status: "queued",
+            availableAt: pauseUntil.toISOString(),
+            lastError: "Broadcast pacing cooldown is active.",
+          },
+        }]);
+        result.paused += 1;
+        continue;
+      }
+      try {
+        const account = await adminAccounts.getAccount(itemAccountId);
+        if (!account || account.active === false) throw new Error("Business account is disabled.");
+        const customer = item.directRecipient ? null : await store.getCustomer(item.customerId, itemAccountId);
+        if (!item.directRecipient && !customer) {
+          await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer not found." } }]);
+          result.skipped += 1;
+          continue;
+        }
+        if (customer?.optedOut) {
+          await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer opted out." } }]);
+          result.skipped += 1;
+          continue;
+        }
+        await sendOutbound(item.to || item.customerId, item.messages || [], {
+          businessAccountId: itemAccountId,
+          purpose: "broadcast",
+          campaignId: item.campaignId,
+        });
+        await operations.updateBroadcastItems([{ id: item.id, patch: { status: "sent", sentAt: new Date().toISOString(), lastError: "" } }]);
+        result.sent += 1;
+      } catch (error) {
+        const attempts = Number(item.attempts || 0);
+        const retry = attempts < 3;
+        await operations.updateBroadcastItems([{
+          id: item.id,
+          patch: {
+            status: retry ? "retry_pending" : "failed",
+            availableAt: new Date(Date.now() + Math.max(1, Number(config.followupRetryMinutes) || 5) * 60 * 1000).toISOString(),
+            lastError: error.message || "Broadcast send failed.",
+          },
+        }]);
+        result.failed += 1;
+        await recordSystemError("broadcast_send", error, `Campaign: ${item.campaignId}; Customer: ${item.customerId}`, itemAccountId);
+      }
+      await wait(randomBroadcastDelayMs());
+    }
+    return result;
+  }
+}
+
+async function claimBroadcastDispatchBatch(now = new Date()) {
+  const accountLimits = [];
+  const seenAccounts = new Set();
+  try {
+    const accounts = await adminAccounts.listAccounts();
+    for (const account of accounts) {
+      const accountId = String(account.id || "");
+      if (!accountId || seenAccounts.has(accountId)) continue;
+      seenAccounts.add(accountId);
+      const limit = Number(account.settings?.broadcastSendsPerMinute || 0) || config.broadcastSendsPerMinute;
+      accountLimits.push({ businessAccountId: accountId, limit: Math.max(limit, 1) });
+    }
+  } catch (error) {
+    await recordSystemError("broadcast_batch_settings", error);
+  }
+  if (!seenAccounts.has(config.accountId)) {
+    accountLimits.push({ businessAccountId: config.accountId, limit: Math.max(config.broadcastSendsPerMinute, 1) });
+  }
+  return operations.claimBroadcastBatches(accountLimits, now);
 }
 
 function parseCustomerImportDate(value = "") {
@@ -8278,17 +8519,24 @@ function resolveCustomerImportProductBySku(value = "", activeCatalog = catalog) 
 }
 
 function customerImportStageLabel(product, stageKey = "") {
-  const item = productFollowupSequence(product).find((stage) => stage.key === stageKey);
-  return item?.label || followupStageName(stageKey);
+  if (stageKey === CUSTOMER_IMPORT_NEW_STAGE_KEY) return "NEW";
+  const index = productFollowupSequence(product).findIndex((stage) => stage.key === stageKey);
+  return index >= 0 ? customerImportSequenceStageLabel(index) : "";
+}
+
+function customerImportSequenceStageLabel(index = 0) {
+  const day = Number(index);
+  return day <= 0 ? "NEW" : `DAY ${day}`;
 }
 
 function importedFollowupsSentThroughStage({ existing = null, sequence = [], currentStageKey = "", sentAt = new Date().toISOString() } = {}) {
   const followupsSent = {
     ...(existing?.followupsSent && typeof existing.followupsSent === "object" ? existing.followupsSent : {}),
   };
+  if (currentStageKey === CUSTOMER_IMPORT_NEW_STAGE_KEY) return followupsSent;
   const stageIndex = sequence.findIndex((item) => item.key === currentStageKey);
   if (stageIndex < 0) return followupsSent;
-  for (const item of sequence.slice(0, stageIndex + 1)) {
+  for (const item of sequence.slice(0, stageIndex)) {
     if (!followupsSent[item.key]) followupsSent[item.key] = sentAt;
   }
   return followupsSent;
@@ -8310,6 +8558,27 @@ async function saveFollowupRuntimeSettings(businessAccountId = config.accountId,
   } catch (error) {
     if (String(error?.message || "").toLowerCase().includes("account not found")) {
       console.warn(`Skipped follow-up runtime settings save for missing account ${businessAccountId}.`);
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function saveBroadcastRuntimeSettings(businessAccountId = config.accountId, settings = {}) {
+  if (!settings || typeof settings !== "object") return null;
+  const runtimeSettings = {
+    broadcastSendsPerMinute: settings.broadcastSendsPerMinute,
+    broadcastSendDelayMinMs: settings.broadcastSendDelayMinMs,
+    broadcastSendDelayMaxMs: settings.broadcastSendDelayMaxMs,
+    broadcastActiveWindowMinutes: settings.broadcastActiveWindowMinutes,
+    broadcastPauseWindowMinutes: settings.broadcastPauseWindowMinutes,
+    broadcastIntervalMinutes: settings.broadcastIntervalMinutes,
+  };
+  try {
+    return await adminAccounts.updateTeamSettings(businessAccountId, runtimeSettings);
+  } catch (error) {
+    if (String(error?.message || "").toLowerCase().includes("account not found")) {
+      console.warn(`Skipped broadcast runtime settings save for missing account ${businessAccountId}.`);
       return null;
     }
     throw error;
@@ -14009,11 +14278,6 @@ function superAdminAccountsHtml() {
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
     }
-    function localDateTimeToIso(value) {
-      if (!value) return "";
-      const date = new Date(value);
-      return Number.isNaN(date.getTime()) ? value : date.toISOString();
-    }
     async function request(path, body) {
       const response = await fetch(path, {
         method: "POST",
@@ -14599,6 +14863,12 @@ function broadcastPageHtml() {
     .section-actions { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid #f0f0f2; }
     .section-actions h2 { padding:0; border:0; background:transparent; }
     .split { display:grid; grid-template-columns:minmax(320px,1fr) minmax(360px,1.3fr); gap:16px; }
+    .settings-panel { display:grid; gap:14px; padding:14px; }
+    .settings-card { border:1px solid #e5e5ea; border-radius:8px; background:linear-gradient(180deg,#fff,#fbfbfd); padding:14px; display:grid; gap:12px; }
+    .settings-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .settings-head h3 { margin:0; font-size:15px; }
+    .settings-head p { margin:4px 0 0; color:var(--muted); font-size:13px; line-height:1.35; }
+    .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
     .hidden { display:none !important; }
     .customer-list { border:1px solid #e5e5ea; border-radius:8px; overflow:hidden; }
     .empty { padding:16px; color:var(--muted); font-size:13px; }
@@ -14625,6 +14895,41 @@ function broadcastPageHtml() {
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
   <main>
+    <section>
+      <h2>Broadcast Sending Settings</h2>
+      <div class="settings-panel">
+        <div class="settings-card">
+          <div class="settings-head">
+            <div>
+              <h3>Per-account send lane</h3>
+              <p>Broadcast sends one-by-one inside this account, while other business accounts can send in their own lanes.</p>
+            </div>
+            <button id="save-broadcast-settings" class="primary" type="button">Save Settings</button>
+          </div>
+          <div class="settings-grid">
+            <label>Sends Per Minute
+              <input id="broadcast-sends-per-minute" type="number" min="1" max="100" />
+            </label>
+            <label>Delay Min (ms)
+              <input id="broadcast-send-delay-min-ms" type="number" min="0" max="600000" step="500" />
+            </label>
+            <label>Delay Max (ms)
+              <input id="broadcast-send-delay-max-ms" type="number" min="0" max="600000" step="500" />
+            </label>
+            <label>Active Window Minutes
+              <input id="broadcast-active-window-minutes" type="number" min="1" max="1440" />
+            </label>
+            <label>Pause Window Minutes
+              <input id="broadcast-pause-window-minutes" type="number" min="0" max="1440" />
+            </label>
+            <label>Scan Interval Minutes
+              <input id="broadcast-interval-minutes" type="number" min="1" max="1440" />
+            </label>
+          </div>
+          <div class="muted" id="broadcast-settings-state"></div>
+        </div>
+      </div>
+    </section>
     <section>
       <h2>Audience</h2>
       <div class="form">
@@ -14725,6 +15030,7 @@ function broadcastPageHtml() {
     let expandedCampaignId = "";
     const stateEl = document.querySelector("#broadcast-state");
     const mediaStateEl = document.querySelector("#media-state");
+    const settingsStateEl = document.querySelector("#broadcast-settings-state");
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
@@ -14733,8 +15039,31 @@ function broadcastPageHtml() {
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
     }
+    function localDateTimeToIso(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toISOString();
+    }
     function selectedValues(selector) {
       return Array.from(document.querySelector(selector).selectedOptions || []).map(option => option.value).filter(Boolean);
+    }
+    function applyBroadcastSettings(settings = {}) {
+      document.querySelector("#broadcast-sends-per-minute").value = settings.broadcastSendsPerMinute || "";
+      document.querySelector("#broadcast-send-delay-min-ms").value = settings.broadcastSendDelayMinMs ?? "";
+      document.querySelector("#broadcast-send-delay-max-ms").value = settings.broadcastSendDelayMaxMs ?? "";
+      document.querySelector("#broadcast-active-window-minutes").value = settings.broadcastActiveWindowMinutes || "";
+      document.querySelector("#broadcast-pause-window-minutes").value = settings.broadcastPauseWindowMinutes ?? "";
+      document.querySelector("#broadcast-interval-minutes").value = settings.broadcastIntervalMinutes || "";
+    }
+    function readBroadcastSettings() {
+      return {
+        broadcastSendsPerMinute: document.querySelector("#broadcast-sends-per-minute").value,
+        broadcastSendDelayMinMs: document.querySelector("#broadcast-send-delay-min-ms").value,
+        broadcastSendDelayMaxMs: document.querySelector("#broadcast-send-delay-max-ms").value,
+        broadcastActiveWindowMinutes: document.querySelector("#broadcast-active-window-minutes").value,
+        broadcastPauseWindowMinutes: document.querySelector("#broadcast-pause-window-minutes").value,
+        broadcastIntervalMinutes: document.querySelector("#broadcast-interval-minutes").value,
+      };
     }
     async function request(path, body) {
       const response = await fetch(path, {
@@ -14761,7 +15090,8 @@ function broadcastPageHtml() {
         openingFlowProductId: document.querySelector("#opening-product").value,
         text: document.querySelector("#message-text").value,
         media: uploadedMedia,
-        scheduledAt: localDateTimeToIso(document.querySelector("#scheduled-at").value)
+        scheduledAt: document.querySelector("#scheduled-at").value,
+        scheduledAtTimezoneOffsetMinutes: new Date().getTimezoneOffset()
       };
     }
     function syncMessageMode() {
@@ -14780,6 +15110,23 @@ function broadcastPageHtml() {
       document.querySelector("#stage-filter").innerHTML = (data.stages || []).map(stage =>
         '<option value="' + esc(stage.label) + '">' + esc(stage.label) + '</option>'
       ).join("");
+    }
+    async function saveBroadcastSettings() {
+      const button = document.querySelector("#save-broadcast-settings");
+      button.disabled = true;
+      settingsStateEl.textContent = "Saving...";
+      try {
+        data = await request("/admin/broadcast/settings", { settings: readBroadcastSettings() });
+        applyBroadcastSettings(data.settings || {});
+        renderOptions();
+        renderCustomers();
+        renderCampaigns();
+        settingsStateEl.textContent = "Saved";
+      } catch (error) {
+        settingsStateEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
     }
     function audienceFilters() {
       return {
@@ -15005,6 +15352,7 @@ function broadcastPageHtml() {
     async function load() {
       const response = await fetch("/admin/broadcast-data");
       data = await response.json();
+      applyBroadcastSettings(data.settings || {});
       renderOptions();
       renderCustomers();
       renderCampaigns();
@@ -15029,6 +15377,10 @@ function broadcastPageHtml() {
       resetPreviewAndRenderCustomers();
     }
     document.querySelector("#message-mode").addEventListener("change", syncMessageMode);
+    document.querySelector("#save-broadcast-settings").addEventListener("click", saveBroadcastSettings);
+    document.querySelectorAll("#broadcast-sends-per-minute,#broadcast-send-delay-min-ms,#broadcast-send-delay-max-ms,#broadcast-active-window-minutes,#broadcast-pause-window-minutes,#broadcast-interval-minutes").forEach(element => {
+      element.addEventListener("input", () => { settingsStateEl.textContent = "Unsaved changes"; });
+    });
     document.querySelector("#preview-broadcast").addEventListener("click", previewBroadcast);
     document.querySelector("#create-broadcast").addEventListener("click", createBroadcast);
     document.querySelector("#clear-broadcast-history").addEventListener("click", clearBroadcastHistory);
