@@ -26,6 +26,7 @@ import {
   formatStockArrivalMessage,
   getOpeningFlowDecision,
   resolveProduct,
+  imageMessage,
   textMessage,
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
@@ -73,6 +74,7 @@ import {
 import { filterKnowledgeRecordsForRoute } from "./lib/retrieval.mjs";
 import { validateProductionConfig } from "./lib/config_security.mjs";
 import {
+  customerDisplayForAlert,
   formatHandoffAlert,
   handoffAlertPatch,
   handoffAlertSettings,
@@ -206,6 +208,7 @@ const FOLLOWUP_EDITOR_STAGES = [
   }),
 ];
 const FOLLOWUP_MEDIA_MAX_BYTES = 30 * 1024 * 1024;
+const BROADCAST_MEDIA_MAX_BYTES = 30 * 1024 * 1024;
 const FOLLOWUP_MEDIA_TYPES = new Map([
   ["image/jpeg", { extension: "jpg", type: "image" }],
   ["image/png", { extension: "png", type: "image" }],
@@ -343,6 +346,7 @@ const outboundQueues = new Map();
 let testCustomerGenerationActive = false;
 let simulatedOutboxBuffer = null;
 let followupRunPromise = null;
+let broadcastRunPromise = null;
 const knowledgeSyncRuns = new Map();
 const followupPacingStartedAt = new Date();
 const webhookDiagnostics = {
@@ -759,6 +763,23 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/superadmin/system/settings") {
+      const body = await readJsonBody(req);
+      try {
+        const state = await operations.updateSystemSettings({
+          staffMonitoring: body.staffMonitoring || {},
+        });
+        await store.appendAuditLog({
+          actor: "super_admin",
+          action: "system_settings_updated",
+          result: "staff_monitoring",
+        });
+        return sendJson(res, 200, { state });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/superadmin/system/release") {
       const body = await readJsonBody(req);
       try {
@@ -937,6 +958,132 @@ const server = http.createServer(async (req, res) => {
       } catch (error) {
         await recordSystemError("followup_settings_save", error, "", adminSession?.accountId || config.accountId);
         return sendJson(res, 500, { error: error.message || "Unable to save follow-up settings." });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/broadcast") {
+      return sendHtml(res, 200, broadcastPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/broadcast-data") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        return sendJson(res, 200, await buildBroadcastData(adminSession.accountId));
+      } catch (error) {
+        await recordSystemError("broadcast_data", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 500, { error: error.message || "Unable to load broadcast data." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/broadcast/media") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        const body = await readJsonBody(req);
+        const media = decodeUploadedFollowupMedia(body.dataUrl);
+        if (!media) return sendJson(res, 400, { error: "Please upload an image or video file." });
+        if (media.bytes.length > BROADCAST_MEDIA_MAX_BYTES) {
+          return sendJson(res, 400, { error: "Media must be 30 MB or smaller." });
+        }
+        const originalName = String(body.originalName || "").trim();
+        const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName))) || "broadcast";
+        const assetKey = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${originalBase}`;
+        const accountAssetId = safeAssetSegment(adminSession.accountId);
+        const targetDirectory = path.join(config.assetsDir, accountAssetId, "broadcasts");
+        const filename = `${assetKey}.${media.extension}`;
+        await mkdir(targetDirectory, { recursive: true });
+        await savePersistedProductImageAsset(adminSession.accountId, "broadcasts", assetKey, {
+          image: media,
+          originalName,
+        });
+        await writeFile(path.join(targetDirectory, filename), media.bytes);
+        return sendJson(res, 200, {
+          media: {
+            type: media.type,
+            url: persistedProductImageUrl(adminSession.accountId, "broadcasts", assetKey, media.extension),
+            originalName,
+          },
+        });
+      } catch (error) {
+        await recordSystemError("broadcast_media_upload", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 400, { error: error.message || "Media upload failed." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/broadcast/preview") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        return sendJson(res, 200, await previewBroadcast(adminSession.accountId, await readJsonBody(req)));
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || "Broadcast preview failed." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/broadcast/create") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        const result = await createBroadcastCampaignForAccount(adminSession.accountId, await readJsonBody(req));
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "broadcast_created",
+          result: `${result.campaign.id}:${result.campaign.totalRecipients} recipient(s)`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 201, result);
+      } catch (error) {
+        await recordSystemError("broadcast_create", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 400, { error: error.message || "Broadcast creation failed." });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/customer-import") {
+      return sendHtml(res, 200, customerImportPageHtml());
+    }
+
+    if (req.method === "GET" && url.pathname === "/admin/customer-import-data") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const content = await getTeamContent(adminSession.accountId);
+      return sendJson(res, 200, buildCustomerImportData(content));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/customer-import/upload") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      try {
+        const body = await readJsonBody(req);
+        const content = await getTeamContent(adminSession.accountId);
+        const result = await parseCustomerImportUpload(body, content);
+        return sendJson(res, 200, result);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || "Unable to read uploaded import file." });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/customer-import/preview") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      const content = await getTeamContent(adminSession.accountId);
+      return sendJson(res, 200, previewCustomerImport(body, content));
+    }
+
+    if (req.method === "POST" && url.pathname === "/admin/customer-import/run") {
+      const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
+      const body = await readJsonBody(req);
+      try {
+        const content = await getTeamContent(adminSession.accountId);
+        const result = await importCustomersForAccount({
+          businessAccountId: adminSession.accountId,
+          body,
+          content,
+        });
+        await store.appendAuditLog({
+          actor: `admin:${adminSession.accountId}`,
+          action: "customers_imported",
+          result: `${result.created} created; ${result.updated} updated; ${result.ordersCreated} order(s); ${result.skipped} skipped`,
+          businessAccountId: adminSession.accountId,
+        });
+        return sendJson(res, 200, result);
+      } catch (error) {
+        await recordSystemError("customer_import", error, "", adminSession?.accountId || config.accountId);
+        return sendJson(res, 400, { error: error.message || "Customer import failed." });
       }
     }
 
@@ -2124,6 +2271,11 @@ if (!config.skipHttpServer && config.followupAutorun) {
   scheduleFollowupAutorun();
 }
 
+if (!config.skipHttpServer) {
+  scheduleStaffMonitoring();
+  scheduleBroadcastAutorun();
+}
+
 async function followupAutorunIntervalMinutes() {
   try {
     const accounts = await adminAccounts.listAccounts();
@@ -2135,6 +2287,17 @@ async function followupAutorunIntervalMinutes() {
     await recordSystemError("followup_interval_settings", error);
   }
   return Math.max(config.followupIntervalMinutes, 1);
+}
+
+async function staffMonitoringIntervalMinutes() {
+  try {
+    const state = await operations.getState();
+    const value = Number(state.staffMonitoring?.intervalMinutes || 0);
+    if (Number.isFinite(value) && value > 0) return value;
+  } catch (error) {
+    await recordSystemError("staff_monitoring_interval_settings", error);
+  }
+  return 5;
 }
 
 function scheduleFollowupAutorun() {
@@ -2150,6 +2313,33 @@ function scheduleFollowupAutorun() {
       }
     }, Math.max(intervalMinutes, 1) * 60 * 1000);
   })();
+}
+
+function scheduleStaffMonitoring() {
+  void (async () => {
+    const intervalMinutes = await staffMonitoringIntervalMinutes();
+    setTimeout(async () => {
+      try {
+        await requestStaffMonitoringRun();
+      } catch (error) {
+        await recordSystemError("staff_monitoring_run", error);
+      } finally {
+        scheduleStaffMonitoring();
+      }
+    }, Math.max(intervalMinutes, 1) * 60 * 1000);
+  })();
+}
+
+function scheduleBroadcastAutorun() {
+  setTimeout(async () => {
+    try {
+      await requestBroadcastRun();
+    } catch (error) {
+      await recordSystemError("broadcast_run", error);
+    } finally {
+      scheduleBroadcastAutorun();
+    }
+  }, 60 * 1000);
 }
 
 function handleVerification(url, res) {
@@ -2358,9 +2548,15 @@ function phoneFromCustomerSource(customerId, source = {}) {
     cleanCustomerPhone(source.phone) ||
     cleanCustomerPhone(source.phoneNumber) ||
     cleanCustomerPhone(source.senderPhone) ||
+    cleanCustomerPhone(source.senderPn) ||
+    cleanCustomerPhone(source.remoteJidAlt) ||
+    cleanCustomerPhone(source.participantAlt) ||
     phoneFromJid(source.remoteJid) ||
     phoneFromJid(source.senderJid) ||
     phoneFromJid(source.participant) ||
+    phoneFromJid(source.senderPn) ||
+    phoneFromJid(source.remoteJidAlt) ||
+    phoneFromJid(source.participantAlt) ||
     cleanCustomerPhone(customerId)
   );
 }
@@ -7185,6 +7381,816 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
   };
 }
 
+function buildCustomerImportData(content = defaultTeamContent) {
+  const teamCatalog = content.catalog || catalog;
+  const stageMap = new Map();
+  for (const product of teamCatalog.products || []) {
+    for (const item of productFollowupSequence(product)) {
+      if (!stageMap.has(item.key)) {
+        stageMap.set(item.key, {
+          key: item.key,
+          label: item.label || followupStageName(item.key),
+        });
+      }
+    }
+  }
+  return {
+    products: (teamCatalog.products || []).map((product) => ({
+      id: product.id,
+      name: product.name || product.id,
+      skuCode: product.sku_code || "",
+    })),
+    stages: [...stageMap.values()],
+    modes: [
+      {
+        id: "continue_followups",
+        label: "Import + Continue Follow-Ups From Now",
+      },
+      {
+        id: "submitted_order",
+        label: "Import As Submitted Order",
+      },
+    ],
+  };
+}
+
+async function parseCustomerImportUpload(body = {}, content = defaultTeamContent) {
+  const filename = String(body.filename || body.originalName || "").trim();
+  const dataUrl = String(body.dataUrl || "").trim();
+  const mode = cleanCustomerImportMode(body.mode);
+  if (!filename) throw new Error("Import file name is required.");
+  if (!dataUrl) throw new Error("Import file is required.");
+  const upload = decodeCustomerImportUpload(dataUrl);
+  const extension = path.extname(filename).toLowerCase();
+  let rows = "";
+  if (extension === ".csv" || upload.mimeType === "text/csv") {
+    rows = decodeCustomerImportCsv(upload.bytes);
+  } else if (extension === ".xlsx" || extension === ".xls") {
+    rows = await excelWorkbookToImportCsv(upload.bytes);
+  } else {
+    throw new Error("Upload a CSV, XLSX, or XLS file.");
+  }
+  rows = normalizeUploadedImportRows(rows);
+  if (!rows) throw new Error("The import file has no rows.");
+  const preview = previewCustomerImport({
+    mode,
+    currentStageKey: body.currentStageKey,
+    rows,
+  }, content);
+  return {
+    filename,
+    rows,
+    totalRows: preview.rows.length,
+    valid: preview.valid,
+    invalid: preview.invalid,
+  };
+}
+
+function decodeCustomerImportUpload(dataUrl = "") {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)?(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/);
+  if (!match) throw new Error("Import file could not be read.");
+  const bytes = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+  if (!bytes.length) throw new Error("Import file is empty.");
+  if (bytes.length > 5 * 1024 * 1024) throw new Error("Import file must be 5 MB or smaller.");
+  return {
+    mimeType: String(match[1] || "").toLowerCase(),
+    bytes,
+  };
+}
+
+function decodeCustomerImportCsv(bytes) {
+  const raw = bytes.toString("utf8").replace(/^\uFEFF/, "");
+  if (raw.includes("\u0000")) {
+    return bytes.toString("utf16le").replace(/^\uFEFF/, "");
+  }
+  return raw;
+}
+
+async function excelWorkbookToImportCsv(bytes) {
+  let XLSX;
+  try {
+    XLSX = await import("xlsx");
+  } catch {
+    throw new Error("Excel import support is not installed. Upload CSV for now.");
+  }
+  const workbook = XLSX.read(bytes, { type: "buffer", cellDates: false });
+  const sheetName = workbook.SheetNames?.[0];
+  if (!sheetName) throw new Error("Excel file has no sheets.");
+  return XLSX.utils.sheet_to_csv(workbook.Sheets[sheetName], { FS: ",", RS: "\n" });
+}
+
+function normalizeUploadedImportRows(rows = "") {
+  return String(rows || "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => splitCustomerImportLine(line).some((value) => String(value || "").trim()))
+    .join("\n");
+}
+
+function previewCustomerImport(body = {}, content = defaultTeamContent) {
+  const mode = cleanCustomerImportMode(body.mode);
+  const teamCatalog = content.catalog || catalog;
+  const currentStageKey = cleanCustomerImportStageKey(body.currentStageKey || body.stageKey || body.currentStage);
+  const rows = parseCustomerImportRows(body.rows || body.text || body.rawText || "", {
+    mode,
+    currentStageKey,
+    catalog: teamCatalog,
+  });
+  return {
+    mode,
+    currentStageKey,
+    rows,
+    valid: rows.filter((row) => !row.errors.length).length,
+    invalid: rows.filter((row) => row.errors.length).length,
+  };
+}
+
+async function importCustomersForAccount({ businessAccountId = config.accountId, body = {}, content = defaultTeamContent } = {}) {
+  const mode = cleanCustomerImportMode(body.mode);
+  const preview = previewCustomerImport(body, content);
+  const validRows = preview.rows.filter((row) => !row.errors.length);
+  if (!validRows.length) throw new Error("No valid customer rows to import.");
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const teamCatalog = content.catalog || catalog;
+  const results = [];
+  const seenCustomerIds = new Set();
+  let created = 0;
+  let updated = 0;
+  let ordersCreated = 0;
+  let followupRowsQueued = 0;
+  let skipped = preview.rows.length - validRows.length;
+
+  for (const row of validRows) {
+    if (seenCustomerIds.has(row.customerId)) {
+      skipped += 1;
+      results.push({ ...row, status: "skipped", reason: "Duplicate row in this import." });
+      continue;
+    }
+    seenCustomerIds.add(row.customerId);
+    const existing = await store.getCustomer(row.customerId, businessAccountId);
+    const product = row.productId ? findCatalogProduct(row.productId, teamCatalog) : null;
+    const basePatch = {
+      businessAccountId,
+      importedCustomer: true,
+      importedAt: nowIso,
+      importMode: mode,
+      importName: row.name || existing?.importName || "",
+      phone: row.phone || phoneNumberFromImportedCustomerId(row.customerId) || existing?.phone || "",
+      importStageKey: row.currentStageKey || "",
+      importStageLabelDisplay: row.currentStageLabel || "",
+      source: {
+        imported: true,
+        importMode: mode,
+        importedAt: nowIso,
+        raw: row.raw,
+        productId: product?.id || "",
+      },
+    };
+
+    if (mode === "continue_followups") {
+      const sequence = productFollowupSequence(product);
+      const followupsSent = importedFollowupsSentThroughStage({
+        existing,
+        sequence,
+        currentStageKey: row.currentStageKey,
+        sentAt: nowIso,
+      });
+      const customer = await store.getOrCreateCustomer(row.customerId, {
+        ...basePatch,
+        productId: product.id,
+        firstSeenAt: nowIso,
+        lastMessageAt: nowIso,
+        lastInboundAt: existing?.lastInboundAt || "",
+        inboundCount: Number(existing?.inboundCount || 0),
+        pendingOpeningFlow: null,
+        openingFlowSentAt: nowIso,
+        openingFlowProductId: product.id,
+        openingFlowsSent: {
+          ...(existing?.openingFlowsSent && typeof existing.openingFlowsSent === "object" ? existing.openingFlowsSent : {}),
+          [product.id]: { sentAt: nowIso, imported: true },
+        },
+        followupsSent,
+        followupBlocked: false,
+        followupBlockedReason: "",
+      });
+      const queuedRows = await enqueueOpeningFlowFollowups({
+        customer,
+        product,
+        businessAccountId,
+        openingFlowSentAt: nowIso,
+        queuedAt: now,
+      });
+      followupRowsQueued += queuedRows.length;
+      if (existing) updated += 1;
+      else created += 1;
+      results.push({
+        ...row,
+        status: existing ? "updated" : "created",
+        followupRowsQueued: queuedRows.length,
+      });
+      continue;
+    }
+
+    const submittedOrderAt = row.orderDateIso || nowIso;
+    const customer = await store.getOrCreateCustomer(row.customerId, {
+      ...basePatch,
+      productId: product?.id || existing?.productId || "",
+      firstSeenAt: existing?.firstSeenAt || submittedOrderAt,
+      lastMessageAt: submittedOrderAt,
+      lastInboundAt: existing?.lastInboundAt || "",
+      inboundCount: Number(existing?.inboundCount || 0),
+      pendingOpeningFlow: null,
+      followupBlocked: true,
+      followupBlockedReason: "Imported as submitted order.",
+    });
+    let orderCreated = false;
+    if (!(customer.orderIds || []).length) {
+      const order = await store.addOrder({
+        businessAccountId,
+        customerId: row.customerId,
+        productId: product?.id || customer.productId || "",
+        productName: product?.name || "",
+        name: row.name || "",
+        phone: row.phone || phoneNumberFromImportedCustomerId(row.customerId),
+        ...(row.orderDateIso ? { createdAt: row.orderDateIso, updatedAt: row.orderDateIso } : {}),
+        orderOptionPrice: row.price || "",
+        quantity: row.quantity || 1,
+        address: row.address || "",
+        record: [
+          "Imported submitted-order customer.",
+          row.orderDateIso ? `Date: ${row.orderDateIso}` : "",
+          row.name ? `Name: ${row.name}` : "",
+          row.address ? `Address: ${row.address}` : "",
+          product?.name ? `Product: ${product.name}` : "",
+          row.quantity ? `Quantity: ${row.quantity}` : "",
+          row.price ? `Price: ${row.price}` : "",
+          row.raw ? `Source row: ${row.raw}` : "",
+        ].filter(Boolean).join("\n"),
+        rawMessage: row.raw || "",
+        source: "customer_import",
+        status: "pending_admin_order",
+        statusHistory: [{ status: "pending_admin_order", at: row.orderDateIso || nowIso, actor: `admin:${businessAccountId}` }],
+      });
+      orderCreated = true;
+      ordersCreated += 1;
+      results.push({ ...row, status: existing ? "updated" : "created", orderId: order.id });
+    } else {
+      results.push({ ...row, status: existing ? "updated" : "created", reason: "Customer already has submitted order." });
+    }
+    if (existing) updated += 1;
+    else created += 1;
+    if (!orderCreated) {
+      await store.updateCustomer(row.customerId, () => ({
+        lastMessageAt: submittedOrderAt,
+        followupBlocked: true,
+        followupBlockedReason: "Imported as submitted order.",
+      }), businessAccountId);
+    }
+  }
+
+  return {
+    mode,
+    importedAt: nowIso,
+    totalRows: preview.rows.length,
+    validRows: validRows.length,
+    created,
+    updated,
+    skipped,
+    ordersCreated,
+    followupRowsQueued,
+    invalidRows: preview.rows.filter((row) => row.errors.length),
+    results,
+  };
+}
+
+function cleanCustomerImportMode(value) {
+  const mode = String(value || "").trim();
+  return mode === "submitted_order" ? "submitted_order" : "continue_followups";
+}
+
+function cleanCustomerImportStageKey(value = "") {
+  return String(value || "").trim();
+}
+
+function parseCustomerImportRows(rawText = "", { mode = "continue_followups", currentStageKey = "", catalog: activeCatalog = catalog } = {}) {
+  const lines = String(rawText || "").split(/\r?\n/);
+  const rows = [];
+  const selectedStageKey = cleanCustomerImportStageKey(currentStageKey);
+  const parsedLines = lines
+    .map((line, index) => ({
+      lineNumber: index + 1,
+      raw: line.trim(),
+      columns: splitCustomerImportLine(line),
+    }))
+    .filter((item) => item.columns.some((value) => String(value || "").trim()));
+  const header = detectCustomerImportHeader(parsedLines[0]?.columns || [], mode);
+  const dataLines = header ? parsedLines.slice(1) : parsedLines;
+  dataLines.forEach(({ raw, columns, lineNumber }) => {
+    const isSubmittedOrder = mode === "submitted_order";
+    const field = (name, fallbackIndex = -1) => {
+      if (header) {
+        const headerIndex = header[name];
+        return headerIndex === undefined ? "" : String(columns[headerIndex] || "").trim();
+      }
+      return fallbackIndex >= 0 ? String(columns[fallbackIndex] || "").trim() : "";
+    };
+    const orderDateInput = isSubmittedOrder ? field("date", 0) : "";
+    const name = field("name", isSubmittedOrder ? 1 : 0).slice(0, 120);
+    const phoneInput = field("phone", isSubmittedOrder ? 2 : 1);
+    const address = isSubmittedOrder ? field("address", 3) : "";
+    const skuCode = field("skuCode", isSubmittedOrder ? -1 : 2);
+    const quantityInput = isSubmittedOrder ? field("quantity", 5) : "";
+    const price = isSubmittedOrder ? field("price", 6) : "";
+    const quantity = Number(quantityInput);
+    const orderDateIso = isSubmittedOrder ? parseCustomerImportDate(orderDateInput) : "";
+    const customerId = normalizeImportedCustomerId(phoneInput);
+    const product = resolveCustomerImportProductBySku(skuCode, activeCatalog);
+    const sequence = product ? productFollowupSequence(product) : [];
+    const hasSelectedStage = Boolean(selectedStageKey && sequence.some((item) => item.key === selectedStageKey));
+    const errors = [];
+    if (!customerId) errors.push("Customer phone/LID is invalid.");
+    if (!name) errors.push("Name is required.");
+    if (isSubmittedOrder && !orderDateInput) errors.push("Date is required.");
+    if (isSubmittedOrder && orderDateInput && !orderDateIso) errors.push("Date is invalid.");
+    if (isSubmittedOrder && !address) errors.push("Address is required.");
+    if (!skuCode) errors.push("SKU code is required.");
+    if (skuCode && !product) errors.push(`SKU code not found: ${skuCode}`);
+    if (isSubmittedOrder && (!quantityInput || !Number.isFinite(quantity) || quantity <= 0)) errors.push("Quantity is required.");
+    if (isSubmittedOrder && !price) errors.push("Price is required.");
+    if (mode === "continue_followups" && !selectedStageKey) errors.push("Current stage is required.");
+    if (mode === "continue_followups" && product && selectedStageKey && !hasSelectedStage) {
+      errors.push(`Current stage is not configured for SKU ${skuCode}.`);
+    }
+    rows.push({
+      line: lineNumber,
+      raw,
+      customerInput: phoneInput,
+      customerId,
+      name,
+      phone: phoneNumberFromImportedCustomerId(customerId),
+      orderDateInput,
+      orderDateIso,
+      address,
+      skuCode,
+      productInput: skuCode,
+      productId: product?.id || "",
+      productName: product?.name || "",
+      quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : "",
+      price,
+      currentStageKey: isSubmittedOrder ? "" : selectedStageKey,
+      currentStageLabel: isSubmittedOrder ? "" : (selectedStageKey ? customerImportStageLabel(product, selectedStageKey) : ""),
+      errors,
+    });
+  });
+  return rows.slice(0, 1000);
+}
+
+function normalizeCustomerImportHeader(value = "") {
+  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function detectCustomerImportHeader(columns = [], mode = "continue_followups") {
+  const aliases = {
+    date: new Set(["date", "orderdate", "ordereddate", "createddate", "createdat"]),
+    name: new Set(["name", "customer", "customername", "fullname", "clientname"]),
+    phone: new Set(["phone", "phonenumber", "mobile", "mobilenumber", "contact", "contactnumber", "whatsapp", "whatsappnumber"]),
+    address: new Set(["address", "deliveryaddress", "shippingaddress", "customeraddress"]),
+    skuCode: new Set(["sku", "skucode", "skunameorcode", "productsku", "productcode", "productid", "itemcode"]),
+    quantity: new Set(["quantity", "qty", "orderquantity", "itemquantity"]),
+    price: new Set(["price", "pricebnd", "pricebn", "amount", "total", "orderprice", "itemprice"]),
+  };
+  const header = {};
+  columns.forEach((column, index) => {
+    const normalized = normalizeCustomerImportHeader(column);
+    for (const [field, names] of Object.entries(aliases)) {
+      if (header[field] === undefined && names.has(normalized)) {
+        header[field] = index;
+      }
+    }
+  });
+  const required = mode === "submitted_order"
+    ? ["date", "name", "phone", "address", "skuCode", "quantity", "price"]
+    : ["name", "phone", "skuCode"];
+  const matched = required.filter((field) => header[field] !== undefined).length;
+  return matched >= Math.min(required.length, 3) ? header : null;
+}
+
+function splitCustomerImportLine(line = "") {
+  const text = String(line || "").trim();
+  if (!text) return [];
+  const delimiter = text.includes("\t") ? "\t" : text.includes(",") ? "," : "";
+  if (!delimiter) {
+    const parts = text.split(/\s+/);
+    return [parts.shift() || "", parts.join(" ")];
+  }
+  const values = [];
+  let current = "";
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '"') {
+      if (quoted && text[index + 1] === '"') {
+        current += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (char === delimiter && !quoted) {
+      values.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current.trim());
+  return values;
+}
+
+function normalizeImportedCustomerId(value = "") {
+  const text = String(value || "").trim().replace(/[\u200B-\u200D\uFEFF]/g, "");
+  if (!text) return "";
+  const lower = text.toLowerCase();
+  if (/^[0-9]+@lid$/.test(lower)) return lower;
+  const jidMatch = lower.match(/^([0-9]+)@(s\.whatsapp\.net|c\.us)$/);
+  if (jidMatch) return `${jidMatch[1]}@s.whatsapp.net`;
+  if (lower.includes("@")) return "";
+  const digits = text.replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 18) return "";
+  return `${digits}@s.whatsapp.net`;
+}
+
+function phoneNumberFromImportedCustomerId(customerId = "") {
+  const match = String(customerId || "").match(/^([0-9]+)@s\.whatsapp\.net$/i);
+  return match ? match[1] : "";
+}
+
+async function buildBroadcastData(businessAccountId = config.accountId) {
+  const content = await getTeamContent(businessAccountId);
+  const [customers, orders, campaigns] = await Promise.all([
+    store.listCustomers(new Date(), businessAccountId),
+    store.listOrders(businessAccountId),
+    operations.listBroadcastCampaigns(businessAccountId),
+  ]);
+  const productById = new Map((content.catalog.products || []).map((product) => [product.id, product]));
+  const ordersByCustomer = groupBy(orders, (order) => order.customerId);
+  const dashboardCustomers = customers
+    .filter((customer) =>
+      (customer.businessAccountId || config.accountId) === businessAccountId &&
+      !isDemoEnvironmentCustomerId(customer.id)
+    )
+    .map((customer) => broadcastCustomerRow(customer, productById, ordersByCustomer));
+  const stageSet = new Set();
+  for (const customer of dashboardCustomers) {
+    if (customer.labelDisplay) stageSet.add(customer.labelDisplay);
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    products: (content.catalog.products || []).map((product) => ({
+      id: product.id,
+      name: product.name,
+      skuCode: product.sku_code || "",
+    })),
+    stages: [...stageSet].sort().map((label) => ({ label })),
+    customers: dashboardCustomers.sort((left, right) =>
+      String(right.lastMessageAt || right.firstSeenAt || "").localeCompare(String(left.lastMessageAt || left.firstSeenAt || ""))
+    ),
+    campaigns: campaigns.slice(0, 50),
+  };
+}
+
+function broadcastCustomerRow(customer = {}, productById = new Map(), ordersByCustomer = new Map()) {
+  const product = productById.get(customer.productId) || {};
+  const orders = ordersByCustomer.get(customer.id) || [];
+  const latestOrder = orders.at(-1) || {};
+  const phone = latestOrder.phone || customer.phone || phoneFromCustomerSource(customer.id, customer.source || {}) || phoneNumberFromImportedCustomerId(customer.id);
+  const labelDisplay = customer.importStageLabelDisplay || customer.labelDisplay || customer.label || "";
+  return {
+    id: customer.id,
+    name: latestOrder.name || customer.importName || customer.name || "",
+    phone: phone || customer.id,
+    whatsappId: customer.id,
+    productId: customer.productId || "",
+    product: product.name || customer.productId || "",
+    skuCode: product.sku_code || "",
+    labelDisplay,
+    status: orders.length ? "submitted order" : conversationStatus(customer, orders),
+    orderCount: orders.length,
+    optedOut: Boolean(customer.optedOut),
+    lastMessageAt: customer.lastMessageAt || "",
+    firstSeenAt: customer.firstSeenAt || "",
+  };
+}
+
+async function previewBroadcast(businessAccountId = config.accountId, body = {}) {
+  const content = await getTeamContent(businessAccountId);
+  const [customers, orders] = await Promise.all([
+    store.listCustomers(new Date(), businessAccountId),
+    store.listOrders(businessAccountId),
+  ]);
+  const productById = new Map((content.catalog.products || []).map((product) => [product.id, product]));
+  const ordersByCustomer = groupBy(orders, (order) => order.customerId);
+  const rows = customers
+    .filter((customer) => (customer.businessAccountId || config.accountId) === businessAccountId && !isDemoEnvironmentCustomerId(customer.id))
+    .map((customer) => broadcastCustomerRow(customer, productById, ordersByCustomer));
+  const preview = selectBroadcastRecipients(rows, body);
+  const messagePreview = buildBroadcastMessagePreview(body, content.catalog);
+  return {
+    ...preview,
+    messagePreview,
+  };
+}
+
+async function createBroadcastCampaignForAccount(businessAccountId = config.accountId, body = {}) {
+  const preview = await previewBroadcast(businessAccountId, body);
+  if (!preview.count) throw new Error("No recipients match this broadcast.");
+  const content = await getTeamContent(businessAccountId);
+  const messages = buildBroadcastMessages(body, content.catalog);
+  if (!messages.length) throw new Error("Broadcast message is required.");
+  const scheduledAt = parseBroadcastScheduledAt(body.scheduledAt);
+  const result = await operations.createBroadcastCampaign({
+    businessAccountId,
+    name: body.name,
+    messageMode: cleanBroadcastMessageMode(body.messageMode),
+    productId: String(body.openingFlowProductId || body.productId || ""),
+    scheduledAt,
+    messages,
+    audience: cleanBroadcastAudience(body),
+  }, preview.recipients.map((recipient) => ({
+    customerId: recipient.id,
+    to: recipient.id,
+    phone: recipient.phone,
+    name: recipient.name,
+    productId: recipient.productId,
+    labelDisplay: recipient.labelDisplay,
+  })), new Date());
+  void requestBroadcastRun().catch((error) => recordSystemError("broadcast_run", error, result.campaign.id, businessAccountId));
+  return {
+    campaign: result.campaign,
+    queued: result.items.length,
+    recipients: preview.recipients.slice(0, 100),
+  };
+}
+
+function selectBroadcastRecipients(customers = [], body = {}) {
+  const audience = cleanBroadcastAudience(body);
+  const selectedIds = new Set(asArray(body.selectedCustomerIds).map(String).filter(Boolean));
+  const pastedTokens = parseBroadcastRecipientTokens(body.pastedRecipients || body.recipientText || "");
+  const pastedMatches = new Set();
+  const unmatched = [];
+  for (const token of pastedTokens) {
+    const match = customers.find((customer) => broadcastCustomerMatchesToken(customer, token));
+    if (match) pastedMatches.add(match.id);
+    else unmatched.push(token.original);
+  }
+  const explicitMode = selectedIds.size > 0 || pastedMatches.size > 0;
+  const recipients = [];
+  const seen = new Set();
+  for (const customer of customers) {
+    const selected = selectedIds.has(customer.id) || pastedMatches.has(customer.id);
+    const includeByFilter = !explicitMode && broadcastAudienceMatches(customer, audience);
+    if (!selected && !includeByFilter) continue;
+    if (audience.excludeOptedOut !== false && customer.optedOut) continue;
+    if (seen.has(customer.id)) continue;
+    seen.add(customer.id);
+    recipients.push(customer);
+  }
+  return {
+    count: recipients.length,
+    recipients: recipients.slice(0, 500),
+    unmatched,
+    audience,
+  };
+}
+
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null || value === "") return [];
+  return [value];
+}
+
+function cleanBroadcastAudience(body = {}) {
+  const preset = ["active", "submitted_order", "all", "custom"].includes(String(body.audiencePreset || ""))
+    ? String(body.audiencePreset)
+    : "active";
+  return {
+    preset,
+    productIds: asArray(body.productIds || body.productId).map(String).filter(Boolean),
+    stageLabels: asArray(body.stageLabels || body.stageLabel).map(String).filter(Boolean),
+    activeOnly: "activeOnly" in body ? Boolean(body.activeOnly) : preset === "active",
+    includeSubmittedOrders: Boolean(body.includeSubmittedOrders || preset === "submitted_order" || preset === "all"),
+    excludeOptedOut: "excludeOptedOut" in body ? Boolean(body.excludeOptedOut) : true,
+  };
+}
+
+function broadcastAudienceMatches(customer = {}, audience = {}) {
+  if (audience.excludeOptedOut !== false && customer.optedOut) return false;
+  if (audience.productIds?.length && !audience.productIds.includes(customer.productId)) return false;
+  if (audience.stageLabels?.length && !audience.stageLabels.includes(customer.labelDisplay)) return false;
+  if (audience.preset === "submitted_order") return Number(customer.orderCount || 0) > 0;
+  if (audience.preset === "all") return true;
+  if (audience.activeOnly && Number(customer.orderCount || 0) > 0 && !audience.includeSubmittedOrders) return false;
+  return true;
+}
+
+function parseBroadcastRecipientTokens(value = "") {
+  return String(value || "")
+    .split(/[\s,;]+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .map((original) => ({
+      original,
+      lower: original.toLowerCase(),
+      digits: original.replace(/\D/g, ""),
+    }));
+}
+
+function broadcastCustomerMatchesToken(customer = {}, token = {}) {
+  if (!token.original) return false;
+  if (token.lower.includes("@")) {
+    return String(customer.id || "").toLowerCase() === token.lower || String(customer.whatsappId || "").toLowerCase() === token.lower;
+  }
+  if (!token.digits) return false;
+  const phones = [
+    customer.phone,
+    phoneNumberFromImportedCustomerId(customer.id),
+    String(customer.id || "").replace(/\D/g, ""),
+  ].map((value) => String(value || "").replace(/\D/g, "")).filter(Boolean);
+  return phones.some((phone) => phone === token.digits || phone.endsWith(token.digits) || token.digits.endsWith(phone));
+}
+
+function cleanBroadcastMessageMode(value = "") {
+  return String(value || "") === "opening_flow" ? "opening_flow" : "text";
+}
+
+function buildBroadcastMessagePreview(body = {}, activeCatalog = catalog) {
+  const messages = buildBroadcastMessages(body, activeCatalog);
+  return messages.map((message) => ({
+    type: message.type,
+    body: message.body || "",
+    caption: message.caption || "",
+    url: message.url || "",
+  })).slice(0, 8);
+}
+
+function buildBroadcastMessages(body = {}, activeCatalog = catalog) {
+  const mode = cleanBroadcastMessageMode(body.messageMode);
+  if (mode === "opening_flow") {
+    const product = findCatalogProduct(body.openingFlowProductId || body.productId, activeCatalog);
+    if (!product) throw new Error("Select a product opening flow to send.");
+    return clampMessages(Array.isArray(product.opening_flow) && product.opening_flow.length
+      ? product.opening_flow
+      : buildProductOpeningFlow(productFlowEditorData(product)));
+  }
+  const media = body.media && typeof body.media === "object" ? body.media : null;
+  const bodyText = String(body.text || body.messageText || "").trim();
+  const messages = [];
+  if (media?.url && ["image", "video"].includes(media.type)) {
+    messages.push(media.type === "image"
+      ? imageMessage(media.url, bodyText)
+      : { type: "video", url: media.url, caption: bodyText });
+  } else if (bodyText) {
+    messages.push(textMessage(bodyText));
+  }
+  return messages;
+}
+
+function parseBroadcastScheduledAt(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return new Date().toISOString();
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) throw new Error("Scheduled send time is invalid.");
+  return date.toISOString();
+}
+
+async function requestBroadcastRun(now = new Date()) {
+  if (broadcastRunPromise) return broadcastRunPromise;
+  broadcastRunPromise = runDueBroadcasts(now).finally(() => {
+    broadcastRunPromise = null;
+  });
+  return broadcastRunPromise;
+}
+
+async function runDueBroadcasts(now = new Date()) {
+  const limit = Math.max(1, Math.min(Number(config.followupSendsPerMinute) || 10, 20));
+  const batch = await operations.claimBroadcastBatch(limit, now);
+  const summary = { claimed: batch.length, sent: 0, skipped: 0, failed: 0 };
+  const touchedCampaigns = new Set();
+  for (const item of batch) {
+    touchedCampaigns.add(item.campaignId);
+    try {
+      const account = await adminAccounts.getAccount(item.businessAccountId || config.accountId);
+      if (!account || account.active === false) throw new Error("Business account is disabled.");
+      const customer = await store.getCustomer(item.customerId, item.businessAccountId || config.accountId);
+      if (!customer) {
+        await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer not found." } }]);
+        summary.skipped += 1;
+        continue;
+      }
+      if (customer.optedOut) {
+        await operations.updateBroadcastItems([{ id: item.id, patch: { status: "skipped", lastError: "Customer opted out." } }]);
+        summary.skipped += 1;
+        continue;
+      }
+      await sendOutbound(item.to || item.customerId, item.messages || [], {
+        businessAccountId: item.businessAccountId || config.accountId,
+        purpose: "broadcast",
+        campaignId: item.campaignId,
+      });
+      await operations.updateBroadcastItems([{ id: item.id, patch: { status: "sent", sentAt: new Date().toISOString(), lastError: "" } }]);
+      summary.sent += 1;
+    } catch (error) {
+      const attempts = Number(item.attempts || 0);
+      const retry = attempts < 3;
+      await operations.updateBroadcastItems([{
+        id: item.id,
+        patch: {
+          status: retry ? "retry_pending" : "failed",
+          availableAt: new Date(Date.now() + Math.max(1, Number(config.followupRetryMinutes) || 5) * 60 * 1000).toISOString(),
+          lastError: error.message || "Broadcast send failed.",
+        },
+      }]);
+      summary.failed += 1;
+      await recordSystemError("broadcast_send", error, `Campaign: ${item.campaignId}; Customer: ${item.customerId}`, item.businessAccountId || config.accountId);
+    }
+    await wait(randomFollowupDelayMs());
+  }
+  for (const campaignId of touchedCampaigns) {
+    await operations.refreshBroadcastCampaignStats(campaignId);
+  }
+  return summary;
+}
+
+function parseCustomerImportDate(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    const serial = Number(text);
+    if (Number.isFinite(serial) && serial > 20000 && serial < 80000) {
+      const excelEpoch = Date.UTC(1899, 11, 30);
+      return new Date(excelEpoch + serial * 24 * 60 * 60 * 1000).toISOString();
+    }
+  }
+  const ymd = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  const slashDate = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  const shortDate = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2})$/);
+  function localDateParts(first, second, year) {
+    if (first > 12) return { year, month: second, day: first };
+    if (second > 12) return { year, month: first, day: second };
+    return { year, month: second, day: first };
+  }
+  let shortParts = null;
+  if (shortDate) {
+    const first = Number(shortDate[1]);
+    const second = Number(shortDate[2]);
+    const year = 2000 + Number(shortDate[3]);
+    shortParts = localDateParts(first, second, year);
+  }
+  const parts = ymd
+    ? { year: Number(ymd[1]), month: Number(ymd[2]), day: Number(ymd[3]) }
+    : slashDate
+      ? localDateParts(Number(slashDate[1]), Number(slashDate[2]), Number(slashDate[3]))
+      : shortParts;
+  if (parts) {
+    if (parts.month < 1 || parts.month > 12 || parts.day < 1 || parts.day > 31) return "";
+    const date = followupZonedLocalToDate({ ...parts, hour: 0, minute: 0, second: 0, millisecond: 0 });
+    return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString();
+}
+
+function normalizeCustomerImportSkuCode(value = "") {
+  return String(value || "").trim().toUpperCase();
+}
+
+function resolveCustomerImportProductBySku(value = "", activeCatalog = catalog) {
+  const normalized = normalizeCustomerImportSkuCode(value);
+  if (!normalized) return null;
+  return (activeCatalog.products || []).find((product) => {
+    return normalizeCustomerImportSkuCode(product.sku_code) === normalized;
+  }) || null;
+}
+
+function customerImportStageLabel(product, stageKey = "") {
+  const item = productFollowupSequence(product).find((stage) => stage.key === stageKey);
+  return item?.label || followupStageName(stageKey);
+}
+
+function importedFollowupsSentThroughStage({ existing = null, sequence = [], currentStageKey = "", sentAt = new Date().toISOString() } = {}) {
+  const followupsSent = {
+    ...(existing?.followupsSent && typeof existing.followupsSent === "object" ? existing.followupsSent : {}),
+  };
+  const stageIndex = sequence.findIndex((item) => item.key === currentStageKey);
+  if (stageIndex < 0) return followupsSent;
+  for (const item of sequence.slice(0, stageIndex + 1)) {
+    if (!followupsSent[item.key]) followupsSent[item.key] = sentAt;
+  }
+  return followupsSent;
+}
+
 async function saveFollowupRuntimeSettings(businessAccountId = config.accountId, settings = {}) {
   if (!settings || typeof settings !== "object") return null;
   const runtimeSettings = {
@@ -7286,7 +8292,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       product: productById.get(customer.productId)?.name || customer.productId || "",
       skuCode: productById.get(customer.productId)?.sku_code || "",
       label: customer.label,
-      labelDisplay: customer.labelDisplay,
+      labelDisplay: customer.importStageLabelDisplay || customer.labelDisplay,
       lastMessageAt: customer.lastMessageAt || "",
       firstSeenAt: customer.firstSeenAt || "",
       latestOrderCreatedAt: latestOrder.createdAt || "",
@@ -8788,6 +9794,7 @@ function isCurrentFollowupSendWindow(customer, item, sequence = [], now = new Da
 }
 
 function isWithinCustomerServiceWindow(customer, at = new Date()) {
+  if (customer?.importedCustomer && !customer.lastInboundAt) return false;
   const lastInbound = new Date(customer.lastInboundAt || customer.firstSeenAt || 0);
   if (Number.isNaN(lastInbound.getTime())) return false;
   return at.getTime() - lastInbound.getTime() <= DAY_MS;
@@ -9897,6 +10904,8 @@ function whatsappWebStatusHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -10588,6 +11597,284 @@ async function buildSystemBackup() {
     outbox,
     followupQueue,
   };
+}
+
+let staffMonitoringRunPromise = null;
+
+function requestStaffMonitoringRun(now = new Date()) {
+  if (staffMonitoringRunPromise) return staffMonitoringRunPromise;
+  staffMonitoringRunPromise = runStaffMonitoring(now).finally(() => {
+    staffMonitoringRunPromise = null;
+  });
+  return staffMonitoringRunPromise;
+}
+
+async function runStaffMonitoring(now = new Date()) {
+  const state = await operations.getState();
+  const accounts = (await adminAccounts.listAccounts()).filter((account) => account.role === "business_admin");
+  const enabledAccounts = accounts.filter((account) => account.settings?.staffMonitoringEnabled);
+  if (!enabledAccounts.length) return { checkedAt: now.toISOString(), alerts: 0, summaries: 0 };
+  const customers = await store.listCustomers(now);
+  const outbox = await store.listOutbox();
+  const alerts = [];
+  let summaries = 0;
+  for (const account of enabledAccounts) {
+    const accountId = account.id;
+    const accountCustomers = customers.filter((customer) => (customer.businessAccountId || config.accountId) === accountId);
+    const accountOutbox = outbox.filter((message) => (message.businessAccountId || config.accountId) === accountId);
+    const mode = normalizeAutoReplyMode(account.autoReplyMode || (account.automationPaused ? "paused" : "full_ai"));
+    if (mode === "paused") continue;
+    const candidates = staffMonitoringCandidatesForAccount({
+      account,
+      mode,
+      customers: accountCustomers,
+      outbox: accountOutbox,
+      now,
+    });
+    for (const candidate of candidates) {
+      if (candidate.customer.staffMonitoringAlertedKey === candidate.key) continue;
+      const sent = await sendStaffMonitoringAlert(account, candidate, now);
+      if (!sent) continue;
+      await store.updateCustomer(candidate.customer.id, () => ({
+        staffMonitoringAlertedAt: now.toISOString(),
+        staffMonitoringAlertedKey: candidate.key,
+        staffMonitoringAlertedReason: candidate.reason,
+      }), accountId);
+      alerts.push({ accountId, customerId: candidate.customer.id, reason: candidate.reason });
+    }
+    if (await maybeSendStaffMonitoringDailySummary({ state, account, customers: accountCustomers, outbox: accountOutbox, now })) {
+      summaries += 1;
+    }
+  }
+  return { checkedAt: now.toISOString(), alerts: alerts.length, summaries, alerted: alerts };
+}
+
+function staffMonitoringCandidatesForAccount({ account = {}, mode = "full_ai", customers = [], outbox = [], now = new Date() } = {}) {
+  const delayMinutes = Math.max(1, Number(account.settings?.staffMonitoringAlertDelayMinutes || 15) || 15);
+  const cutoff = now.getTime() - delayMinutes * 60 * 1000;
+  const candidates = [];
+  if (mode === "paused") return candidates;
+  if (mode === "flows_only") {
+    candidates.push(...flowsOnlyUnrepliedInboundCandidates(customers, outbox, cutoff));
+  } else {
+    candidates.push(...fullAiUnresolvedHandoffCandidates(customers, cutoff));
+  }
+  return candidates.sort((left, right) => left.triggerAt.getTime() - right.triggerAt.getTime());
+}
+
+function fullAiUnresolvedHandoffCandidates(customers = [], cutoff = Date.now()) {
+  return customers
+    .map((customer) => {
+      if (customer.handoffStatus !== "human_required" && customer.pendingOrderLookup?.status !== "human_required" && customer.complaintStatus !== "open") {
+        return null;
+      }
+      const triggerAt = validDateOrNull(
+        customer.pendingOrderLookup?.updatedAt ||
+        customer.pendingOrderLookup?.startedAt ||
+        customer.lastInboundAt ||
+        customer.lastMessageAt ||
+        customer.firstSeenAt
+      );
+      if (!triggerAt || triggerAt.getTime() > cutoff) return null;
+      const reason = customer.handoffReason || (customer.pendingOrderLookup?.status === "human_required"
+        ? ORDER_LOOKUP_HANDOFF_REASON
+        : customer.complaintStatus === "open" ? "Complaint requires human reply." : "Human reply required.");
+      return {
+        customer,
+        key: `handoff:${reason}:${triggerAt.toISOString()}`,
+        reason,
+        mode: "full_ai",
+        triggerAt,
+        lastCustomerMessage: customer.pendingOrderLookup?.lastMessage || "",
+      };
+    })
+    .filter(Boolean);
+}
+
+function flowsOnlyUnrepliedInboundCandidates(customers = [], outbox = [], cutoff = Date.now()) {
+  const customerById = new Map(customers.map((customer) => [customer.id, customer]));
+  const latestInbound = new Map();
+  const latestStaffOutbound = new Map();
+  for (const message of outbox) {
+    const customerId = outboxCustomerId(message);
+    if (!customerId || !customerById.has(customerId)) continue;
+    const createdAt = validDateOrNull(message.createdAt);
+    if (!createdAt) continue;
+    if (message.direction === "inbound") {
+      const previous = latestInbound.get(customerId);
+      if (!previous || createdAt > previous.createdAt) latestInbound.set(customerId, { message, createdAt });
+    } else if (isStaffOutboundMessage(message)) {
+      const previous = latestStaffOutbound.get(customerId);
+      if (!previous || createdAt > previous.createdAt) latestStaffOutbound.set(customerId, { message, createdAt });
+    }
+  }
+  const candidates = [];
+  for (const [customerId, inbound] of latestInbound.entries()) {
+    if (inbound.createdAt.getTime() > cutoff) continue;
+    const staffReply = latestStaffOutbound.get(customerId);
+    if (staffReply && staffReply.createdAt > inbound.createdAt) continue;
+    const customer = customerById.get(customerId);
+    const inboundKey = inbound.message.id || inbound.createdAt.toISOString();
+    candidates.push({
+      customer,
+      key: `inbound:${inboundKey}`,
+      reason: "Customer message has not been replied by staff.",
+      mode: "flows_only",
+      triggerAt: inbound.createdAt,
+      lastCustomerMessage: inbound.message.body || inbound.message.caption || "",
+    });
+  }
+  return candidates;
+}
+
+function outboxCustomerId(message = {}) {
+  if (message.direction === "inbound") return String(message.from || message.customerId || "");
+  return String(message.to || message.customerId || "");
+}
+
+function isStaffOutboundMessage(message = {}) {
+  if (message.direction !== "outbound") return false;
+  if (String(message.channel || "") === "business_admin") return true;
+  if (String(message.from || "").startsWith("business_admin:")) return true;
+  return ["manual_whatsapp_message", "manual_media_reply"].includes(String(message.purpose || ""));
+}
+
+async function sendStaffMonitoringAlert(account = {}, candidate = {}, now = new Date()) {
+  const targets = staffMonitoringTargets(account.settings?.staffMonitoringAlertTargets);
+  if (!targets.length) return false;
+  const accountId = account.id || config.accountId;
+  const body = await formatStaffMonitoringAlert(accountId, candidate, now);
+  let sent = 0;
+  for (const target of targets) {
+    try {
+      await sendOutbound(target.value, [textMessage(body)], {
+        businessAccountId: accountId,
+        channel: "admin",
+        purpose: "staff_monitoring_alert",
+        skipFailureRecord: true,
+      });
+      sent += 1;
+    } catch (error) {
+      await recordSystemError("staff_monitoring_alert", error, `Account: ${accountId}; Customer: ${candidate.customer?.id || "unknown"}; Target: ${target.value}`, accountId);
+    }
+  }
+  return sent > 0;
+}
+
+async function formatStaffMonitoringAlert(accountId, candidate = {}, now = new Date()) {
+  const product = await productForHandoffAlert(candidate.customer, accountId);
+  const display = customerDisplayForAlert(candidate.customer, candidate.customer?.id || "");
+  const waitingMinutes = Math.max(0, Math.floor((now.getTime() - candidate.triggerAt.getTime()) / 60000));
+  const lines = [
+    "Staff monitoring alert",
+    "",
+    `Account: ${accountId}`,
+    `Mode: ${candidate.mode === "flows_only" ? "Flows Only" : "Full AI"}`,
+    `Customer: ${display.customer}`,
+  ];
+  if (display.customerId && display.customerId !== display.customer) lines.push(`Customer ID: ${display.customerId}`);
+  if (product?.name) lines.push(`Product: ${product.name}`);
+  lines.push(`Waiting: ${waitingMinutes} minute(s)`);
+  lines.push(`Reason: ${candidate.reason || "Staff reply required."}`);
+  if (candidate.lastCustomerMessage) lines.push(`Last customer message: ${String(candidate.lastCustomerMessage).trim().slice(0, 500)}`);
+  lines.push(`Time: ${now.toLocaleString("en-GB", { timeZone: "Asia/Kuala_Lumpur" })}`);
+  return lines.join("\n");
+}
+
+async function maybeSendStaffMonitoringDailySummary({ state = {}, account = {}, customers = [], outbox = [], now = new Date() } = {}) {
+  const systemSettings = state.staffMonitoring || {};
+  if (systemSettings.dailySummaryEnabled === false || !account.settings?.staffMonitoringDailySummaryEnabled) return false;
+  const targets = staffMonitoringTargets(account.settings?.staffMonitoringDailySummaryTargets);
+  if (!targets.length) return false;
+  const dateKey = localDateKey(now);
+  const time = String(systemSettings.dailySummaryTime || "18:00");
+  if (localTimeKey(now) < time) return false;
+  if (systemSettings.dailySummarySentDates?.[account.id] === dateKey) return false;
+  const mode = normalizeAutoReplyMode(account.autoReplyMode || (account.automationPaused ? "paused" : "full_ai"));
+  const candidates = staffMonitoringCandidatesForAccount({ account, mode, customers, outbox, now });
+  const alertedToday = customers.filter((customer) => localDateKey(validDateOrNull(customer.staffMonitoringAlertedAt)) === dateKey);
+  const unresolvedKeys = new Set(candidates.map((candidate) => candidate.key));
+  const resolvedAfterAlert = alertedToday.filter((customer) => customer.staffMonitoringAlertedKey && !unresolvedKeys.has(customer.staffMonitoringAlertedKey)).length;
+  const body = formatStaffMonitoringDailySummary({
+    accountId: account.id,
+    dateKey,
+    alertsSent: alertedToday.length,
+    resolvedAfterAlert,
+    unresolved: candidates,
+    now,
+  });
+  let sent = 0;
+  for (const target of targets) {
+    try {
+      await sendOutbound(target.value, [textMessage(body)], {
+        businessAccountId: account.id,
+        channel: "admin",
+        purpose: "staff_monitoring_daily_summary",
+        skipFailureRecord: true,
+      });
+      sent += 1;
+    } catch (error) {
+      await recordSystemError("staff_monitoring_daily_summary", error, `Account: ${account.id}; Target: ${target.value}`, account.id);
+    }
+  }
+  if (!sent) return false;
+  await operations.updateSystemSettings({
+    staffMonitoring: {
+      ...systemSettings,
+      dailySummarySentDates: {
+        ...(systemSettings.dailySummarySentDates || {}),
+        [account.id]: dateKey,
+      },
+    },
+  });
+  return true;
+}
+
+function formatStaffMonitoringDailySummary({ accountId = "", dateKey = "", alertsSent = 0, resolvedAfterAlert = 0, unresolved = [], now = new Date() } = {}) {
+  const lines = [
+    `Staff Monitoring Daily Summary - ${accountId}`,
+    `Date: ${dateKey}`,
+    "",
+    `Alerts sent: ${alertsSent}`,
+    `Resolved after alert: ${resolvedAfterAlert}`,
+    `Still unresolved: ${unresolved.length}`,
+  ];
+  const top = unresolved.slice(0, 3);
+  if (top.length) {
+    lines.push("", "Top unresolved:");
+    top.forEach((candidate, index) => {
+      const waitingMinutes = Math.max(0, Math.floor((now.getTime() - candidate.triggerAt.getTime()) / 60000));
+      const preview = candidate.lastCustomerMessage ? ` - "${String(candidate.lastCustomerMessage).trim().slice(0, 80)}"` : "";
+      lines.push(`${index + 1}. ${candidate.customer?.id || "unknown"} - waiting ${waitingMinutes}m${preview}`);
+    });
+  }
+  return lines.join("\n");
+}
+
+function staffMonitoringTargets(targets = []) {
+  return (Array.isArray(targets) ? targets : [])
+    .filter((target) => target && target.enabled !== false && target.value)
+    .slice(0, 10);
+}
+
+function localDateKey(date = new Date()) {
+  const value = date instanceof Date ? date : new Date(date || "");
+  if (Number.isNaN(value.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kuala_Lumpur",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(value);
+}
+
+function localTimeKey(date = new Date()) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kuala_Lumpur",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
 async function getTeamContent(accountId) {
@@ -12723,6 +14010,9 @@ function superAdminSystemHtml() {
     .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; padding: 14px; max-width: 980px; }
     .settings-grid label { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
     .settings-grid input, .settings-grid select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; min-width: 0; }
+    .settings-grid textarea { width: 100%; min-width: 0; min-height: 88px; }
+    .settings-grid .checkbox-label { display: flex; align-items: center; gap: 9px; }
+    .settings-grid .checkbox-label input { width: auto; }
     .settings-help { grid-column: 1 / -1; color: var(--muted); font-size: 13px; line-height: 1.38; }
     .settings-secret { display: block; color: var(--muted); font-size: 12px; font-weight: 600; }
     #team-settings-state { color: var(--muted); font-size: 13px; }
@@ -12758,6 +14048,26 @@ function superAdminSystemHtml() {
   </nav>
   <main>
     <div class="summary" id="summary"></div>
+    <section>
+      <h2>Staff Monitoring System Settings</h2>
+      <form class="settings-grid" id="system-settings-form">
+        <div class="settings-help">Global scheduler settings. Account targets and alert delay are configured below per business account.</div>
+        <label for="staff-monitoring-interval">Monitor Interval Minutes
+          <input id="staff-monitoring-interval" name="intervalMinutes" type="number" min="1" max="60" placeholder="5" />
+        </label>
+        <label class="checkbox-label" for="staff-summary-enabled">
+          <input id="staff-summary-enabled" name="dailySummaryEnabled" type="checkbox" />
+          Enable daily staff monitoring summaries
+        </label>
+        <label for="staff-summary-time">Daily Summary Time
+          <input id="staff-summary-time" name="dailySummaryTime" type="time" />
+        </label>
+        <div class="actions">
+          <button class="primary" type="submit">Save System Settings</button>
+          <span id="system-settings-state"></span>
+        </div>
+      </form>
+    </section>
     <section>
       <h2>Release Record</h2>
       <form class="toolbar" id="release-form">
@@ -12807,6 +14117,23 @@ function superAdminSystemHtml() {
             <option value="gpt-5.4-mini">GPT-5.4 mini</option>
             <option value="gpt-5-nano">GPT-5 nano</option>
           </select>
+        </label>
+        <label class="checkbox-label" for="team-staff-monitoring-enabled">
+          <input id="team-staff-monitoring-enabled" name="staffMonitoringEnabled" type="checkbox" />
+          Enable staff monitoring
+        </label>
+        <label for="team-staff-monitoring-delay">Alert Delay Minutes
+          <input id="team-staff-monitoring-delay" name="staffMonitoringAlertDelayMinutes" type="number" min="1" max="1440" placeholder="15" />
+        </label>
+        <label for="team-staff-monitoring-targets">Alert Targets
+          <textarea id="team-staff-monitoring-targets" name="staffMonitoringAlertTargets" placeholder="One WhatsApp number or group id per line"></textarea>
+        </label>
+        <label class="checkbox-label" for="team-staff-summary-enabled">
+          <input id="team-staff-summary-enabled" name="staffMonitoringDailySummaryEnabled" type="checkbox" />
+          Enable daily summary for this account
+        </label>
+        <label for="team-staff-summary-targets">Daily Summary Targets
+          <textarea id="team-staff-summary-targets" name="staffMonitoringDailySummaryTargets" placeholder="One WhatsApp number or group id per line"></textarea>
         </label>
         <div class="actions">
           <button class="primary" type="submit">Save Team Settings</button>
@@ -12858,6 +14185,18 @@ function superAdminSystemHtml() {
       if (!response.ok) throw new Error(result.error || "Action failed.");
       return result;
     }
+    function targetLines(targets) {
+      return Array.isArray(targets)
+        ? targets.filter(item => item && item.enabled !== false).map(item => item.value || "").filter(Boolean).join("\\n")
+        : "";
+    }
+    function parseTargetLines(value) {
+      return String(value || "").split(/\\r?\\n/).map(line => line.trim()).filter(Boolean).map(value => ({
+        type: value.endsWith("@g.us") ? "group" : "number",
+        value,
+        enabled: true
+      }));
+    }
     function mode(account) {
       if ((account.autoReplyMode || "") === "paused" || account.automationPaused) return ["Paused", "pause"];
       if ((account.autoReplyMode || "") === "flows_only") return ["Flows Only", "test"];
@@ -12872,6 +14211,12 @@ function superAdminSystemHtml() {
     function currentTeamSettingsAccount() {
       const accounts = data ? data.accounts || [] : [];
       return accounts.find(account => account.id === selectedTeamSettingsAccount) || accounts[0] || null;
+    }
+    function renderSystemSettings() {
+      const settings = data?.state?.staffMonitoring || {};
+      document.querySelector("#staff-monitoring-interval").value = settings.intervalMinutes || 5;
+      document.querySelector("#staff-summary-enabled").checked = settings.dailySummaryEnabled !== false;
+      document.querySelector("#staff-summary-time").value = settings.dailySummaryTime || "18:00";
     }
     function renderTeamSettings(force = false) {
       const form = document.querySelector("#team-settings-form");
@@ -12894,6 +14239,11 @@ function superAdminSystemHtml() {
       document.querySelector("#team-openai-api-key").value = "";
       document.querySelector("#team-vector-store-id").value = settings.openaiVectorStoreId || "";
       document.querySelector("#team-openai-model").value = settings.openaiModel || "";
+      document.querySelector("#team-staff-monitoring-enabled").checked = Boolean(settings.staffMonitoringEnabled);
+      document.querySelector("#team-staff-monitoring-delay").value = settings.staffMonitoringAlertDelayMinutes || "";
+      document.querySelector("#team-staff-monitoring-targets").value = targetLines(settings.staffMonitoringAlertTargets);
+      document.querySelector("#team-staff-summary-enabled").checked = Boolean(settings.staffMonitoringDailySummaryEnabled);
+      document.querySelector("#team-staff-summary-targets").value = targetLines(settings.staffMonitoringDailySummaryTargets);
       document.querySelector("#team-phone-number-id-current").textContent =
         settings.whatsappPhoneNumberId ? "Current: " + settings.whatsappPhoneNumberId : "No team-specific phone number ID saved.";
       document.querySelector("#team-access-token-current").textContent =
@@ -12904,6 +14254,25 @@ function superAdminSystemHtml() {
           : settings.openaiApiKey ? "Current: " + settings.openaiApiKey : "No team-specific OpenAI API key saved. Railway default will be used.";
       if (settings.openaiVectorStoreIdLooksInvalid) {
         state.textContent = "Saved vector store ID looks wrong: it starts with sk-. Replace it with a vector store ID starting with vs_.";
+      }
+    }
+    async function saveSystemSettings(event) {
+      event.preventDefault();
+      const state = document.querySelector("#system-settings-state");
+      state.textContent = "Saving...";
+      try {
+        const result = await request("/superadmin/system/settings", {
+          staffMonitoring: {
+            intervalMinutes: document.querySelector("#staff-monitoring-interval").value,
+            dailySummaryEnabled: document.querySelector("#staff-summary-enabled").checked,
+            dailySummaryTime: document.querySelector("#staff-summary-time").value
+          }
+        });
+        data.state = result.state;
+        renderSystemSettings();
+        state.textContent = "Saved";
+      } catch (error) {
+        state.textContent = error.message;
       }
     }
     async function saveTeamSettings(event) {
@@ -12919,7 +14288,12 @@ function superAdminSystemHtml() {
         publicBaseUrl,
         assetsBaseUrl,
         openaiVectorStoreId: document.querySelector("#team-vector-store-id").value,
-        openaiModel: document.querySelector("#team-openai-model").value
+        openaiModel: document.querySelector("#team-openai-model").value,
+        staffMonitoringEnabled: document.querySelector("#team-staff-monitoring-enabled").checked,
+        staffMonitoringAlertDelayMinutes: document.querySelector("#team-staff-monitoring-delay").value,
+        staffMonitoringAlertTargets: parseTargetLines(document.querySelector("#team-staff-monitoring-targets").value),
+        staffMonitoringDailySummaryEnabled: document.querySelector("#team-staff-summary-enabled").checked,
+        staffMonitoringDailySummaryTargets: parseTargetLines(document.querySelector("#team-staff-summary-targets").value)
       };
       const phoneNumberId = document.querySelector("#team-phone-number-id").value.trim();
       const accessToken = document.querySelector("#team-access-token").value.trim();
@@ -13007,6 +14381,7 @@ function superAdminSystemHtml() {
         audits.slice(0, 50).map(item => '<tr><td>' + esc(fmt(item.createdAt)) + '</td><td>' + esc(item.actor) + '</td><td>' + esc(item.action) + '</td><td>' + esc(item.result || "") + '</td></tr>').join("") +
         '</tbody></table>' : '<div class="empty">No change history recorded.</div>';
       renderTeamSettings();
+      renderSystemSettings();
 
       document.querySelectorAll("button[data-id][data-mode]").forEach(button => button.addEventListener("click", async () => {
         await request("/superadmin/system/account-control", {
@@ -13046,6 +14421,7 @@ function superAdminSystemHtml() {
         document.querySelector("#release-message").textContent = error.message;
       }
     });
+    document.querySelector("#system-settings-form").addEventListener("submit", saveSystemSettings);
     document.querySelector("#team-account-id").addEventListener("change", event => {
       selectedTeamSettingsAccount = event.target.value;
       teamSettingsDirty = false;
@@ -13061,6 +14437,710 @@ function superAdminSystemHtml() {
     document.querySelector("#team-settings-form").addEventListener("submit", saveTeamSettings);
     load();
     setInterval(load, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function broadcastPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Broadcast</title>
+  <style>
+    :root { --accent:#0071e3; --accent-soft:#e8f2ff; --line:#d2d2d7; --muted:#6e6e73; --bg:#f5f5f7; --surface:#fff; --soft:#fbfbfd; --green:#176028; --red:#b42318; --amber:#7b4d00; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Arial,sans-serif; background:var(--bg); color:#1d1d1f; }
+    header { padding:16px 22px 10px; background:rgba(251,251,253,.9); border-bottom:1px solid rgba(210,210,215,.8); }
+    h1 { margin:0; font-size:20px; }
+    .sub { margin-top:4px; color:var(--muted); font-size:13px; }
+    nav { display:flex; flex-wrap:wrap; gap:8px; padding:10px 22px 14px; background:rgba(251,251,253,.9); border-bottom:1px solid rgba(210,210,215,.8); }
+    nav a, button { border:1px solid var(--line); border-radius:8px; padding:8px 11px; background:var(--surface); color:#1d1d1f; text-decoration:none; font:inherit; font-weight:700; cursor:pointer; }
+    nav a.active, button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    main { width:min(1440px,100%); margin:0 auto; padding:22px; display:grid; gap:16px; }
+    section { background:#fff; border:1px solid #e5e5ea; border-radius:8px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,.03); }
+    h2 { margin:0; padding:12px 14px; font-size:16px; background:var(--soft); border-bottom:1px solid #e5e5ea; }
+    .form { display:grid; gap:14px; padding:14px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .audience-layout { display:grid; grid-template-columns:minmax(280px,.8fr) minmax(360px,1.4fr); gap:14px; align-items:start; }
+    .panel { border:1px solid #e5e5ea; border-radius:8px; background:#fff; padding:12px; display:grid; gap:12px; }
+    .panel-title { margin:0; color:#1d1d1f; font-size:13px; font-weight:900; text-transform:uppercase; }
+    .filter-grid { display:grid; grid-template-columns:repeat(2,minmax(220px,1fr)); gap:12px; }
+    label { display:grid; gap:6px; font-size:13px; font-weight:800; }
+    input, select, textarea { width:100%; min-width:0; border:1px solid var(--line); border-radius:8px; padding:9px 10px; font:inherit; background:#fff; }
+    input:focus, select:focus, textarea:focus { outline:3px solid rgba(0,113,227,.16); border-color:var(--accent); }
+    textarea { min-height:96px; line-height:1.38; resize:vertical; }
+    select[multiple] { min-height:142px; }
+    .check { display:flex; align-items:center; gap:8px; }
+    .check input { width:auto; }
+    .actions { display:flex; flex-wrap:wrap; align-items:center; gap:9px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .pill { display:inline-flex; align-items:center; border-radius:999px; padding:5px 9px; background:#f5f5f7; font-size:12px; font-weight:800; }
+    .pill.ok { background:#e6f6e8; color:var(--green); }
+    .pill.warn { background:#fff3d8; color:var(--amber); }
+    .pill.fail { background:#ffe9e7; color:var(--red); }
+    .table-wrap { overflow-x:auto; max-height:460px; }
+    table { width:100%; border-collapse:collapse; min-width:920px; }
+    th, td { padding:9px 10px; border-bottom:1px solid #f0f0f2; text-align:left; vertical-align:top; font-size:13px; }
+    th { background:var(--soft); color:var(--muted); text-transform:uppercase; font-size:12px; position:sticky; top:0; }
+    .summary { display:flex; flex-wrap:wrap; gap:8px; padding:12px 14px; border-bottom:1px solid #f0f0f2; }
+    .split { display:grid; grid-template-columns:minmax(320px,1fr) minmax(360px,1.3fr); gap:16px; }
+    .hidden { display:none !important; }
+    .customer-list { border:1px solid #e5e5ea; border-radius:8px; overflow:hidden; }
+    .empty { padding:16px; color:var(--muted); font-size:13px; }
+    @media (max-width:900px) { main { padding:14px; } .split, .audience-layout, .filter-grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Broadcast</h1>
+    <div class="sub">Create scheduled broadcasts from existing customers or submitted-order customers.</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a class="active" href="/admin/broadcast">Broadcast</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <section>
+      <h2>Audience</h2>
+      <div class="form">
+        <div class="audience-layout">
+          <div class="panel">
+            <p class="panel-title">Choose audience</p>
+            <label>Audience Preset
+              <select id="audience-preset">
+                <option value="active">Active customers</option>
+                <option value="submitted_order">Submitted-order customers</option>
+                <option value="all">All customers except opted-out</option>
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+            <label class="check"><input id="active-only" type="checkbox" checked /> Active customers only</label>
+            <label class="check"><input id="include-submitted" type="checkbox" /> Include submitted-order customers</label>
+            <label class="check"><input id="exclude-opted-out" type="checkbox" checked /> Exclude opted-out customers</label>
+          </div>
+          <div class="panel">
+            <p class="panel-title">Narrow by product or stage</p>
+            <div class="filter-grid">
+              <label>Product / SKU
+                <select id="product-filter" multiple></select>
+              </label>
+              <label>Customer Stage
+                <select id="stage-filter" multiple></select>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <p class="panel-title">Add exact recipients</p>
+          <label>Paste Phone Numbers or @lid IDs
+            <textarea id="pasted-recipients" placeholder="6738123456&#10;159932368347158@lid"></textarea>
+          </label>
+        </div>
+      </div>
+      <div class="summary" id="audience-summary"><span class="pill">Loading customers...</span></div>
+      <div class="customer-list">
+        <div class="table-wrap" id="customer-table"></div>
+      </div>
+    </section>
+    <section>
+      <h2>Message</h2>
+      <div class="form split">
+        <div class="form" style="padding:0">
+          <label>Broadcast Name
+            <input id="broadcast-name" placeholder="Promo broadcast" />
+          </label>
+          <label>Message Type
+            <select id="message-mode">
+              <option value="text">Write broadcast message</option>
+              <option value="opening_flow">Send product opening flow</option>
+            </select>
+          </label>
+          <label id="opening-product-wrap" class="hidden">Opening Flow Product
+            <select id="opening-product"></select>
+          </label>
+          <label id="message-text-wrap">Message Text
+            <textarea id="message-text" placeholder="Write the broadcast message..."></textarea>
+          </label>
+          <label id="media-wrap">Optional Media
+            <input id="media-file" type="file" accept="image/*,video/mp4,video/webm,video/quicktime" />
+          </label>
+          <div class="muted" id="media-state"></div>
+        </div>
+        <div class="form" style="padding:0">
+          <label>Scheduled Send Time
+            <input id="scheduled-at" type="datetime-local" />
+          </label>
+          <div class="actions">
+            <button id="preview-broadcast" type="button">Preview Recipients</button>
+            <button id="create-broadcast" class="primary" type="button" disabled>Create Broadcast</button>
+            <span class="muted" id="broadcast-state"></span>
+          </div>
+          <div class="summary" id="preview-summary"><span class="pill">No preview yet</span></div>
+          <div class="table-wrap" id="preview-table"></div>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Recent Broadcasts</h2>
+      <div class="table-wrap" id="campaign-table"></div>
+    </section>
+  </main>
+  <script>
+    let data = { products: [], stages: [], customers: [], campaigns: [] };
+    let selectedIds = new Set();
+    let latestPreview = null;
+    let uploadedMedia = null;
+    const stateEl = document.querySelector("#broadcast-state");
+    const mediaStateEl = document.querySelector("#media-state");
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+    }
+    function fmt(value) {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+    }
+    function selectedValues(selector) {
+      return Array.from(document.querySelector(selector).selectedOptions || []).map(option => option.value).filter(Boolean);
+    }
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {})
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Request failed.");
+      return result;
+    }
+    function payload() {
+      return {
+        name: document.querySelector("#broadcast-name").value,
+        audiencePreset: document.querySelector("#audience-preset").value,
+        productIds: selectedValues("#product-filter"),
+        stageLabels: selectedValues("#stage-filter"),
+        activeOnly: document.querySelector("#active-only").checked,
+        includeSubmittedOrders: document.querySelector("#include-submitted").checked,
+        excludeOptedOut: document.querySelector("#exclude-opted-out").checked,
+        selectedCustomerIds: Array.from(selectedIds),
+        pastedRecipients: document.querySelector("#pasted-recipients").value,
+        messageMode: document.querySelector("#message-mode").value,
+        openingFlowProductId: document.querySelector("#opening-product").value,
+        text: document.querySelector("#message-text").value,
+        media: uploadedMedia,
+        scheduledAt: document.querySelector("#scheduled-at").value
+      };
+    }
+    function syncMessageMode() {
+      const opening = document.querySelector("#message-mode").value === "opening_flow";
+      document.querySelector("#opening-product-wrap").classList.toggle("hidden", !opening);
+      document.querySelector("#message-text-wrap").classList.toggle("hidden", opening);
+      document.querySelector("#media-wrap").classList.toggle("hidden", opening);
+    }
+    function renderOptions() {
+      document.querySelector("#product-filter").innerHTML = (data.products || []).map(product =>
+        '<option value="' + esc(product.id) + '">' + esc([product.skuCode, product.name].filter(Boolean).join(" - ")) + '</option>'
+      ).join("");
+      document.querySelector("#opening-product").innerHTML = '<option value="">Select product</option>' + (data.products || []).map(product =>
+        '<option value="' + esc(product.id) + '">' + esc([product.skuCode, product.name].filter(Boolean).join(" - ")) + '</option>'
+      ).join("");
+      document.querySelector("#stage-filter").innerHTML = (data.stages || []).map(stage =>
+        '<option value="' + esc(stage.label) + '">' + esc(stage.label) + '</option>'
+      ).join("");
+    }
+    function audienceFilters() {
+      return {
+        preset: document.querySelector("#audience-preset").value,
+        productIds: selectedValues("#product-filter"),
+        stageLabels: selectedValues("#stage-filter"),
+        activeOnly: document.querySelector("#active-only").checked,
+        includeSubmittedOrders: document.querySelector("#include-submitted").checked,
+        excludeOptedOut: document.querySelector("#exclude-opted-out").checked
+      };
+    }
+    function customerMatchesAudience(customer, filters) {
+      const orderCount = Number(customer.orderCount || 0);
+      if (filters.excludeOptedOut && customer.optedOut) return false;
+      if (filters.productIds.length && !filters.productIds.includes(customer.productId)) return false;
+      if (filters.stageLabels.length && !filters.stageLabels.includes(customer.labelDisplay)) return false;
+      if (filters.preset === "submitted_order") return orderCount > 0;
+      if (filters.preset === "all") return true;
+      if (filters.activeOnly && orderCount > 0 && !filters.includeSubmittedOrders) return false;
+      return true;
+    }
+    function recipientTokens() {
+      return document.querySelector("#pasted-recipients").value
+        .split(/[\\s,;]+/)
+        .map(token => token.trim())
+        .filter(Boolean)
+        .map(original => ({
+          original,
+          lower: original.toLowerCase(),
+          digits: original.replace(/\\D/g, "")
+        }));
+    }
+    function significantPhoneDigits(digits) {
+      return String(digits || "").replace(/^0+/, "");
+    }
+    function phoneDigitsMatch(left, right) {
+      if (!left || !right) return false;
+      if (left === right || left.endsWith(right) || right.endsWith(left)) return true;
+      const shortLeft = significantPhoneDigits(left);
+      const shortRight = significantPhoneDigits(right);
+      return Boolean(shortLeft && shortRight && (shortLeft === shortRight || shortLeft.endsWith(shortRight) || shortRight.endsWith(shortLeft)));
+    }
+    function customerMatchesToken(customer, token) {
+      if (!token.original) return false;
+      if (token.lower.includes("@")) {
+        return String(customer.id || "").toLowerCase() === token.lower || String(customer.whatsappId || "").toLowerCase() === token.lower;
+      }
+      if (!token.digits) return false;
+      const phones = [
+        customer.phone,
+        customer.id,
+        customer.whatsappId
+      ].map(value => String(value || "").replace(/\\D/g, "")).filter(Boolean);
+      return phones.some(phone => phoneDigitsMatch(phone, token.digits));
+    }
+    function pastedRecipientMatches() {
+      const tokens = recipientTokens();
+      const matchedIds = new Set();
+      const unmatched = [];
+      for (const token of tokens) {
+        const match = (data.customers || []).find(customer => customerMatchesToken(customer, token));
+        if (match) matchedIds.add(match.id);
+        else unmatched.push(token.original);
+      }
+      return { tokens, matchedIds, unmatched };
+    }
+    function filteredCustomers() {
+      const filters = audienceFilters();
+      const pasted = pastedRecipientMatches();
+      if (pasted.tokens.length) {
+        return (data.customers || []).filter(customer => pasted.matchedIds.has(customer.id));
+      }
+      return (data.customers || []).filter(customer => customerMatchesAudience(customer, filters));
+    }
+    function renderCustomers() {
+      const customers = filteredCustomers().slice(0, 300);
+      const pasted = pastedRecipientMatches();
+      if (pasted.tokens.length) {
+        selectedIds = new Set(pasted.matchedIds);
+      }
+      document.querySelector("#audience-summary").innerHTML = [
+        '<span class="pill">Customers ' + esc((data.customers || []).length) + '</span>',
+        '<span class="pill ok">Selected ' + esc(selectedIds.size) + '</span>',
+        '<span class="pill">Showing ' + esc(customers.length) + '</span>',
+        pasted.unmatched.length ? '<span class="pill warn">Unmatched ' + esc(pasted.unmatched.length) + '</span>' : ''
+      ].filter(Boolean).join("");
+      document.querySelector("#customer-table").innerHTML = customers.length ? '<table><thead><tr><th></th><th>Phone</th><th>Name</th><th>Product</th><th>Stage</th><th>Status</th><th>Last Message</th></tr></thead><tbody>' +
+        customers.map(customer => '<tr><td><input type="checkbox" data-id="' + esc(customer.id) + '"' + (selectedIds.has(customer.id) ? ' checked' : '') + ' /></td><td>' + esc(customer.phone || customer.id) + '<br><span class="muted">' + esc(customer.id) + '</span></td><td>' + esc(customer.name || '') + '</td><td>' + esc([customer.skuCode, customer.product].filter(Boolean).join(" - ")) + '</td><td>' + esc(customer.labelDisplay || '') + '</td><td>' + esc(customer.optedOut ? 'opted out' : customer.status || '') + '</td><td>' + esc(fmt(customer.lastMessageAt)) + '</td></tr>').join("") +
+        '</tbody></table>' : '<div class="empty">No customers match this audience.</div>';
+      document.querySelectorAll("#customer-table input[data-id]").forEach(input => input.addEventListener("change", () => {
+        if (input.checked) selectedIds.add(input.dataset.id);
+        else selectedIds.delete(input.dataset.id);
+        latestPreview = null;
+        document.querySelector("#create-broadcast").disabled = true;
+        renderCustomers();
+      }));
+    }
+    function renderCampaigns() {
+      const campaigns = data.campaigns || [];
+      document.querySelector("#campaign-table").innerHTML = campaigns.length
+        ? '<table><thead><tr><th>Name</th><th>Status</th><th>Schedule</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Updated</th></tr></thead><tbody>' + campaigns.map(campaign =>
+            '<tr><td>' + esc(campaign.name || campaign.id) + '</td><td><span class="pill">' + esc(campaign.status || '') + '</span></td><td>' + esc(fmt(campaign.scheduledAt)) + '</td><td>' + esc(campaign.totalRecipients || 0) + '</td><td>' + esc(campaign.sent || 0) + '</td><td>' + esc(campaign.failed || 0) + '</td><td>' + esc(fmt(campaign.updatedAt)) + '</td></tr>'
+          ).join("") + '</tbody></table>'
+        : '<div class="form"><span class="muted">No broadcasts created yet.</span></div>';
+    }
+    function renderPreview(preview) {
+      latestPreview = preview;
+      document.querySelector("#create-broadcast").disabled = !preview.count;
+      document.querySelector("#preview-summary").innerHTML = [
+        '<span class="pill ok">Recipients ' + esc(preview.count || 0) + '</span>',
+        preview.unmatched?.length ? '<span class="pill warn">Unmatched pasted ' + esc(preview.unmatched.length) + '</span>' : '',
+        preview.messagePreview?.length ? '<span class="pill">Message parts ' + esc(preview.messagePreview.length) + '</span>' : ''
+      ].filter(Boolean).join("");
+      const rows = preview.recipients || [];
+      document.querySelector("#preview-table").innerHTML = '<table><thead><tr><th>Phone</th><th>Name</th><th>Product</th><th>Stage</th><th>Status</th></tr></thead><tbody>' +
+        rows.slice(0, 100).map(customer => '<tr><td>' + esc(customer.phone || customer.id) + '<br><span class="muted">' + esc(customer.id) + '</span></td><td>' + esc(customer.name || '') + '</td><td>' + esc([customer.skuCode, customer.product].filter(Boolean).join(" - ")) + '</td><td>' + esc(customer.labelDisplay || '') + '</td><td>' + esc(customer.status || '') + '</td></tr>').join("") +
+        '</tbody></table>';
+    }
+    async function previewBroadcast() {
+      stateEl.textContent = "Previewing...";
+      try {
+        const preview = await request("/admin/broadcast/preview", payload());
+        renderPreview(preview);
+        stateEl.textContent = "Preview ready";
+      } catch (error) {
+        stateEl.textContent = error.message;
+      }
+    }
+    async function createBroadcast() {
+      stateEl.textContent = "Creating...";
+      document.querySelector("#create-broadcast").disabled = true;
+      try {
+        const result = await request("/admin/broadcast/create", payload());
+        stateEl.textContent = "Broadcast created with " + result.queued + " recipient(s).";
+        latestPreview = null;
+        selectedIds = new Set();
+        await load();
+      } catch (error) {
+        stateEl.textContent = error.message;
+      } finally {
+        document.querySelector("#create-broadcast").disabled = !latestPreview?.count;
+      }
+    }
+    async function uploadMedia(file) {
+      uploadedMedia = null;
+      if (!file) {
+        mediaStateEl.textContent = "";
+        return;
+      }
+      mediaStateEl.textContent = "Uploading media...";
+      const reader = new FileReader();
+      const dataUrl = await new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error("Unable to read media file."));
+        reader.readAsDataURL(file);
+      });
+      const result = await request("/admin/broadcast/media", { dataUrl, originalName: file.name });
+      uploadedMedia = result.media;
+      mediaStateEl.textContent = "Attached: " + file.name;
+    }
+    async function load() {
+      const response = await fetch("/admin/broadcast-data");
+      data = await response.json();
+      renderOptions();
+      renderCustomers();
+      renderCampaigns();
+    }
+    function resetPreviewAndRenderCustomers() {
+      latestPreview = null;
+      document.querySelector("#create-broadcast").disabled = true;
+      renderCustomers();
+    }
+    function syncAudiencePreset() {
+      const preset = document.querySelector("#audience-preset").value;
+      if (preset === "active") {
+        document.querySelector("#active-only").checked = true;
+        document.querySelector("#include-submitted").checked = false;
+      } else if (preset === "submitted_order") {
+        document.querySelector("#active-only").checked = false;
+        document.querySelector("#include-submitted").checked = true;
+      } else if (preset === "all") {
+        document.querySelector("#active-only").checked = false;
+        document.querySelector("#include-submitted").checked = true;
+      }
+      resetPreviewAndRenderCustomers();
+    }
+    document.querySelector("#message-mode").addEventListener("change", syncMessageMode);
+    document.querySelector("#preview-broadcast").addEventListener("click", previewBroadcast);
+    document.querySelector("#create-broadcast").addEventListener("click", createBroadcast);
+    document.querySelector("#media-file").addEventListener("change", event => uploadMedia(event.target.files[0]).catch(error => { mediaStateEl.textContent = error.message; }));
+    document.querySelector("#audience-preset").addEventListener("change", syncAudiencePreset);
+    document.querySelectorAll("#product-filter,#stage-filter,#active-only,#include-submitted,#exclude-opted-out").forEach(element => {
+      element.addEventListener("change", resetPreviewAndRenderCustomers);
+      element.addEventListener("input", resetPreviewAndRenderCustomers);
+    });
+    document.querySelector("#pasted-recipients").addEventListener("change", resetPreviewAndRenderCustomers);
+    document.querySelector("#pasted-recipients").addEventListener("input", resetPreviewAndRenderCustomers);
+    document.querySelectorAll("#message-text,#opening-product,#scheduled-at").forEach(element => {
+      element.addEventListener("change", () => { latestPreview = null; document.querySelector("#create-broadcast").disabled = true; });
+      element.addEventListener("input", () => { latestPreview = null; document.querySelector("#create-broadcast").disabled = true; });
+    });
+    syncMessageMode();
+    load().catch(error => { stateEl.textContent = error.message; });
+  </script>
+</body>
+</html>`;
+}
+
+function customerImportPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Customer Import</title>
+  <style>
+    :root { --accent: #0071e3; --line: #d2d2d7; --muted: #6e6e73; --bg: #f5f5f7; --surface: #fff; --soft: #fbfbfd; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Arial, sans-serif; background: var(--bg); color: #1d1d1f; }
+    header { padding: 16px 22px 10px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); backdrop-filter: saturate(180%) blur(16px); }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 22px 14px; background: rgba(251,251,253,.9); border-bottom: 1px solid rgba(210,210,215,.8); }
+    nav a { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: var(--surface); color: #1d1d1f; text-decoration: none; font-weight: 600; }
+    nav a.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    main { padding: 22px; display: grid; gap: 16px; }
+    section { background: #fff; border: 1px solid #e5e5ea; border-radius: 8px; overflow: hidden; }
+    h2 { margin: 0; padding: 12px 14px; font-size: 16px; background: var(--soft); border-bottom: 1px solid #e5e5ea; }
+    .form { display: grid; gap: 14px; padding: 14px; max-width: 980px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+    label { display: grid; gap: 6px; font-size: 13px; font-weight: 800; }
+    select, textarea, input { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; font: inherit; background: #fff; min-width: 0; }
+    textarea { min-height: 240px; line-height: 1.38; resize: vertical; }
+    button { border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: #fff; color: #1d1d1f; font: inherit; font-weight: 700; cursor: pointer; }
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+    .muted { color: var(--muted); }
+    .help { color: var(--muted); font-size: 13px; line-height: 1.42; }
+    .note { margin: 0; padding: 10px 14px; color: #6e6e73; background: #fff8e8; border-bottom: 1px solid #f5dfaa; font-size: 13px; }
+    .summary { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 14px; border-bottom: 1px solid #f0f0f2; }
+    .pill { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 5px 9px; background: #f5f5f7; font-weight: 800; font-size: 12px; }
+    .pill.ok { background: #e6f6e8; color: #176028; }
+    .pill.warn { background: #fff3d8; color: #7b4d00; }
+    .pill.fail { background: #ffe9e7; color: #8f1d12; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; min-width: 820px; border-collapse: collapse; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid #f0f0f2; text-align: left; vertical-align: top; font-size: 13px; }
+    th { background: var(--soft); color: var(--muted); text-transform: uppercase; font-size: 12px; }
+    code { background: #f5f5f7; border-radius: 5px; padding: 1px 5px; }
+    pre { margin: 0; padding: 10px 12px; border: 1px solid #e5e5ea; border-radius: 8px; background: #fbfbfd; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+    .reference { display: flex; flex-wrap: wrap; gap: 8px; }
+    .reference .pill { border-radius: 8px; }
+    .upload-box { border: 1px dashed #b8b8bd; border-radius: 8px; padding: 14px; display: grid; gap: 8px; background: #fbfbfd; }
+    .upload-box input { background: #fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Customer Import</h1>
+    <div class="sub">Import old customers into this business account only.</div>
+  </header>
+  <nav>
+    <a href="/admin/dashboard">Dashboard</a>
+    <a href="/admin/chat">Chat Inbox</a>
+    <a href="/admin/whatsapp-web">WhatsApp Web</a>
+    <a href="/admin/analytics">Analytics</a>
+    <a href="/admin/ai-suggestions">AI Suggestions</a>
+    <a href="/admin/reply-library">Reply Library</a>
+    <a href="/admin/product-flow">Product Flow</a>
+    <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a class="active" href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
+    <a href="/demo/chat">Customer Demo</a>
+    <a href="/admin/dashboard?tab=profile">Profile</a>
+  </nav>
+  <main>
+    <section>
+      <h2>Import Setup</h2>
+      <p class="note">No opening flow is sent during import. Phone numbers are stored as WhatsApp phone JIDs, for example <code>6738123456@s.whatsapp.net</code>.</p>
+      <div class="form">
+        <div class="grid">
+          <label for="import-mode">Import Mode
+            <select id="import-mode">
+              <option value="continue_followups">Import + Continue Follow-Ups From Now</option>
+              <option value="submitted_order">Import As Submitted Order</option>
+            </select>
+          </label>
+          <label for="current-stage">Current Stage
+            <select id="current-stage"></select>
+          </label>
+        </div>
+        <label class="upload-box" for="import-file">Upload CSV or Excel
+          <input id="import-file" type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+          <span class="muted" id="file-state">No file uploaded yet.</span>
+        </label>
+        <div class="help" id="import-help">
+          Required fields: name, phone, and SKU code. Header names like <code>Customer_Name</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.
+        </div>
+        <pre id="import-sample">Customer_Name,Phone,sku_code
+Ali,6738123456,PY1
+Siti,6738889999,SS2
+Customer Name,159932368347158@lid,PY1</pre>
+        <div class="reference" id="sku-reference"></div>
+        <div class="actions">
+          <button id="preview-import" type="button">Preview</button>
+          <button class="primary" id="run-import" type="button" disabled>Import Valid Rows</button>
+          <span class="muted" id="import-state"></span>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Preview / Results</h2>
+      <div class="summary" id="import-summary">
+        <span class="pill">Waiting for preview</span>
+      </div>
+      <div class="table-wrap" id="import-table"></div>
+    </section>
+  </main>
+  <script>
+    let importData = { products: [] };
+    let latestPreview = null;
+    let uploadedRows = "";
+    const modeEl = document.querySelector("#import-mode");
+    const stageEl = document.querySelector("#current-stage");
+    const fileEl = document.querySelector("#import-file");
+    const fileStateEl = document.querySelector("#file-state");
+    const helpEl = document.querySelector("#import-help");
+    const sampleEl = document.querySelector("#import-sample");
+    const stateEl = document.querySelector("#import-state");
+    const summaryEl = document.querySelector("#import-summary");
+    const tableEl = document.querySelector("#import-table");
+    const skuReferenceEl = document.querySelector("#sku-reference");
+    const runButton = document.querySelector("#run-import");
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+    }
+    async function request(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {})
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Request failed.");
+      return result;
+    }
+    function payload() {
+      return {
+        mode: modeEl.value,
+        currentStageKey: stageEl.value,
+        rows: uploadedRows
+      };
+    }
+    function syncModeHelp() {
+      if (modeEl.value === "submitted_order") {
+        stageEl.disabled = true;
+        helpEl.innerHTML = 'Required fields: order date, customer name, phone, address, SKU code, quantity, and price. Your submitted-order format is accepted: <code>Order_date</code>, <code>Customer_Name</code>, <code>Phone</code>, <code>Address</code>, <code>SKU_Code</code>, <code>Quantity</code>, and <code>Price(BND)</code>. Extra columns are ignored.';
+        sampleEl.textContent = 'Order_code,Order_date,Customer_Name,Phone,Address,SKU_Code,Quantity,Price(BND),Total_amount(RM),Ads_campaign\\nAV18,05/28/2026,Reena,8289919,"No.10, Spg 26, Jln Nenas Senggol",P07,2,39,117,P07A';
+        return;
+      }
+      stageEl.disabled = false;
+      helpEl.innerHTML = 'Required fields: name, phone, and SKU code. Header names like <code>Customer_Name</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.';
+      sampleEl.textContent = 'Customer_Name,Phone,sku_code\\nAli,6738123456,PY1\\nSiti,6738889999,SS2\\nCustomer Name,159932368347158@lid,PY1';
+    }
+    function renderImportOptions() {
+      const stages = importData.stages || [];
+      stageEl.innerHTML = '<option value="">Select current stage</option>' + stages.map(stage =>
+        '<option value="' + esc(stage.key) + '">' + esc(stage.label || stage.key) + '</option>'
+      ).join("");
+      const products = (importData.products || []).filter(product => product.skuCode);
+      skuReferenceEl.innerHTML = products.length
+        ? products.map(product => '<span class="pill">' + esc(product.skuCode) + ' - ' + esc(product.name || product.id) + '</span>').join("")
+        : '<span class="muted">No product SKU codes configured yet.</span>';
+      syncModeHelp();
+    }
+    function renderPreview(preview, result = null) {
+      latestPreview = preview;
+      const rows = preview.rows || result?.results || [];
+      const invalid = preview.invalid || 0;
+      const valid = preview.valid || 0;
+      summaryEl.innerHTML = [
+        '<span class="pill ok">Valid ' + esc(valid) + '</span>',
+        '<span class="pill ' + (invalid ? 'fail' : '') + '">Invalid ' + esc(invalid) + '</span>',
+        result ? '<span class="pill ok">Created ' + esc(result.created) + '</span>' : '',
+        result ? '<span class="pill ok">Updated ' + esc(result.updated) + '</span>' : '',
+        result ? '<span class="pill">Queued ' + esc(result.followupRowsQueued) + '</span>' : '',
+        result ? '<span class="pill">Orders ' + esc(result.ordersCreated) + '</span>' : ''
+      ].filter(Boolean).join("");
+      runButton.disabled = !valid;
+      const displayRows = result?.results || rows;
+      tableEl.innerHTML = '<table><thead><tr><th>Line</th><th>Customer</th><th>Name</th><th>SKU / Product</th><th>Current Stage</th><th>Order Details</th><th>Status</th></tr></thead><tbody>' +
+        displayRows.map(row => {
+          const errors = Array.isArray(row.errors) ? row.errors : [];
+          const status = result
+            ? (row.status || "") + (row.reason ? ": " + row.reason : "")
+            : errors.length ? errors.join("; ") : "Ready";
+          const cls = errors.length ? "fail" : row.status === "skipped" ? "warn" : "ok";
+          const productText = [row.skuCode || row.productInput || "", row.productName || ""].filter(Boolean).join(" - ");
+          const orderText = [row.orderDateInput || "", row.address || "", row.quantity ? "Qty " + row.quantity : "", row.price || ""].filter(Boolean).join(" | ");
+          return '<tr><td>' + esc(row.line || "") + '</td><td>' + esc(row.customerId || row.customerInput || "") + '</td><td>' + esc(row.name || "") + '</td><td>' + esc(productText) + '</td><td>' + esc(row.currentStageLabel || "") + '</td><td>' + esc(orderText) + '</td><td><span class="pill ' + cls + '">' + esc(status) + '</span></td></tr>';
+        }).join("") +
+        '</tbody></table>';
+    }
+    async function load() {
+      const response = await fetch("/admin/customer-import-data");
+      importData = await response.json();
+      renderImportOptions();
+    }
+    async function preview() {
+      if (!uploadedRows.trim()) {
+        stateEl.textContent = "Upload a CSV or Excel file first.";
+        return;
+      }
+      stateEl.textContent = "Previewing...";
+      try {
+        const result = await request("/admin/customer-import/preview", payload());
+        renderPreview(result);
+        stateEl.textContent = "Preview ready";
+      } catch (error) {
+        stateEl.textContent = error.message;
+      }
+    }
+    async function runImport() {
+      if (!latestPreview || !latestPreview.valid) return;
+      stateEl.textContent = "Importing...";
+      runButton.disabled = true;
+      try {
+        const result = await request("/admin/customer-import/run", payload());
+        renderPreview({ rows: result.results || [], valid: result.validRows || 0, invalid: result.invalidRows?.length || 0 }, result);
+        stateEl.textContent = "Import complete";
+      } catch (error) {
+        stateEl.textContent = error.message;
+      } finally {
+        runButton.disabled = !latestPreview?.valid;
+      }
+    }
+    async function uploadImportFile(file) {
+      uploadedRows = "";
+      latestPreview = null;
+      runButton.disabled = true;
+      if (!file) {
+        fileStateEl.textContent = "No file uploaded yet.";
+        return;
+      }
+      fileStateEl.textContent = "Reading " + file.name + "...";
+      const dataUrl = await readFileAsDataUrl(file);
+      const result = await request("/admin/customer-import/upload", {
+        filename: file.name,
+        dataUrl,
+        mode: modeEl.value,
+        currentStageKey: stageEl.value
+      });
+      uploadedRows = result.rows || "";
+      fileStateEl.textContent = file.name + " loaded: " + result.totalRows + " row(s), " + result.valid + " valid, " + result.invalid + " invalid before preview.";
+      summaryEl.innerHTML = '<span class="pill ok">File loaded ' + esc(result.totalRows || 0) + '</span><span class="pill">Click Preview</span>';
+      tableEl.innerHTML = "";
+    }
+    function readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error("Unable to read file."));
+        reader.readAsDataURL(file);
+      });
+    }
+    document.querySelector("#preview-import").addEventListener("click", preview);
+    runButton.addEventListener("click", runImport);
+    fileEl.addEventListener("change", event => uploadImportFile(event.target.files[0]).catch(error => { fileStateEl.textContent = error.message; }));
+    modeEl.addEventListener("change", () => {
+      uploadedRows = "";
+      latestPreview = null;
+      runButton.disabled = true;
+      fileEl.value = "";
+      fileStateEl.textContent = "Upload the file again after changing import mode.";
+      syncModeHelp();
+    });
+    stageEl.addEventListener("change", () => { latestPreview = null; runButton.disabled = true; });
+    syncModeHelp();
+    load().catch(error => { stateEl.textContent = error.message; });
   </script>
 </body>
 </html>`;
@@ -13691,6 +15771,8 @@ function adminDashboardHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <button id="profile-nav" type="button">Profile</button>
   </nav>
@@ -15198,6 +17280,8 @@ function adminChatPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -15623,6 +17707,8 @@ function replyLibraryPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -16039,6 +18125,8 @@ function faqLibraryPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -16552,6 +18640,8 @@ function salesRepliesPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -16852,6 +18942,8 @@ function followupSettingsPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -17415,6 +19507,8 @@ function productFlowPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -18737,6 +20831,8 @@ function analyticsPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
     <a href="/demo/chat">Customer Demo</a>
     <a href="/admin/dashboard?tab=profile">Profile</a>
   </nav>
@@ -18902,6 +20998,8 @@ function aiSuggestionsPageHtml() {
     <a href="/admin/reply-library">Reply Library</a>
     <a href="/admin/product-flow">Product Flow</a>
     <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
   </nav>
   <main>
     <section>
@@ -19212,6 +21310,8 @@ async function demoChatHtml(contentAccountId = config.accountId) {
       <a href="/admin/reply-library">Reply Library</a>
       <a href="/admin/product-flow">Product Flow</a>
       <a href="/admin/follow-up-settings">Follow-Up Settings</a>
+    <a href="/admin/customer-import">Customer Import</a>
+    <a href="/admin/broadcast">Broadcast</a>
       <a href="/demo/chat">Customer Demo</a>
       <a href="/admin/dashboard?tab=profile">Profile</a>
     </nav>
