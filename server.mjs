@@ -7825,10 +7825,10 @@ function parseCustomerImportRows(rawText = "", { mode = "continue_followups", cu
       return fallbackIndex >= 0 ? String(columns[fallbackIndex] || "").trim() : "";
     };
     const orderDateInput = isSubmittedOrder ? field("date", 0) : "";
-    const name = field("name", isSubmittedOrder ? 1 : 0).slice(0, 120);
-    const phoneInput = field("phone", isSubmittedOrder ? 2 : 1);
+    const name = field("name", isSubmittedOrder ? 1 : -1).slice(0, 120);
+    const phoneInput = field("phone", isSubmittedOrder ? 2 : 0);
     const address = isSubmittedOrder ? field("address", 3) : "";
-    const skuCode = field("skuCode", isSubmittedOrder ? -1 : 2);
+    const skuCode = field("skuCode", isSubmittedOrder ? -1 : 1);
     const quantityInput = isSubmittedOrder ? field("quantity", 5) : "";
     const price = isSubmittedOrder ? field("price", 6) : "";
     const quantity = Number(quantityInput);
@@ -7840,7 +7840,7 @@ function parseCustomerImportRows(rawText = "", { mode = "continue_followups", cu
       Boolean(selectedStageKey && sequence.some((item) => item.key === selectedStageKey));
     const errors = [];
     if (!customerId) errors.push("Customer phone/LID is invalid.");
-    if (!name) errors.push("Name is required.");
+    if (isSubmittedOrder && !name) errors.push("Name is required.");
     if (isSubmittedOrder && !orderDateInput) errors.push("Date is required.");
     if (isSubmittedOrder && orderDateInput && !orderDateIso) errors.push("Date is invalid.");
     if (isSubmittedOrder && !address) errors.push("Address is required.");
@@ -7884,7 +7884,7 @@ function detectCustomerImportHeader(columns = [], mode = "continue_followups") {
   const aliases = {
     date: new Set(["date", "orderdate", "ordereddate", "createddate", "createdat"]),
     name: new Set(["name", "customer", "customername", "fullname", "clientname"]),
-    phone: new Set(["phone", "phonenumber", "mobile", "mobilenumber", "contact", "contactnumber", "whatsapp", "whatsappnumber"]),
+    phone: new Set(["phone", "number", "phonenumber", "mobile", "mobilenumber", "contact", "contactnumber", "whatsapp", "whatsappnumber"]),
     address: new Set(["address", "deliveryaddress", "shippingaddress", "customeraddress"]),
     skuCode: new Set(["sku", "skucode", "skunameorcode", "productsku", "productcode", "productid", "itemcode"]),
     quantity: new Set(["quantity", "qty", "orderquantity", "itemquantity"]),
@@ -7901,9 +7901,10 @@ function detectCustomerImportHeader(columns = [], mode = "continue_followups") {
   });
   const required = mode === "submitted_order"
     ? ["date", "name", "phone", "address", "skuCode", "quantity", "price"]
-    : ["name", "phone", "skuCode"];
+    : ["phone", "skuCode"];
   const matched = required.filter((field) => header[field] !== undefined).length;
-  return matched >= Math.min(required.length, 3) ? header : null;
+  const minimumMatched = mode === "submitted_order" ? Math.min(required.length, 3) : 2;
+  return matched >= minimumMatched ? header : null;
 }
 
 function splitCustomerImportLine(line = "") {
@@ -15493,13 +15494,8 @@ function customerImportPageHtml() {
           <span class="muted" id="file-state">No file uploaded yet.</span>
         </label>
         <div class="help" id="import-help">
-          Required fields: name, phone, and SKU code. Header names like <code>Customer_Name</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.
+          Required fields: number and SKU code. Header names like <code>number</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.
         </div>
-        <pre id="import-sample">Customer_Name,Phone,sku_code
-Ali,6738123456,PY1
-Siti,6738889999,SS2
-Customer Name,159932368347158@lid,PY1</pre>
-        <div class="reference" id="sku-reference"></div>
         <div class="actions">
           <button id="preview-import" type="button">Preview</button>
           <button class="primary" id="run-import" type="button" disabled>Import Valid Rows</button>
@@ -15524,11 +15520,9 @@ Customer Name,159932368347158@lid,PY1</pre>
     const fileEl = document.querySelector("#import-file");
     const fileStateEl = document.querySelector("#file-state");
     const helpEl = document.querySelector("#import-help");
-    const sampleEl = document.querySelector("#import-sample");
     const stateEl = document.querySelector("#import-state");
     const summaryEl = document.querySelector("#import-summary");
     const tableEl = document.querySelector("#import-table");
-    const skuReferenceEl = document.querySelector("#sku-reference");
     const runButton = document.querySelector("#run-import");
 
     function esc(value) {
@@ -15555,22 +15549,16 @@ Customer Name,159932368347158@lid,PY1</pre>
       if (modeEl.value === "submitted_order") {
         stageEl.disabled = true;
         helpEl.innerHTML = 'Required fields: order date, customer name, phone, address, SKU code, quantity, and price. Your submitted-order format is accepted: <code>Order_date</code>, <code>Customer_Name</code>, <code>Phone</code>, <code>Address</code>, <code>SKU_Code</code>, <code>Quantity</code>, and <code>Price(BND)</code>. Extra columns are ignored.';
-        sampleEl.textContent = 'Order_code,Order_date,Customer_Name,Phone,Address,SKU_Code,Quantity,Price(BND),Total_amount(RM),Ads_campaign\\nAV18,05/28/2026,Reena,8289919,"No.10, Spg 26, Jln Nenas Senggol",P07,2,39,117,P07A';
         return;
       }
       stageEl.disabled = false;
-      helpEl.innerHTML = 'Required fields: name, phone, and SKU code. Header names like <code>Customer_Name</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.';
-      sampleEl.textContent = 'Customer_Name,Phone,sku_code\\nAli,6738123456,PY1\\nSiti,6738889999,SS2\\nCustomer Name,159932368347158@lid,PY1';
+      helpEl.innerHTML = 'Required fields: number and SKU code. Header names like <code>number</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.';
     }
     function renderImportOptions() {
       const stages = importData.stages || [];
       stageEl.innerHTML = '<option value="">Select current stage</option>' + stages.map(stage =>
         '<option value="' + esc(stage.key) + '">' + esc(stage.label || stage.key) + '</option>'
       ).join("");
-      const products = (importData.products || []).filter(product => product.skuCode);
-      skuReferenceEl.innerHTML = products.length
-        ? products.map(product => '<span class="pill">' + esc(product.skuCode) + ' - ' + esc(product.name || product.id) + '</span>').join("")
-        : '<span class="muted">No product SKU codes configured yet.</span>';
       syncModeHelp();
     }
     function renderPreview(preview, result = null) {
