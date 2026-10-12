@@ -59,6 +59,7 @@ import {
   hasOpeningFlowAlreadySent,
   sameProductAdReentryPatch,
 } from "./lib/opening_flow_handler.mjs";
+import { customerHasActiveFreshAdJourney } from "./lib/customer_state.mjs";
 import {
   customerOrderStatusReply,
   deliveryRescheduleReply,
@@ -139,6 +140,9 @@ const config = {
   postgresTable: getEnv("WHATSAPP_POSTGRES_TABLE", "json_documents"),
   followupQueueTableEnabled: parseBool(getEnv("WHATSAPP_FOLLOWUP_QUEUE_TABLE_ENABLED", "false")),
   followupQueueTableName: getEnv("WHATSAPP_FOLLOWUP_QUEUE_TABLE", "followup_dispatch_queue_rows"),
+  broadcastQueueTableEnabled: parseBool(getEnv("WHATSAPP_BROADCAST_QUEUE_TABLE_ENABLED", "true")),
+  broadcastCampaignsTableName: getEnv("WHATSAPP_BROADCAST_CAMPAIGNS_TABLE", "broadcast_campaigns"),
+  broadcastQueueTableName: getEnv("WHATSAPP_BROADCAST_QUEUE_TABLE", "broadcast_dispatch_queue_rows"),
   outboxTableEnabled: parseBool(getEnv("WHATSAPP_OUTBOX_TABLE_ENABLED", "false")),
   outboxTableName: getEnv("WHATSAPP_OUTBOX_TABLE", "outbox_messages"),
   customersTableEnabled: parseBool(getEnv("WHATSAPP_CUSTOMERS_TABLE_ENABLED", "false")),
@@ -224,6 +228,8 @@ const FOLLOWUP_EDITOR_STAGES = [
 ];
 const FOLLOWUP_MEDIA_MAX_BYTES = 30 * 1024 * 1024;
 const BROADCAST_MEDIA_MAX_BYTES = 30 * 1024 * 1024;
+const PRODUCT_FLOW_VIDEO_MAX_BYTES = 16 * 1024 * 1024;
+const FOLLOWUP_VOICE_NOTE_MAX_BYTES = 16 * 1024 * 1024;
 const FOLLOWUP_MEDIA_TYPES = new Map([
   ["image/jpeg", { extension: "jpg", type: "image" }],
   ["image/png", { extension: "png", type: "image" }],
@@ -231,6 +237,7 @@ const FOLLOWUP_MEDIA_TYPES = new Map([
   ["video/mp4", { extension: "mp4", type: "video" }],
   ["video/webm", { extension: "webm", type: "video" }],
   ["video/quicktime", { extension: "mov", type: "video" }],
+  ["audio/ogg", { extension: "ogg", type: "audio", voiceNote: true, mimeType: "audio/ogg; codecs=opus" }],
 ]);
 const CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const CHAT_VIDEO_MAX_BYTES = 16 * 1024 * 1024;
@@ -292,6 +299,9 @@ const postgresAdapter = config.storeBackend === "postgres"
       tableName: config.postgresTable,
       followupQueueTableEnabled: config.followupQueueTableEnabled,
       followupQueueTableName: config.followupQueueTableName,
+      broadcastQueueTableEnabled: config.broadcastQueueTableEnabled,
+      broadcastCampaignsTableName: config.broadcastCampaignsTableName,
+      broadcastQueueTableName: config.broadcastQueueTableName,
       outboxTableEnabled: config.outboxTableEnabled,
       outboxTableName: config.outboxTableName,
       customersTableEnabled: config.customersTableEnabled,
@@ -928,10 +938,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/admin/followup-settings/media") {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       const body = await readJsonBody(req);
-      const media = decodeUploadedFollowupMedia(body.dataUrl);
-      if (!media) return sendJson(res, 400, { error: "Please upload an image or video file." });
+      const media = decodeUploadedFollowupMedia(body.dataUrl, body.originalName);
+      if (!media) return sendJson(res, 400, { error: "Please upload an image, video, or OGG voice note file." });
       if (media.bytes.length > FOLLOWUP_MEDIA_MAX_BYTES) {
         return sendJson(res, 400, { error: "Media must be 30 MB or smaller." });
+      }
+      if (media.voiceNote && media.bytes.length > FOLLOWUP_VOICE_NOTE_MAX_BYTES) {
+        return sendJson(res, 400, { error: "Voice note must be 16 MB or smaller." });
       }
       const accountAssetId = safeAssetSegment(adminSession.accountId);
       const targetDirectory = path.join(config.assetsDir, accountAssetId, "followups");
@@ -940,17 +953,16 @@ const server = http.createServer(async (req, res) => {
       const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName))) || "followup";
       const assetKey = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${originalBase}`;
       const filename = `${assetKey}.${media.extension}`;
-      await savePersistedProductImageAsset(adminSession.accountId, "followups", assetKey, {
-        image: media,
-        originalName,
-      });
       await writeFile(path.join(targetDirectory, filename), media.bytes);
+      const mediaUrl = `/assets/${accountAssetId}/followups/${filename}`;
       return sendJson(res, 200, {
         block: {
           id: `block_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`,
           type: media.type,
-          url: persistedProductImageUrl(adminSession.accountId, "followups", assetKey, media.extension),
+          url: mediaUrl,
           caption: "",
+          voiceNote: Boolean(media.voiceNote),
+          mimeType: media.mimeType || "",
         },
       });
     }
@@ -1013,7 +1025,7 @@ const server = http.createServer(async (req, res) => {
       const adminSession = readSessionToken(parseCookies(req.headers.cookie || "").wa_admin);
       try {
         const body = await readJsonBody(req);
-        const media = decodeUploadedFollowupMedia(body.dataUrl);
+        const media = decodeUploadedFollowupMedia(body.dataUrl, body.originalName);
         if (!media) return sendJson(res, 400, { error: "Please upload an image or video file." });
         if (media.bytes.length > BROADCAST_MEDIA_MAX_BYTES) {
           return sendJson(res, 400, { error: "Media must be 30 MB or smaller." });
@@ -1025,15 +1037,12 @@ const server = http.createServer(async (req, res) => {
         const targetDirectory = path.join(config.assetsDir, accountAssetId, "broadcasts");
         const filename = `${assetKey}.${media.extension}`;
         await mkdir(targetDirectory, { recursive: true });
-        await savePersistedProductImageAsset(adminSession.accountId, "broadcasts", assetKey, {
-          image: media,
-          originalName,
-        });
         await writeFile(path.join(targetDirectory, filename), media.bytes);
+        const mediaUrl = `/assets/${accountAssetId}/broadcasts/${filename}`;
         return sendJson(res, 200, {
           media: {
             type: media.type,
-            url: persistedProductImageUrl(adminSession.accountId, "broadcasts", assetKey, media.extension),
+            url: mediaUrl,
             originalName,
           },
         });
@@ -2015,44 +2024,46 @@ const server = http.createServer(async (req, res) => {
         product.opening_flow_blocks = existingBlocks;
         product.opening_flow = buildProductOpeningFlowFromBlocks(product.opening_flow_blocks);
       }
-      const slot = productFlowImageSlotForUpload(product, body.slot);
-      if (!slot) return sendJson(res, 400, { error: "Unknown image slot." });
-      const image = decodeUploadedImage(body.dataUrl);
-      if (!image) return sendJson(res, 400, { error: "Please upload a PNG, JPG, or WEBP image." });
-      if (image.bytes.length > 10 * 1024 * 1024) {
+      const originalName = String(body.originalName || "").trim();
+      const slot = productFlowMediaSlotForUpload(product, body.slot);
+      if (!slot) return sendJson(res, 400, { error: "Unknown media slot." });
+      const media = decodeUploadedProductFlowMedia(body.dataUrl, originalName);
+      if (!media) return sendJson(res, 400, { error: "Please upload a PNG, JPG, WEBP, MP4, or OGG voice note file." });
+      if (media.type === "image" && media.bytes.length > 10 * 1024 * 1024) {
         return sendJson(res, 400, { error: "Image must be 10 MB or smaller." });
+      }
+      if (media.type === "video" && media.bytes.length > PRODUCT_FLOW_VIDEO_MAX_BYTES) {
+        return sendJson(res, 400, { error: "Video must be 16 MB or smaller." });
+      }
+      if (media.type === "audio" && media.bytes.length > FOLLOWUP_VOICE_NOTE_MAX_BYTES) {
+        return sendJson(res, 400, { error: "Voice note must be 16 MB or smaller." });
       }
       const accountAssetId = safeAssetSegment(adminSession.accountId);
       const productAssetId = safeAssetSegment(product.id);
       const targetDirectory = path.join(config.assetsDir, accountAssetId, productAssetId);
       await mkdir(targetDirectory, { recursive: true });
-      const originalName = String(body.originalName || "").trim();
       const originalBase = safeAssetSegment(path.basename(originalName, path.extname(originalName)));
-      const filename = originalBase && !["file", "image", "blob"].includes(originalBase)
-        ? `${slot.filename}-${originalBase}.${image.extension}`
-        : `${slot.filename}.${image.extension}`;
-      await writeFile(path.join(targetDirectory, filename), image.bytes);
+      const filename = originalBase && !["file", "image", "video", "blob"].includes(originalBase)
+        ? `${slot.filename}-${originalBase}.${media.extension}`
+        : `${slot.filename}.${media.extension}`;
+      await writeFile(path.join(targetDirectory, filename), media.bytes);
       const assetUrl = `/assets/${accountAssetId}/${productAssetId}/${filename}`;
-      const durableUrl = persistedProductImageUrl(adminSession.accountId, product.id, slot.key, image.extension);
-      const mediaKey = await savePersistedProductImageAsset(adminSession.accountId, product.id, slot.key, {
-        image,
-        originalName,
-      });
       persistProductFlowImage(product, slot, {
-        image,
-        mediaKey,
+        image: media,
         originalName,
         assetUrl,
-        durableUrl,
+        durableUrl: assetUrl,
       });
-      updateProductFlowImage(product, slot, durableUrl);
-      const extraction = await ingestProductImageKnowledge(product, {
-        slot,
-        assetUrl: durableUrl,
-        originalName,
-        dataUrl: body.dataUrl,
-        businessAccountId: adminSession.accountId,
-      });
+      updateProductFlowMedia(product, slot, assetUrl, media.type);
+      const extraction = media.type === "image"
+        ? await ingestProductImageKnowledge(product, {
+            slot,
+            assetUrl,
+            originalName,
+            dataUrl: body.dataUrl,
+            businessAccountId: adminSession.accountId,
+          })
+        : { status: "skipped", reason: "Media upload saved; image knowledge extraction applies only to images." };
       await saveTeamContent(adminSession.accountId, content);
       return sendJson(res, 200, { product: productFlowEditorData(product), extraction });
     }
@@ -2211,6 +2222,7 @@ if (req.method === "GET" && url.pathname === "/admin/customer/export") {
         salesStatus: "",
         anotherDatePurchaseDate: "",
         anotherDatePurchaseText: "",
+        freshAdJourney: null,
         followupBlocked: true,
         followupBlockedReason: "order_submitted",
       }), adminSession.accountId);
@@ -4346,7 +4358,7 @@ async function processInboundMessageCore({
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
-      ...(openingFlowDecision.sameProductAdReentry ? sameProductAdReentryPatch(openingFlowSentAt) : {}),
+      ...(openingFlowDecision.sameProductAdReentry ? sameProductAdReentryPatch(openingFlowSentAt, product.id) : {}),
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt: openingFlowSentAt },
@@ -4521,7 +4533,7 @@ async function handleOpeningFlowOnlyRoute({
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
-      ...(openingFlowDecision.sameProductAdReentry ? sameProductAdReentryPatch(openingFlowSentAt) : {}),
+      ...(openingFlowDecision.sameProductAdReentry ? sameProductAdReentryPatch(openingFlowSentAt, product.id) : {}),
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt: openingFlowSentAt },
@@ -5935,6 +5947,7 @@ async function submitOrderFromDraft(customer, product, orderDraft, rawMessage = 
     handoffReason: "Customer submitted complete order details.",
     handoffSeverity: handoffSeverityForReason("Customer submitted complete order details.", "order"),
     status: "order_submitted",
+    freshAdJourney: null,
     followupBlocked: true,
     followupBlockedReason: "order_submitted",
   }), businessAccountId);
@@ -6234,7 +6247,7 @@ async function sendCustomerFollowupNow(customerId, options = {}) {
   if (!customer) {
     return { sent: false, customerId: id, skipped: "customer_not_found" };
   }
-  if ((customer.orderIds || []).length > 0) {
+  if ((customer.orderIds || []).length > 0 && !customerHasActiveFreshAdJourney(customer)) {
     return { sent: false, customerId: id, skipped: "order_submitted" };
   }
   if (customer.optedOut) {
@@ -6371,7 +6384,7 @@ function flowsOnlyOpeningPlan(plan = {}, openingFlowDecision = {}, openingFlowGa
   const customerPatch = {
     productId: productId || patch.productId || "",
   };
-  for (const key of ["label", "labelDisplay", "followupsSent", "followupBlocked", "followupBlockedReason", "productJourneyResetAt"]) {
+  for (const key of ["label", "labelDisplay", "freshAdJourney", "followupsSent", "followupBlocked", "followupBlockedReason", "productJourneyResetAt"]) {
     if (Object.hasOwn(patch, key)) customerPatch[key] = patch[key];
   }
   if (openingFlowGate.queued && patch.pendingOpeningFlow) {
@@ -6515,7 +6528,7 @@ async function runPendingOpeningFlows(now = new Date(), { respectOperationalCont
       openingFlowInProgressAt: "",
       openingFlowFailedAt: "",
       openingFlowFailureReason: "",
-      ...(pending.sameProductAdReentry ? sameProductAdReentryPatch(sentAt) : {}),
+      ...(pending.sameProductAdReentry ? sameProductAdReentryPatch(sentAt, product.id) : {}),
       openingFlowsSent: {
         ...(currentCustomer.openingFlowsSent && typeof currentCustomer.openingFlowsSent === "object" ? currentCustomer.openingFlowsSent : {}),
         [product.id]: { sentAt },
@@ -6552,7 +6565,12 @@ async function enqueueOpeningFlowFollowups({
   queuedAt = new Date(),
 } = {}) {
   if (!customer?.id || !product?.id) return [];
-  if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked || customer.handoffStatus === "human_required") {
+  if (
+    ((customer.orderIds || []).length > 0 && !customerHasActiveFreshAdJourney(customer)) ||
+    customer.optedOut ||
+    customer.followupBlocked ||
+    customer.handoffStatus === "human_required"
+  ) {
     return [];
   }
   const sequence = productFollowupSequence(product);
@@ -6682,7 +6700,7 @@ async function getDueFollowupsForTeams(now = new Date()) {
       due.push(anotherDateItem);
       continue;
     }
-    if ((customer.orderIds || []).length > 0 || customer.optedOut || customer.followupBlocked) continue;
+    if (((customer.orderIds || []).length > 0 && !customerHasActiveFreshAdJourney(customer)) || customer.optedOut || customer.followupBlocked) continue;
     if (customer.pendingUpsell) continue;
     if (customer.pendingOrder && !isPendingOrderReminderExhausted(customer)) continue;
     const sequence = productFollowupSequence(product);
@@ -6789,7 +6807,13 @@ async function dispatchFollowupQueue(now = new Date()) {
       });
       continue;
     }
-    if (!customer || (customer.orderIds || []).length > 0 || customer.optedOut || customer.handoffStatus === "human_required" || (customer.followupBlocked && !specialAnotherDateFollowup)) {
+    if (
+      !customer ||
+      ((customer.orderIds || []).length > 0 && !customerHasActiveFreshAdJourney(customer)) ||
+      customer.optedOut ||
+      customer.handoffStatus === "human_required" ||
+      (customer.followupBlocked && !specialAnotherDateFollowup)
+    ) {
       updateDispatch(item.id, {
         status: "cancelled",
         lastError: !customer ? "Customer no longer exists." : "Customer no longer eligible for follow-up.",
@@ -8128,7 +8152,7 @@ function selectBroadcastRecipients(customers = [], body = {}) {
   }
   return {
     count: recipients.length,
-    recipients: recipients.slice(0, 500),
+    recipients,
     unmatched,
     audience,
   };
@@ -9022,7 +9046,7 @@ function guardrailDisplay(customer, now = new Date()) {
 
 function followupGuardrailStatus(customer, now = new Date()) {
   if (customer.optedOut) return { blocked: true, reason: "opted_out" };
-  if ((customer.orderIds || []).length > 0) return { blocked: true, reason: "order_submitted" };
+  if ((customer.orderIds || []).length > 0 && !customerHasActiveFreshAdJourney(customer)) return { blocked: true, reason: "order_submitted" };
   const salesStatus = String(customer.salesStatus || "").trim().toLowerCase();
   const conversationState = String(customer.conversationState || "").trim().toLowerCase();
   const followupBlockedReason = String(customer.followupBlockedReason || "").trim().toLowerCase();
@@ -9048,7 +9072,7 @@ function buildFollowupRows(customers, productById, now, queueItems = []) {
   return customers.map((customer) => {
     const product = productById.get(customer.productId);
     const sent = customer.followupsSent || {};
-    const hasOrder = (customer.orderIds || []).length > 0;
+    const hasOrder = (customer.orderIds || []).length > 0 && !customerHasActiveFreshAdJourney(customer);
     const followups = productFollowupSequence(product);
     const nextItem = currentFollowupStage(customer, followups, now);
     let nextFollowup = nextItem?.key || "";
@@ -9791,7 +9815,7 @@ function normalizeFollowupMessageBlocks(blocks, fallbackMessage = "") {
 function normalizeFollowupMessageBlock(block = {}, index = 0) {
   const type = String(block.type || "text").trim().toLowerCase();
   const id = String(block.id || `block_${Date.now()}_${index}`).trim();
-  if (type === "image" || type === "video") {
+  if (type === "image" || type === "video" || type === "audio") {
     const url = String(block.url || "").trim();
     if (!url) return null;
     return {
@@ -9799,6 +9823,8 @@ function normalizeFollowupMessageBlock(block = {}, index = 0) {
       type,
       url,
       caption: String(block.caption || "").trim(),
+      voiceNote: Boolean(block.voiceNote || block.voice_note),
+      mimeType: String(block.mimeType || block.mime_type || "").trim(),
     };
   }
   const body = String(block.body || block.message || block.text || "").trim();
@@ -9817,6 +9843,14 @@ function followupOutboundMessages(followup = {}) {
   return normalizeFollowupMessageBlocks(followup.messages, followup.message).map((message) => {
     if (message.type === "image" || message.type === "video") {
       return { type: message.type, url: message.url, caption: message.caption || "" };
+    }
+    if (message.type === "audio") {
+      return {
+        type: "audio",
+        url: message.url,
+        voiceNote: Boolean(message.voiceNote),
+        mimeType: message.mimeType || "",
+      };
     }
     return textMessage(message.body);
   });
@@ -10377,6 +10411,7 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
   if (image && message.caption) image.caption = message.caption;
   const video = message.type === "video" ? { link: resolveMediaUrl(message.url, "Video") } : null;
   if (video && message.caption) video.caption = message.caption;
+  const audio = message.type === "audio" ? { link: resolveMediaUrl(message.url, "Audio") } : null;
   const payload =
     message.type === "image"
       ? {
@@ -10391,6 +10426,13 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
           to,
           type: "video",
           video,
+        }
+      : message.type === "audio"
+      ? {
+          messaging_product: "whatsapp",
+          to,
+          type: "audio",
+          audio,
         }
       : message.type === "template"
       ? {
@@ -10443,7 +10485,7 @@ async function sendWhatsAppMessage(to, message, meta = {}) {
 }
 
 async function messageForWebTransport(message = {}, accountId = config.accountId) {
-  if (message.type !== "image" && message.type !== "video") return message;
+  if (message.type !== "image" && message.type !== "video" && message.type !== "audio") return message;
   return {
     ...message,
     url: await resolveWebMediaPath(message.url, accountId),
@@ -13003,23 +13045,30 @@ function normalizeOpeningFlowBlocks(blocks, editorData = {}) {
   const imageByKey = new Map((editorData.images || []).map((image) => [image.key, image]));
   return (Array.isArray(blocks) ? blocks : [])
     .map((block, index) => {
-      const type = block?.type === "image" ? "image" : "text";
+      const rawType = String(block?.type || "").trim();
+      const type = rawType === "image" || rawType === "video" || rawType === "audio" ? rawType : "text";
       const id = safeOpeningFlowBlockId(block?.id || `${type}_${Date.now()}_${index + 1}`);
-      const label = String(block?.label || (type === "image" ? "Image block" : "Text block")).trim().slice(0, 120);
+      const label = String(block?.label || (type === "text" ? "Text block" : `${type[0].toUpperCase()}${type.slice(1)} block`)).trim().slice(0, 120);
       const enabled = block?.enabled !== false;
-      if (type === "image") {
+      if (type === "image" || type === "video" || type === "audio") {
         const imageKey = String(block?.imageKey || block?.slot || "").trim();
         const image = imageByKey.get(imageKey) || {};
         const url = String(block?.url || image.url || "").trim();
-        return {
+        const normalized = {
           id,
           type,
           label,
           imageKey,
           url,
-          caption: String(block?.caption || "").trim(),
           enabled,
         };
+        if (type === "audio") {
+          normalized.voiceNote = block?.voiceNote !== false;
+          normalized.mimeType = String(block?.mimeType || block?.mime_type || "audio/ogg; codecs=opus").trim();
+        } else {
+          normalized.caption = String(block?.caption || "").trim();
+        }
+        return normalized;
       }
       return {
         id,
@@ -13029,7 +13078,7 @@ function normalizeOpeningFlowBlocks(blocks, editorData = {}) {
         enabled,
       };
     })
-    .filter((block) => block.type === "image" || block.body);
+    .filter((block) => block.type === "image" || block.type === "video" || block.type === "audio" || block.body);
 }
 
 function safeOpeningFlowBlockId(value) {
@@ -13167,14 +13216,20 @@ function updateProductFlowText(product, body) {
 }
 
 function updateProductFlowImage(product, slot, assetUrl) {
+  return updateProductFlowMedia(product, slot, assetUrl, "image");
+}
+
+function updateProductFlowMedia(product, slot, assetUrl, mediaType = "image") {
   const current = productFlowEditorData(product);
-  current.images = current.images.map((image) =>
-    image.key === slot.key ? { ...image, url: assetUrl } : image
-  );
-  if (slot.key === "salesPhoto") product.sales_photo_url = assetUrl;
+  if (mediaType === "image") {
+    current.images = current.images.map((image) =>
+      image.key === slot.key ? { ...image, url: assetUrl } : image
+    );
+    if (slot.key === "salesPhoto") product.sales_photo_url = assetUrl;
+  }
   if (Array.isArray(product.opening_flow_blocks)) {
     product.opening_flow_blocks = normalizeOpeningFlowBlocks(product.opening_flow_blocks.map((block) =>
-      block.imageKey === slot.key ? { ...block, url: assetUrl, enabled: true } : block
+      block.imageKey === slot.key ? { ...block, type: mediaType, url: assetUrl, enabled: true } : block
     ), current);
     product.opening_flow = buildProductOpeningFlowFromBlocks(product.opening_flow_blocks);
   } else {
@@ -13187,18 +13242,27 @@ function updateProductFlowImage(product, slot, assetUrl) {
   updateProductFlowReadiness(product);
 }
 
+function productFlowMediaSlotForUpload(product, slotKey) {
+  return productFlowImageSlotForUpload(product, slotKey) || productFlowCustomMediaSlotForUpload(product, slotKey);
+}
+
 function productFlowImageSlotForUpload(product, slotKey) {
   const key = String(slotKey || "").trim();
   const standard = PRODUCT_FLOW_IMAGE_SLOTS.find((item) => item.key === key);
   if (standard) return standard;
+  return productFlowCustomMediaSlotForUpload(product, key);
+}
+
+function productFlowCustomMediaSlotForUpload(product, slotKey) {
+  const key = String(slotKey || "").trim();
   const block = Array.isArray(product.opening_flow_blocks)
-    ? product.opening_flow_blocks.find((item) => item?.type === "image" && item.imageKey === key)
+    ? product.opening_flow_blocks.find((item) => ["image", "video", "audio"].includes(item?.type) && item.imageKey === key)
     : null;
   if (!block) return null;
   return {
     key,
-    label: String(block.label || "Opening flow image"),
-    filename: safeAssetSegment(key || block.id || "opening-flow-image"),
+    label: String(block.label || "Opening flow media"),
+    filename: safeAssetSegment(key || block.id || "opening-flow-media"),
   };
 }
 
@@ -13693,10 +13757,20 @@ function buildProductOpeningFlowFromBlocks(blocks) {
   return normalizeOpeningFlowBlocks(blocks)
     .filter((block) => block.enabled !== false)
     .map((block) => {
-      if (block.type === "image") {
+      if (block.type === "image" || block.type === "video") {
         const url = String(block.url || "").trim();
         if (!url) return null;
-        return { type: "image", url, caption: String(block.caption || "") };
+        return { type: block.type, url, caption: String(block.caption || "") };
+      }
+      if (block.type === "audio") {
+        const url = String(block.url || "").trim();
+        if (!url) return null;
+        return {
+          type: "audio",
+          url,
+          voiceNote: block.voiceNote !== false,
+          mimeType: block.mimeType || "audio/ogg; codecs=opus",
+        };
       }
       const body = String(block.body || "").trim();
       return body ? textMessage(body) : null;
@@ -13818,16 +13892,52 @@ function decodeUploadedImage(dataUrl) {
   return decodePersistedImageDataUrl(dataUrl);
 }
 
-function decodeUploadedFollowupMedia(dataUrl) {
+function decodeUploadedProductFlowMedia(dataUrl, originalName = "") {
+  const image = decodePersistedImageDataUrl(dataUrl);
+  if (image) return { ...image, type: "image" };
+  const audio = decodeUploadedVoiceNote(dataUrl, originalName);
+  if (audio?.type === "audio") return audio;
+  const match = String(dataUrl || "").match(/^data:(video\/mp4);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!match) return null;
+  return {
+    type: "video",
+    mimeType: match[1].toLowerCase(),
+    extension: "mp4",
+    bytes: Buffer.from(match[2].replace(/\s/g, ""), "base64"),
+  };
+}
+
+function decodeUploadedVoiceNote(dataUrl, originalName = "") {
   const match = /^data:([^;]+);base64,(.+)$/i.exec(String(dataUrl || ""));
   if (!match) return null;
-  const mimeType = match[1].toLowerCase();
+  const sourceMimeType = match[1].toLowerCase();
+  const originalExt = path.extname(String(originalName || "")).toLowerCase();
+  const mimeType = sourceMimeType === "application/octet-stream" && originalExt === ".ogg"
+    ? "audio/ogg"
+    : sourceMimeType;
+  const mediaType = FOLLOWUP_MEDIA_TYPES.get(mimeType);
+  if (mediaType?.type !== "audio") return null;
+  return {
+    ...mediaType,
+    mimeType: mediaType.mimeType || mimeType,
+    bytes: Buffer.from(match[2].replace(/\s/g, ""), "base64"),
+  };
+}
+
+function decodeUploadedFollowupMedia(dataUrl, originalName = "") {
+  const match = /^data:([^;]+);base64,(.+)$/i.exec(String(dataUrl || ""));
+  if (!match) return null;
+  const sourceMimeType = match[1].toLowerCase();
+  const originalExt = path.extname(String(originalName || "")).toLowerCase();
+  const mimeType = sourceMimeType === "application/octet-stream" && originalExt === ".ogg"
+    ? "audio/ogg"
+    : sourceMimeType;
   const mediaType = FOLLOWUP_MEDIA_TYPES.get(mimeType);
   if (!mediaType) return null;
   return {
     ...mediaType,
-    mimeType,
-    bytes: Buffer.from(match[2], "base64"),
+    mimeType: mediaType.mimeType || mimeType,
+    bytes: Buffer.from(match[2].replace(/\s/g, ""), "base64"),
   };
 }
 
@@ -14870,10 +14980,14 @@ function broadcastPageHtml() {
     .settings-head h3 { margin:0; font-size:15px; }
     .settings-head p { margin:4px 0 0; color:var(--muted); font-size:13px; line-height:1.35; }
     .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+    .batch-grid { display:grid; grid-template-columns:minmax(160px,.55fr) minmax(180px,.7fr) minmax(280px,1.2fr); gap:12px; align-items:end; }
+    .quick-buttons { display:flex; flex-wrap:wrap; gap:7px; }
+    .quick-buttons button { padding:7px 9px; font-size:12px; }
+    .batch-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
     .hidden { display:none !important; }
     .customer-list { border:1px solid #e5e5ea; border-radius:8px; overflow:hidden; }
     .empty { padding:16px; color:var(--muted); font-size:13px; }
-    @media (max-width:900px) { main { padding:14px; } .split, .audience-layout, .filter-grid { grid-template-columns:1fr; } }
+    @media (max-width:900px) { main { padding:14px; } .split, .audience-layout, .filter-grid, .batch-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -14966,6 +15080,30 @@ function broadcastPageHtml() {
           <label>Paste Phone Numbers or @lid IDs
             <textarea id="pasted-recipients" placeholder="6738123456&#10;159932368347158@lid"></textarea>
           </label>
+        </div>
+        <div class="panel">
+          <p class="panel-title">Batch selection</p>
+          <div class="batch-grid">
+            <label>Batch Size
+              <input id="batch-size" type="number" min="1" max="1000" value="150" />
+            </label>
+            <label>Batch
+              <select id="batch-index"></select>
+            </label>
+            <div class="batch-actions">
+              <button id="select-batch" type="button">Select Batch</button>
+              <button id="add-batch" type="button">Add Batch</button>
+              <button id="select-all-filtered" type="button">Select All Filtered</button>
+            </div>
+          </div>
+          <div class="quick-buttons" aria-label="Batch size shortcuts">
+            <button type="button" data-batch-size="50">50</button>
+            <button type="button" data-batch-size="100">100</button>
+            <button type="button" data-batch-size="150">150</button>
+            <button type="button" data-batch-size="200">200</button>
+          </div>
+          <label class="check"><input id="exclude-broadcasted-today" type="checkbox" checked /> Exclude customers already sent a broadcast today</label>
+          <div class="muted" id="batch-summary">Choose filters to build batches.</div>
         </div>
       </div>
       <div class="summary" id="audience-summary"><span class="pill">Loading customers...</span></div>
@@ -15198,6 +15336,64 @@ function broadcastPageHtml() {
       const filters = audienceFilters();
       return (data.customers || []).filter(customer => customerMatchesAudience(customer, filters));
     }
+    function localDateKey(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      return [
+        date.getFullYear(),
+        String(date.getMonth() + 1).padStart(2, "0"),
+        String(date.getDate()).padStart(2, "0")
+      ].join("-");
+    }
+    function broadcastedTodayCustomerIds() {
+      const today = localDateKey(new Date());
+      const sent = new Set();
+      for (const item of data.broadcastQueue || []) {
+        if (String(item.status || "") !== "sent") continue;
+        if (localDateKey(item.sentAt || item.updatedAt) !== today) continue;
+        const customerId = String(item.customerId || item.to || "");
+        if (customerId) sent.add(customerId);
+      }
+      return sent;
+    }
+    function batchCandidates() {
+      const excluded = document.querySelector("#exclude-broadcasted-today").checked
+        ? broadcastedTodayCustomerIds()
+        : new Set();
+      return filteredCustomers().filter(customer => !excluded.has(customer.id));
+    }
+    function batchSize() {
+      const value = Number(document.querySelector("#batch-size").value || 150);
+      return Number.isFinite(value) && value > 0 ? Math.min(1000, Math.floor(value)) : 150;
+    }
+    function renderBatchControls() {
+      const select = document.querySelector("#batch-index");
+      const size = batchSize();
+      const candidates = batchCandidates();
+      const count = Math.max(1, Math.ceil(candidates.length / size));
+      const current = Math.min(Number(select.value || 0), count - 1);
+      select.innerHTML = Array.from({ length: count }, (_, index) => {
+        const start = index * size + 1;
+        const end = Math.min(candidates.length, (index + 1) * size);
+        const label = candidates.length ? "Batch " + (index + 1) + ": " + start + "-" + end : "No eligible batch";
+        return '<option value="' + index + '"' + (index === current ? ' selected' : '') + '>' + esc(label) + '</option>';
+      }).join("");
+      const excludedCount = document.querySelector("#exclude-broadcasted-today").checked ? broadcastedTodayCustomerIds().size : 0;
+      document.querySelector("#batch-summary").textContent =
+        candidates.length + " eligible customer(s), " + count + " batch(es), " + selectedIds.size + " selected" +
+        (excludedCount ? ". Excluding " + excludedCount + " already sent today." : ".");
+    }
+    function selectBatchCustomers({ append = false } = {}) {
+      const candidates = batchCandidates();
+      const size = batchSize();
+      const index = Number(document.querySelector("#batch-index").value || 0);
+      const batch = candidates.slice(index * size, (index + 1) * size);
+      if (!append) selectedIds = new Set();
+      for (const customer of batch) selectedIds.add(customer.id);
+      latestPreview = null;
+      document.querySelector("#create-broadcast").disabled = true;
+      renderCustomers();
+    }
     function renderCustomers() {
       const filtered = filteredCustomers();
       const customers = filtered.slice(0, 300);
@@ -15212,6 +15408,7 @@ function broadcastPageHtml() {
       document.querySelector("#customer-table").innerHTML = customers.length ? '<table><thead><tr><th></th><th>Phone</th><th>Name</th><th>Product</th><th>Stage</th><th>Status</th><th>Last Message</th></tr></thead><tbody>' +
         customers.map(customer => '<tr><td><input type="checkbox" data-id="' + esc(customer.id) + '"' + (selectedIds.has(customer.id) ? ' checked' : '') + ' /></td><td>' + esc(customer.phone || customer.id) + '<br><span class="muted">' + esc(customer.id) + '</span></td><td>' + esc(customer.name || '') + '</td><td>' + esc([customer.skuCode, customer.product].filter(Boolean).join(" - ")) + '</td><td>' + esc(customer.labelDisplay || '') + '</td><td>' + esc(customer.optedOut ? 'opted out' : customer.status || '') + '</td><td>' + esc(fmt(customer.lastMessageAt)) + '</td></tr>').join("") +
         '</tbody></table>' : '<div class="empty">No customers match this audience.</div>';
+      renderBatchControls();
       document.querySelectorAll("#customer-table input[data-id]").forEach(input => input.addEventListener("change", () => {
         if (input.checked) selectedIds.add(input.dataset.id);
         else selectedIds.delete(input.dataset.id);
@@ -15230,6 +15427,14 @@ function broadcastPageHtml() {
     }
     function clearSelectedCustomers() {
       selectedIds = new Set();
+      latestPreview = null;
+      document.querySelector("#create-broadcast").disabled = true;
+      renderCustomers();
+    }
+    function selectAllBatchCandidates() {
+      for (const customer of batchCandidates()) {
+        selectedIds.add(customer.id);
+      }
       latestPreview = null;
       document.querySelector("#create-broadcast").disabled = true;
       renderCustomers();
@@ -15389,6 +15594,18 @@ function broadcastPageHtml() {
     document.querySelector("#audience-preset").addEventListener("change", syncAudiencePreset);
     document.querySelector("#select-visible-customers").addEventListener("click", selectVisibleCustomers);
     document.querySelector("#clear-selected-customers").addEventListener("click", clearSelectedCustomers);
+    document.querySelector("#select-batch").addEventListener("click", () => selectBatchCustomers({ append: false }));
+    document.querySelector("#add-batch").addEventListener("click", () => selectBatchCustomers({ append: true }));
+    document.querySelector("#select-all-filtered").addEventListener("click", selectAllBatchCandidates);
+    document.querySelector("#batch-size").addEventListener("input", renderBatchControls);
+    document.querySelector("#batch-index").addEventListener("change", renderBatchControls);
+    document.querySelector("#exclude-broadcasted-today").addEventListener("change", renderBatchControls);
+    document.querySelectorAll("[data-batch-size]").forEach(button => {
+      button.addEventListener("click", () => {
+        document.querySelector("#batch-size").value = button.dataset.batchSize;
+        renderBatchControls();
+      });
+    });
     document.querySelectorAll("#product-filter,#stage-filter,#active-only,#include-submitted,#exclude-opted-out").forEach(element => {
       element.addEventListener("change", resetPreviewAndRenderCustomers);
       element.addEventListener("input", resetPreviewAndRenderCustomers);
@@ -19637,8 +19854,13 @@ function followupSettingsPageHtml() {
     function normalizeBlock(block) {
       if (!block || typeof block !== "object") return null;
       const type = String(block.type || "text").toLowerCase();
-      if (type === "image" || type === "video") {
-        return { id: block.id || blockId(), type, url: block.url || "", caption: block.caption || "" };
+      if (type === "image" || type === "video" || type === "audio") {
+        const normalized = { id: block.id || blockId(), type, url: block.url || "", caption: block.caption || "" };
+        if (type === "audio") {
+          normalized.voiceNote = block.voiceNote !== false;
+          normalized.mimeType = block.mimeType || "audio/ogg; codecs=opus";
+        }
+        return normalized;
       }
       return { id: block.id || blockId(), type: "text", body: block.body || block.message || "" };
     }
@@ -19690,6 +19912,7 @@ function followupSettingsPageHtml() {
           '<button type="button" data-add-block="text">Add Text</button>' +
           '<button type="button" data-add-block="image">Add Image</button>' +
           '<button type="button" data-add-block="video">Add Video</button>' +
+          '<button type="button" data-add-block="audio">Add Voice Note</button>' +
         '</div>' +
       '</article>';
     }
@@ -19708,6 +19931,15 @@ function followupSettingsPageHtml() {
           '<video class="media-preview" controls src="' + esc(block.url) + '"></video>' +
           '<input data-block-field="url" type="hidden" value="' + esc(block.url) + '" />' +
           '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' +
+        '</div>';
+      }
+      if (block.type === "audio") {
+        return '<div class="block" data-block-id="' + esc(block.id) + '" data-block-type="audio">' +
+          '<div class="block-head"><span>Voice Note</span><button class="danger" type="button" data-remove-block>Remove</button></div>' +
+          '<audio class="media-preview" controls src="' + esc(block.url) + '"></audio>' +
+          '<input data-block-field="url" type="hidden" value="' + esc(block.url) + '" />' +
+          '<input data-block-field="voiceNote" type="hidden" value="' + (block.voiceNote === false ? "false" : "true") + '" />' +
+          '<input data-block-field="mimeType" type="hidden" value="' + esc(block.mimeType || "audio/ogg; codecs=opus") + '" />' +
         '</div>';
       }
       return '<div class="block" data-block-id="' + esc(block.id) + '" data-block-type="text">' +
@@ -19772,13 +20004,17 @@ function followupSettingsPageHtml() {
         bindStageButtons();
         return;
       }
-      mediaInput.accept = type === "image" ? "image/png,image/jpeg,image/webp" : "video/mp4,video/webm,video/quicktime";
+      mediaInput.accept = type === "image"
+        ? "image/png,image/jpeg,image/webp"
+        : type === "audio"
+          ? "audio/ogg,.ogg"
+          : "video/mp4,video/webm,video/quicktime";
       mediaInput.onchange = async () => {
         const file = mediaInput.files && mediaInput.files[0];
         mediaInput.value = "";
         if (!file) return;
         const state = document.querySelector("#save-state");
-        state.textContent = "Uploading " + type + "...";
+        state.textContent = "Uploading " + (type === "audio" ? "voice note" : type) + "...";
         const dataUrl = await new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result);
@@ -19815,6 +20051,15 @@ function followupSettingsPageHtml() {
               type,
               url: block.querySelector('[data-block-field="url"]').value,
               caption: block.querySelector('[data-block-field="caption"]').value
+            };
+          }
+          if (type === "audio") {
+            return {
+              id: block.dataset.blockId,
+              type,
+              url: block.querySelector('[data-block-field="url"]').value,
+              voiceNote: block.querySelector('[data-block-field="voiceNote"]')?.value !== "false",
+              mimeType: block.querySelector('[data-block-field="mimeType"]')?.value || "audio/ogg; codecs=opus"
             };
           }
           return {
@@ -20277,6 +20522,8 @@ function productFlowPageHtml() {
             <div class="toolbar-tools">
               <button id="add-text-block" type="button">Add Text Block</button>
               <button id="add-image-block" type="button">Add Image Block</button>
+              <button id="add-video-block" type="button">Add Video Block</button>
+              <button id="add-audio-block" type="button">Add Voice Note Block</button>
             </div>
           </div>
           <div class="flow-block-list" id="opening-flow-blocks"></div>
@@ -20546,14 +20793,24 @@ function productFlowPageHtml() {
 
     function blockHtml(block, index) {
       const disabled = block.enabled === false;
-      const type = block.type === "image" ? "image" : "text";
+      const type = block.type === "image" || block.type === "video" || block.type === "audio" ? block.type : "text";
       const preview = type === "image" && block.url
         ? '<img class="image-preview" src="' + esc(block.url) + '" alt="' + esc(block.label || "Opening flow image") + '" />'
+        : type === "video" && block.url
+          ? '<video class="image-preview" src="' + esc(block.url) + '" controls muted playsinline></video>'
+          : type === "audio" && block.url
+            ? '<audio class="image-preview" src="' + esc(block.url) + '" controls></audio>'
         : '';
-      const content = type === "image"
-        ? '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' +
-          '<div><div class="image-url">' + esc(block.url || "No image uploaded for this block yet") + '</div>' + preview +
-          '<input type="file" accept="image/png,image/jpeg,image/webp" data-block-image-upload data-slot="' + esc(block.imageKey || block.id) + '" /></div>'
+      const mediaAccept = type === "audio" ? "audio/ogg,.ogg" : (type === "video" ? "video/mp4" : "image/png,image/jpeg,image/webp");
+      const mediaLabel = type === "audio" ? "voice note" : type;
+      const mediaUpload = '<div><div class="image-url">' + esc(block.url || ("No " + mediaLabel + " uploaded for this block yet")) + '</div>' + preview +
+          '<input type="file" accept="' + mediaAccept + '" data-block-media-upload data-slot="' + esc(block.imageKey || block.id) + '" /></div>';
+      const content = type === "image" || type === "video"
+        ? '<label>Caption<textarea data-block-field="caption">' + esc(block.caption || "") + '</textarea></label>' + mediaUpload
+        : type === "audio"
+          ? mediaUpload +
+            '<input type="hidden" data-block-field="voiceNote" value="' + (block.voiceNote === false ? "false" : "true") + '" />' +
+            '<input type="hidden" data-block-field="mimeType" value="' + esc(block.mimeType || "audio/ogg; codecs=opus") + '" />'
         : '<label>Message<textarea data-block-field="body">' + esc(block.body || "") + '</textarea></label>';
       return '<div class="flow-block' + (disabled ? ' disabled' : '') + '" data-block-index="' + index + '">' +
         '<div class="flow-block-head">' +
@@ -20593,8 +20850,8 @@ function productFlowPageHtml() {
           selectedProduct.openingFlowBlocks.splice(index, 1);
           renderOpeningFlowBlocks();
         });
-        const imageInput = card.querySelector("[data-block-image-upload]");
-        if (imageInput) imageInput.addEventListener("change", uploadImage);
+        const mediaInput = card.querySelector("[data-block-media-upload]");
+        if (mediaInput) mediaInput.addEventListener("change", uploadImage);
       });
     }
 
@@ -20637,6 +20894,39 @@ function productFlowPageHtml() {
       renderOpeningFlowBlocks();
     }
 
+    function addVideoBlock() {
+      if (!selectedProduct) return;
+      const id = "custom_video_" + Date.now();
+      selectedProduct.openingFlowBlocks = selectedProduct.openingFlowBlocks || [];
+      selectedProduct.openingFlowBlocks.push({
+        id,
+        type: "video",
+        label: "Custom video",
+        imageKey: id,
+        url: "",
+        caption: "",
+        enabled: true
+      });
+      renderOpeningFlowBlocks();
+    }
+
+    function addAudioBlock() {
+      if (!selectedProduct) return;
+      const id = "custom_audio_" + Date.now();
+      selectedProduct.openingFlowBlocks = selectedProduct.openingFlowBlocks || [];
+      selectedProduct.openingFlowBlocks.push({
+        id,
+        type: "audio",
+        label: "Custom voice note",
+        imageKey: id,
+        url: "",
+        voiceNote: true,
+        mimeType: "audio/ogg; codecs=opus",
+        enabled: true
+      });
+      renderOpeningFlowBlocks();
+    }
+
     function readOpeningFlowBlocks() {
       return Array.from(document.querySelectorAll(".flow-block")).map(card => {
         const index = Number(card.dataset.blockIndex);
@@ -20646,7 +20936,9 @@ function productFlowPageHtml() {
           ...original,
           label: read("label") ? read("label").value : original.label,
           body: read("body") ? read("body").value : original.body,
-          caption: read("caption") ? read("caption").value : original.caption
+          caption: read("caption") ? read("caption").value : original.caption,
+          voiceNote: read("voiceNote") ? read("voiceNote").value !== "false" : original.voiceNote,
+          mimeType: read("mimeType") ? read("mimeType").value : original.mimeType
         };
       });
     }
@@ -21069,7 +21361,7 @@ function productFlowPageHtml() {
       updateSelectedOptionLabel();
       status(data.extraction && data.extraction.status === "completed"
         ? "Image saved, " + (data.extraction.imageChunkAdded ? "1 image chunk extracted" : "no new image chunk")
-        : "Image saved");
+        : (data.extraction && data.extraction.reason ? "Media saved" : "Image saved"));
     }
 
     async function saveFlow(event) {
@@ -21224,6 +21516,8 @@ function productFlowPageHtml() {
     document.querySelector("#flow-form").addEventListener("submit", saveFlow);
     document.querySelector("#add-text-block").addEventListener("click", addTextBlock);
     document.querySelector("#add-image-block").addEventListener("click", addImageBlock);
+    document.querySelector("#add-video-block").addEventListener("click", addVideoBlock);
+    document.querySelector("#add-audio-block").addEventListener("click", addAudioBlock);
     document.querySelector("#add-closing-message").addEventListener("click", addClosingMessage);
     document.querySelector("#new-product-faq").addEventListener("click", newProductFaq);
     document.querySelector("#cancel-product-faq").addEventListener("click", () => {
