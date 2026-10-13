@@ -3609,12 +3609,16 @@ async function processInboundMessageCore({
   });
   const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
   const shouldPrioritizeOpeningFlow =
-    (!activeState || earlyNewProductJourneyOverride) &&
     !customer.pendingOrder &&
     (
       earlyOpeningFlowDecision.shouldSend ||
-      isProductNameOnlyOpening ||
-      (contextMatchedProduct && (firstEligibleInbound || contextStartsNewProductJourney))
+      (
+        (!activeState || earlyNewProductJourneyOverride) &&
+        (
+          isProductNameOnlyOpening ||
+          (contextMatchedProduct && (firstEligibleInbound || contextStartsNewProductJourney))
+        )
+      )
     );
   const flowsOnlyMode = live && await isFlowsOnlyAutoReplyMode(businessAccountId);
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
