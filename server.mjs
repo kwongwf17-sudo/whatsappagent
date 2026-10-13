@@ -12304,7 +12304,8 @@ function localTimeKey(date = new Date()) {
 async function getTeamContent(accountId) {
   const resolvedAccountId = accountId || config.accountId;
   const content = await teamContentStore.getContent(resolvedAccountId, defaultTeamContent);
-  if (inheritTeamFollowupSchedule(content)) {
+  const changed = inheritTeamFollowupSchedule(content) || reconcileProductFlowReadiness(content);
+  if (changed) {
     await teamContentStore.saveContent(resolvedAccountId, content);
   }
   return content;
@@ -13873,13 +13874,7 @@ function isProductFlowComplete(product) {
   const editorData = productFlowEditorData(product, { skipReady: true });
   if (Array.isArray(product.opening_flow_blocks) && product.opening_flow_blocks.length) {
     const blocks = normalizeOpeningFlowBlocks(product.opening_flow_blocks, editorData).filter((block) => block.enabled !== false);
-    return blocks.length > 0 && blocks.every((block) => {
-      if (block.type === "image") {
-        const url = String(block.url || "").trim();
-        return url && localAssetExists(url);
-      }
-      return Boolean(String(block.body || "").trim());
-    });
+    return blocks.length > 0 && blocks.every(openingFlowBlockIsComplete);
   }
   const imageByKey = new Map((editorData.images || []).map((image) => [image.key, image.url]));
   return (
@@ -13891,6 +13886,27 @@ function isProductFlowComplete(product) {
         return url && localAssetExists(url);
       })
   );
+}
+
+function openingFlowBlockIsComplete(block = {}) {
+  const type = String(block.type || "text");
+  if (type === "image" || type === "video" || type === "audio") {
+    const url = String(block.url || "").trim();
+    return Boolean(url && localAssetExists(url));
+  }
+  return Boolean(String(block.body || "").trim());
+}
+
+function reconcileProductFlowReadiness(content = {}) {
+  let changed = false;
+  for (const product of content?.catalog?.products || []) {
+    const ready = isProductFlowComplete(product);
+    if (product.openingFlowEnabled !== ready) {
+      product.openingFlowEnabled = ready;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function updateProductFlowReadiness(product) {
