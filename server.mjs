@@ -394,6 +394,8 @@ const DASHBOARD_DEMO_ORDER_IDS = new Set([
   "ord_1781332861319",
   "ord_1781332388644",
 ]);
+const DASHBOARD_OUTBOX_MESSAGE_LIMIT = Number(process.env.DASHBOARD_OUTBOX_MESSAGE_LIMIT || 5000) || 5000;
+const DASHBOARD_FOLLOWUP_QUEUE_LIMIT = Number(process.env.DASHBOARD_FOLLOWUP_QUEUE_LIMIT || 5000) || 5000;
 
 async function readSeedFile(configuredPath, fileName) {
   try {
@@ -8631,9 +8633,9 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     store.listCustomers(analyticsDate, businessAccountId),
     store.listDeletedCustomers(businessAccountId),
     store.listOrders(businessAccountId),
-    store.listOutbox(businessAccountId),
+    store.listOutbox(businessAccountId, { limit: DASHBOARD_OUTBOX_MESSAGE_LIMIT }),
     operations.getDashboardProfile(businessAccountId),
-    operations.listFollowupQueue(businessAccountId),
+    operations.listFollowupQueue(businessAccountId, { limit: DASHBOARD_FOLLOWUP_QUEUE_LIMIT }),
     store.getOrderStatusReplies(businessAccountId),
     store.listComplaintCases(businessAccountId),
   ]);
@@ -8661,12 +8663,15 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
   const ordersByCustomer = groupBy(orders, (order) => order.customerId);
   const customerById = new Map(customers.map((customer) => [customer.id, customer]));
   const latestOrderForCustomer = (customerId) => (ordersByCustomer.get(customerId) || []).at(-1) || null;
-  const latestInboundForCustomer = (customerId) =>
-    outbox
-      .filter((message) => message.direction === "inbound" && message.from === customerId)
-      .slice()
-      .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))
-      .at(-1);
+  const latestInboundByCustomer = new Map();
+  for (const message of outbox) {
+    if (message.direction !== "inbound" || !message.from) continue;
+    const existing = latestInboundByCustomer.get(message.from);
+    if (!existing || String(message.createdAt || "").localeCompare(String(existing.createdAt || "")) > 0) {
+      latestInboundByCustomer.set(message.from, message);
+    }
+  }
+  const latestInboundForCustomer = (customerId) => latestInboundByCustomer.get(customerId) || null;
   const customerPhone = (customerId, order = null) => {
     const customer = customerById.get(customerId);
     const latestOrder = order || latestOrderForCustomer(customerId);
@@ -16977,8 +16982,17 @@ function adminDashboardHtml() {
 
     async function loadDashboard() {
       const selectedDate = dashboardDate();
-      const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
-      const data = await response.json();
+      let data;
+      try {
+        const response = await fetch('/admin/dashboard-data?date=' + encodeURIComponent(selectedDate));
+        data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Dashboard data failed to load.");
+      } catch (error) {
+        document.querySelector("#today-date").textContent = "Load failed";
+        document.querySelector('#summary').innerHTML =
+          '<div class="empty">Dashboard could not load. ' + esc(error.message || "Please refresh.") + '</div>';
+        throw error;
+      }
       dashboardData = data;
       applyDashboardProfile(data.profile);
       applyTeamSettings(data.teamSettings || {});
