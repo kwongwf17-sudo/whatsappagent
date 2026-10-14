@@ -50,6 +50,10 @@ import {
   transcribeAudio,
 } from "./lib/openai.mjs";
 import { JsonStore } from "./lib/store.mjs";
+import {
+  customerImportStages, customerImportStageDay,
+  createImportJourney, importedFollowupHistory, importedFollowupDueAt, importedJourneyAgeDays,
+} from "./lib/customer_import_journey.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
 import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
 import { AdminAccountStore } from "./lib/admin_accounts.mjs";
@@ -7545,29 +7549,13 @@ async function buildFollowupSettingsData(businessAccountId = config.accountId, c
 
 function buildCustomerImportData(content = defaultTeamContent) {
   const teamCatalog = content.catalog || catalog;
-  const stageMap = new Map();
-  stageMap.set(CUSTOMER_IMPORT_NEW_STAGE_KEY, {
-    key: CUSTOMER_IMPORT_NEW_STAGE_KEY,
-    label: "NEW",
-  });
-  for (const product of teamCatalog.products || []) {
-    for (const [index, item] of productFollowupSequence(product).entries()) {
-      if (index === 0) continue;
-      if (!stageMap.has(item.key)) {
-        stageMap.set(item.key, {
-          key: item.key,
-          label: customerImportSequenceStageLabel(index),
-        });
-      }
-    }
-  }
   return {
     products: (teamCatalog.products || []).map((product) => ({
       id: product.id,
       name: product.name || product.id,
       skuCode: product.sku_code || "",
     })),
-    stages: [...stageMap.values()],
+    stages: customerImportStages(),
     modes: [
       {
         id: "continue_followups",
@@ -7698,6 +7686,11 @@ async function importCustomersForAccount({ businessAccountId = config.accountId,
     seenCustomerIds.add(row.customerId);
     const existing = await store.getCustomer(row.customerId, businessAccountId);
     const product = row.productId ? findCatalogProduct(row.productId, teamCatalog) : null;
+    if (existing && mode === "continue_followups") {
+      skipped += 1;
+      results.push({ ...row, status: "skipped", reason: "Existing customer matched; customer history and queued follow-ups were kept unchanged." });
+      continue;
+    }
     const basePatch = {
       businessAccountId,
       importedCustomer: true,
@@ -7727,6 +7720,7 @@ async function importCustomersForAccount({ businessAccountId = config.accountId,
       const customer = await store.getOrCreateCustomer(row.customerId, {
         ...basePatch,
         productId: product.id,
+        importJourney: createImportJourney(row.currentStageKey, product.id, nowIso),
         firstSeenAt: nowIso,
         lastMessageAt: nowIso,
         lastInboundAt: existing?.lastInboundAt || "",
@@ -7837,8 +7831,6 @@ function cleanCustomerImportMode(value) {
   return mode === "submitted_order" ? "submitted_order" : "continue_followups";
 }
 
-const CUSTOMER_IMPORT_NEW_STAGE_KEY = "__new_customer__";
-
 function cleanCustomerImportStageKey(value = "") {
   return String(value || "").trim();
 }
@@ -7876,9 +7868,7 @@ function parseCustomerImportRows(rawText = "", { mode = "continue_followups", cu
     const orderDateIso = isSubmittedOrder ? parseCustomerImportDate(orderDateInput) : "";
     const customerId = normalizeImportedCustomerId(phoneInput);
     const product = resolveCustomerImportProductBySku(skuCode, activeCatalog);
-    const sequence = product ? productFollowupSequence(product) : [];
-    const hasSelectedStage = selectedStageKey === CUSTOMER_IMPORT_NEW_STAGE_KEY ||
-      Boolean(selectedStageKey && sequence.some((item) => item.key === selectedStageKey));
+    const hasSelectedStage = customerImportStageDay(selectedStageKey) !== null;
     const errors = [];
     if (!customerId) errors.push("Customer phone/LID is invalid.");
     if (isSubmittedOrder && !name) errors.push("Name is required.");
@@ -7891,7 +7881,7 @@ function parseCustomerImportRows(rawText = "", { mode = "continue_followups", cu
     if (isSubmittedOrder && !price) errors.push("Price is required.");
     if (mode === "continue_followups" && !selectedStageKey) errors.push("Current stage is required.");
     if (mode === "continue_followups" && product && selectedStageKey && !hasSelectedStage) {
-      errors.push(`Current stage is not configured for SKU ${skuCode}.`);
+      errors.push("Select a customer stage from NEW through DAY 10. Refresh the import page if necessary.");
     }
     rows.push({
       line: lineNumber,
@@ -8561,27 +8551,12 @@ function resolveCustomerImportProductBySku(value = "", activeCatalog = catalog) 
 }
 
 function customerImportStageLabel(product, stageKey = "") {
-  if (stageKey === CUSTOMER_IMPORT_NEW_STAGE_KEY) return "NEW";
-  const index = productFollowupSequence(product).findIndex((stage) => stage.key === stageKey);
-  return index >= 0 ? customerImportSequenceStageLabel(index) : "";
-}
-
-function customerImportSequenceStageLabel(index = 0) {
-  const day = Number(index);
-  return day <= 0 ? "NEW" : `DAY ${day}`;
+  const day = customerImportStageDay(stageKey);
+  return day === null ? "" : day === 0 ? "NEW" : `DAY ${day}`;
 }
 
 function importedFollowupsSentThroughStage({ existing = null, sequence = [], currentStageKey = "", sentAt = new Date().toISOString() } = {}) {
-  const followupsSent = {
-    ...(existing?.followupsSent && typeof existing.followupsSent === "object" ? existing.followupsSent : {}),
-  };
-  if (currentStageKey === CUSTOMER_IMPORT_NEW_STAGE_KEY) return followupsSent;
-  const stageIndex = sequence.findIndex((item) => item.key === currentStageKey);
-  if (stageIndex < 0) return followupsSent;
-  for (const item of sequence.slice(0, stageIndex)) {
-    if (!followupsSent[item.key]) followupsSent[item.key] = sentAt;
-  }
-  return followupsSent;
+  return importedFollowupHistory(existing, sequence, currentStageKey, sentAt);
 }
 
 async function saveFollowupRuntimeSettings(businessAccountId = config.accountId, settings = {}) {
@@ -10136,6 +10111,8 @@ function followupDueAfterPreviousSent(previousSentAt, item) {
 }
 
 function effectiveFollowupDueAt(customer, item, sequence = []) {
+  const importedDue = importedFollowupDueAt(customer, item);
+  if (importedDue) return importedDue;
   const scheduledDueAt = followupDueAt(followupAnchorAt(customer, item), item);
   const previousSentAt = previousFollowupSentAt(customer, item, sequence);
   if (!previousSentAt) return scheduledDueAt;
@@ -10193,6 +10170,8 @@ function localCalendarDayDiff(start, end) {
 }
 
 function customerAgeDays(customer, now = new Date()) {
+  const importedAge = importedJourneyAgeDays(customer, now);
+  if (importedAge !== null) return importedAge;
   return localCalendarDayDiff(new Date(customer.firstSeenAt || now), now);
 }
 
@@ -15805,7 +15784,7 @@ function customerImportPageHtml() {
         return;
       }
       stageEl.disabled = false;
-      helpEl.innerHTML = 'Required fields: number and SKU code. Header names like <code>number</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage applies to every customer in this import.';
+      helpEl.innerHTML = 'Required fields: number and SKU code. Header names like <code>number</code>, <code>Phone</code>, and <code>sku_code</code> are accepted. Extra columns are ignored. Current Stage means the customer’s journey day and applies to every new customer in this import. Existing customers are matched and skipped. If today’s send time has passed, remaining messages use the normal sending pace.';
     }
     function renderImportOptions() {
       const stages = importData.stages || [];
