@@ -19927,6 +19927,8 @@ function followupSettingsPageHtml() {
       if (!blocks.length) blocks.push({ id: blockId(), type: "text", body: "" });
       return '<article class="stage-card" data-stage-key="' + esc(stage.key) + '">' +
         '<div class="stage-head"><strong>' + esc(stage.label || "Follow-Up") + '</strong><div class="stage-tools">' +
+          '<button type="button" data-insert-stage="above">Insert Above</button>' +
+          '<button type="button" data-insert-stage="below">Insert Below</button>' +
           '<button type="button" data-move-stage="up">Move Up</button>' +
           '<button type="button" data-move-stage="down">Move Down</button>' +
           '<button class="danger" type="button" data-remove-stage>Delete Row</button>' +
@@ -19989,6 +19991,9 @@ function followupSettingsPageHtml() {
       });
       document.querySelectorAll("[data-move-stage]").forEach(button => {
         button.addEventListener("click", () => moveStage(button.closest(".stage-card"), button.dataset.moveStage));
+      });
+      document.querySelectorAll("[data-insert-stage]").forEach(button => {
+        button.addEventListener("click", () => insertFollowupRow(button.closest(".stage-card"), button.dataset.insertStage));
       });
       document.querySelectorAll("[data-add-block]").forEach(button => {
         button.addEventListener("click", () => addBlock(button.closest(".stage-card"), button.dataset.addBlock));
@@ -20104,9 +20109,9 @@ function followupSettingsPageHtml() {
         }),
       };
     }
-    function addFollowupRow() {
+    function newFollowupRow() {
       const index = document.querySelectorAll(".stage-card").length + 1;
-      const row = {
+      return {
         key: "custom_followup_" + Date.now(),
         label: "Follow-up " + index,
         customSchedule: true,
@@ -20120,7 +20125,21 @@ function followupSettingsPageHtml() {
         delayDuration: String(Math.max(1, index * 2)).padStart(2, "0") + ":00",
         messages: [{ id: blockId(), type: "text", body: "" }]
       };
-      document.querySelector("#followup-stage-grid").insertAdjacentHTML("beforeend", renderStage(row));
+    }
+    function insertFollowupRow(card, position) {
+      const grid = document.querySelector("#followup-stage-grid");
+      const row = newFollowupRow();
+      if (!card || !grid.contains(card)) {
+        grid.insertAdjacentHTML("beforeend", renderStage(row));
+      } else if (position === "above") {
+        card.insertAdjacentHTML("beforebegin", renderStage(row));
+      } else {
+        card.insertAdjacentHTML("afterend", renderStage(row));
+      }
+      bindStageButtons();
+    }
+    function addFollowupRow() {
+      document.querySelector("#followup-stage-grid").insertAdjacentHTML("beforeend", renderStage(newFollowupRow()));
       bindStageButtons();
     }
     async function save() {
