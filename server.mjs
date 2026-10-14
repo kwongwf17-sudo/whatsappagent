@@ -2732,7 +2732,7 @@ async function recordRecoveredWebMessage({
   recoveredAt = "",
   originalTimestamp = "",
 } = {}) {
-  const customerId = String(from || "").trim();
+  const customerId = await store.resolveCustomerIdentity(String(from || "").trim(), businessAccountId, source);
   const messageId = String(id || "").trim();
   if (!customerId || !messageId) return { imported: false, reason: "missing_customer_or_message_id" };
   const normalizedMediaType = mediaType ? normalizeInboundMediaType(mediaType) : "text";
@@ -3053,6 +3053,7 @@ async function processInboundMediaMessage({
   live = false,
   businessAccountId = config.accountId,
 }) {
+  from = await store.resolveCustomerIdentity(from, businessAccountId, source);
   const normalizedMediaType = normalizeInboundMediaType(mediaType);
   const contactPatch = customerContactPatch(from, source);
   const correlationId = correlationIdForInbound(id, from);
@@ -3429,6 +3430,7 @@ async function recordInboundMediaHandoff({
 }
 
 async function processInboundMessage(args) {
+  args = { ...args, from: await store.resolveCustomerIdentity(args?.from, args?.businessAccountId || config.accountId, args?.source || {}) };
   const id = String(args?.id || "").trim();
   const businessAccountId = args?.businessAccountId || config.accountId;
   const correlationId = args?.correlationId || correlationIdForInbound(id, args?.from);
@@ -4645,6 +4647,7 @@ async function handleOpeningFlowProductHandoff({
 async function handleManualBusinessMessage({ id, from, text, source = {}, businessAccountId = config.accountId }) {
   const body = String(text || "").trim();
   if (!from || !body) return;
+  from = await store.resolveCustomerIdentity(from, businessAccountId, source);
   console.log(`Manual WhatsApp business message to ${from}: ${body}`);
   const now = new Date().toISOString();
   const contactPatch = customerContactPatch(from, source);
@@ -7686,6 +7689,7 @@ async function importCustomersForAccount({ businessAccountId = config.accountId,
   let skipped = preview.rows.length - validRows.length;
 
   for (const row of validRows) {
+    row.customerId = await store.resolveCustomerIdentity(row.customerId, businessAccountId, { phone: row.phone });
     if (seenCustomerIds.has(row.customerId)) {
       skipped += 1;
       results.push({ ...row, status: "skipped", reason: "Duplicate row in this import." });
