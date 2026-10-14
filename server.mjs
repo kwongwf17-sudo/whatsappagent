@@ -4278,6 +4278,13 @@ async function processInboundMessageCore({
   let order = null;
   if (sendPlan.order) {
     order = await store.addOrder({ ...sendPlan.order, businessAccountId, inboundMessageId: id || "", correlationId });
+    await store.updateCustomer(from, () => ({
+      status: "order_submitted",
+      freshAdJourney: null,
+      followupBlocked: true,
+      followupBlockedReason: "order_submitted",
+    }), businessAccountId);
+    await cancelPendingFollowupsForCustomer(from, businessAccountId, "Customer submitted order.");
   }
 
   if (sendPlan.adminMessage && businessAccountId !== DEMO_ACCOUNT_ID) {
