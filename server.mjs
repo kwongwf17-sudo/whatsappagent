@@ -8065,7 +8065,7 @@ function broadcastCustomerRow(customer = {}, productById = new Map(), ordersByCu
   const orders = ordersByCustomer.get(customer.id) || [];
   const latestOrder = orders.at(-1) || {};
   const phone = latestOrder.phone || customer.phone || phoneFromCustomerSource(customer.id, customer.source || {}) || phoneNumberFromImportedCustomerId(customer.id);
-  const labelDisplay = customer.importStageLabelDisplay || customer.labelDisplay || customer.label || "";
+  const labelDisplay = customer.labelDisplay || customer.label || "";
   return {
     id: customer.id,
     name: latestOrder.name || customer.importName || customer.name || "",
@@ -8709,7 +8709,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       product: productById.get(customer.productId)?.name || customer.productId || "",
       skuCode: productById.get(customer.productId)?.sku_code || "",
       label: customer.label,
-      labelDisplay: customer.importStageLabelDisplay || customer.labelDisplay,
+      labelDisplay: customer.labelDisplay,
       lastMessageAt: customer.lastMessageAt || "",
       firstSeenAt: customer.firstSeenAt || "",
       latestOrderCreatedAt: latestOrder.createdAt || "",
