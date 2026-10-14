@@ -2588,6 +2588,33 @@ function productDetectionSource(customer = {}, source = {}, settings = {}) {
   };
 }
 
+function currentInboundOpeningFlowSource(source = {}, settings = {}) {
+  if (!hasCurrentInboundAdReferralSource(source)) return {};
+  return {
+    ...(source && typeof source === "object" ? source : {}),
+    ...skuPrefixSource(settings),
+  };
+}
+
+function hasCurrentInboundAdReferralSource(source = {}) {
+  if (!source || typeof source !== "object") return false;
+  if (source.manualBusinessMessage || source.imported || source.recoveryImportOnly || source.recoveredAfterReconnect || source.safeAutoProcess) {
+    return false;
+  }
+  return Boolean(
+    source.sourceUrl ||
+    source.adId ||
+    source.referralBody ||
+    source.referralHeadline ||
+    source.adBody ||
+    source.adTitle ||
+    source.ctaPayload ||
+    source.ref ||
+    source.adSourceType === "ad" ||
+    source.sourceType === "ad"
+  );
+}
+
 function skuPrefixSource(settings = {}) {
   const prefixes = [
     ...(Array.isArray(settings.skuPrefixes) ? settings.skuPrefixes : []),
@@ -3482,28 +3509,24 @@ async function processInboundMessageCore({
   const firstEligibleInbound = typeof isFirstEligibleInbound === "boolean"
     ? isFirstEligibleInbound
     : !existingCustomer || Number(existingCustomer.inboundCount || 0) === 0;
-  const initialDetectionSource = productDetectionSource(existingCustomer, source, teamSettings);
-  const initialProductResolution = resolveProduct(teamCatalog, text, initialDetectionSource, existingCustomer?.productId || "");
+  const initialOpeningFlowSource = currentInboundOpeningFlowSource(source, teamSettings);
+  const initialOpeningFlowProductResolution = Object.keys(initialOpeningFlowSource).length
+    ? resolveProduct(teamCatalog, "", initialOpeningFlowSource, "")
+    : null;
   const initialActiveState = conversationActiveState(existingCustomer || {});
   const initialNewProductJourneyOverride =
-    hasOpeningFlowProductClue(initialProductResolution) &&
-    shouldStartNewProductJourney(existingCustomer || {}, initialProductResolution.product);
+    hasOpeningFlowProductClue(initialOpeningFlowProductResolution) &&
+    shouldStartNewProductJourney(existingCustomer || {}, initialOpeningFlowProductResolution.product);
   const initialOpeningFlowDecision = getOpeningFlowDecision({
     customer: existingCustomer || {},
-    productResolution: initialProductResolution,
+    productResolution: initialOpeningFlowProductResolution,
     customerMessage: text,
-    source: initialDetectionSource,
+    source: initialOpeningFlowSource,
     isFirstEligibleInbound: firstEligibleInbound,
     allowActiveStateOverride: initialNewProductJourneyOverride,
   });
-  const initialTextMatchedProduct = findProductMatch(teamCatalog, text, {});
-  const initialIsProductNameOnlyOpening = isProductNameMessage(initialTextMatchedProduct || initialProductResolution.product, text);
-  const shouldBypassMessageMergeBuffer = Boolean(
-    initialOpeningFlowDecision.shouldSend ||
-      initialIsProductNameOnlyOpening ||
-      hasOpeningFlowProductClue(initialProductResolution)
-  );
-  const shouldLockInitialProduct = !initialActiveState && hasOpeningFlowProductClue(initialProductResolution);
+  const shouldBypassMessageMergeBuffer = Boolean(initialOpeningFlowDecision.shouldSend);
+  const shouldLockInitialProduct = !initialActiveState && initialOpeningFlowDecision.shouldSend;
   if (!skipInboundRecord) {
     await store.appendOutbox({
       ...(id ? { id } : {}),
@@ -3528,20 +3551,20 @@ async function processInboundMessageCore({
         businessAccountId,
         source,
         ...(shouldLockInitialProduct
-          ? { productId: initialProductResolution.product.id }
+          ? { productId: initialOpeningFlowDecision.productId }
           : {}),
         ...contactPatch,
       });
   if (
     !skipInboundRecord &&
     shouldLockInitialProduct &&
-    (!existingCustomer?.productId || existingCustomer.productId !== initialProductResolution.product.id)
+    (!existingCustomer?.productId || existingCustomer.productId !== initialOpeningFlowDecision.productId)
   ) {
     await store.appendAuditLog({
       actor: "ai_agent",
       action: "opening_flow_product_locked",
       customerId: from,
-      result: `${initialProductResolution.product.id}:${initialProductResolution.matchSource}`,
+      result: `${initialOpeningFlowDecision.productId}:${initialOpeningFlowProductResolution?.matchSource || "current_ad_referral"}`,
       businessAccountId,
       correlationId,
     });
@@ -3589,39 +3612,25 @@ async function processInboundMessageCore({
   const conversationContext = await recentConversationContext(from, businessAccountId);
   const activeState = conversationActiveState(customer);
   const detectionSource = productDetectionSource(customer, source, teamSettings);
-  const sourceMatchedProduct = findProductMatch(teamCatalog, "", detectionSource);
-  const contextMatchedProduct = customer.productId
-    ? sourceMatchedProduct
-    : await recentProductContextMatch(from, businessAccountId, teamCatalog, detectionSource);
+  const openingFlowSource = currentInboundOpeningFlowSource(source, teamSettings);
   const bufferProduct = findProduct(teamCatalog, text, detectionSource, customer.productId);
   const explicitTextMatchedProduct = findProductMatch(teamCatalog, text, {});
-  const textMatchedProduct = explicitTextMatchedProduct || findProduct(teamCatalog, text, detectionSource, "");
-  const isProductNameOnlyOpening = isProductNameMessage(textMatchedProduct, text);
   const earlyProductResolution = resolveProduct(teamCatalog, text, detectionSource, customer.productId);
+  const earlyOpeningFlowProductResolution = Object.keys(openingFlowSource).length
+    ? resolveProduct(teamCatalog, "", openingFlowSource, "")
+    : null;
   const earlyNewProductJourneyOverride =
-    hasOpeningFlowProductClue(earlyProductResolution) &&
-    shouldStartNewProductJourney(customer, earlyProductResolution.product);
+    hasOpeningFlowProductClue(earlyOpeningFlowProductResolution) &&
+    shouldStartNewProductJourney(customer, earlyOpeningFlowProductResolution.product);
   const earlyOpeningFlowDecision = getOpeningFlowDecision({
     customer,
-    productResolution: earlyProductResolution,
+    productResolution: earlyOpeningFlowProductResolution,
     customerMessage: text,
-    source: detectionSource,
+    source: openingFlowSource,
     isFirstEligibleInbound: firstEligibleInbound,
     allowActiveStateOverride: earlyNewProductJourneyOverride,
   });
-  const contextStartsNewProductJourney = shouldStartNewProductJourney(customer, contextMatchedProduct);
-  const shouldPrioritizeOpeningFlow =
-    !customer.pendingOrder &&
-    (
-      earlyOpeningFlowDecision.shouldSend ||
-      (
-        (!activeState || earlyNewProductJourneyOverride) &&
-        (
-          isProductNameOnlyOpening ||
-          (contextMatchedProduct && (firstEligibleInbound || contextStartsNewProductJourney))
-        )
-      )
-    );
+  const shouldPrioritizeOpeningFlow = !customer.pendingOrder && earlyOpeningFlowDecision.shouldSend;
   const flowsOnlyMode = live && await isFlowsOnlyAutoReplyMode(businessAccountId);
   const faqSalesResponse = classifyFaqSalesPromptResponse(customer, text);
   const optOutIntent = detectOptOutIntent(text);
@@ -3974,20 +3983,11 @@ async function processInboundMessageCore({
   }
 
   const productResolution = earlyProductResolution;
-  const product = productResolution.product || routedProduct;
-  const openingFlowDecision = earlyOpeningFlowDecision.product?.id === product?.id
-    ? earlyOpeningFlowDecision
-    : getOpeningFlowDecision({
-        customer,
-        productResolution: { ...productResolution, product },
-        customerMessage: text,
-        source: detectionSource,
-        isFirstEligibleInbound: firstEligibleInbound,
-        allowActiveStateOverride:
-          hasOpeningFlowProductClue({ ...productResolution, product }) &&
-          shouldStartNewProductJourney(customer, product),
-      });
-  const messageSource = openingFlowDecision.shouldSend ? { ...detectionSource, productNameMatch: true } : detectionSource;
+  const openingFlowDecision = earlyOpeningFlowDecision;
+  const product = openingFlowDecision.shouldSend
+    ? openingFlowDecision.product
+    : productResolution.product || routedProduct;
+  const messageSource = openingFlowDecision.shouldSend ? { ...openingFlowSource, productNameMatch: true } : detectionSource;
   const allowSalesReplyRoute = routeAllowsSalesReply(routeClassification);
   const allowKnowledgeRoute = routeAllowsKnowledgeAnswer(routeClassification);
   const exactSalesReply = faqSalesResponse
