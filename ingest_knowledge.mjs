@@ -16,6 +16,7 @@ import { PostgresJsonAdapter } from "./lib/postgres_adapter.mjs";
 import { SqliteJsonAdapter } from "./lib/sqlite_adapter.mjs";
 import { TeamContentStore } from "./lib/team_content.mjs";
 import { sanitizeImageKnowledgeChunk } from "./lib/knowledge_sanitizer.mjs";
+import {KNOWLEDGE_MANIFEST,knowledgeFileAttributes,validateKnowledgeAttributes} from "./lib/knowledge_manifest.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const supportedExtensions = new Set([
@@ -49,6 +50,9 @@ const teamAccountId = getCliValue("--account-id") || getEnv("TEAM_ACCOUNT_ID", "
 const manualKnowledgeDir = getCliValue("--knowledge-dir");
 const dryRun = hasCliFlag("--dry-run");
 const appendMode = hasCliFlag("--append");
+const freshStore = hasCliFlag("--new-store");
+if(freshStore && !teamAccountId)throw new Error("--new-store requires --account-id for safe cutover after indexing.");
+const knowledgeAccountId = teamAccountId || getEnv("ACCOUNT_ID", "demo");
 const dataDir = path.resolve(getEnv("WHATSAPP_DATA_DIR", path.join(__dirname, "data")));
 const vectorIndexTimeoutMs = Math.max(
   120000,
@@ -65,7 +69,7 @@ const vectorStoreName = getEnv(
 const adminAccounts = teamAccountId && !dryRun ? await createAdminAccountStore() : null;
 const teamSettings = adminAccounts ? await adminAccounts.getTeamSettings(teamAccountId) : {};
 const apiKey = teamSettings.openaiApiKey || (dryRun ? getEnv("OPENAI_API_KEY", "") : requireEnv("OPENAI_API_KEY"));
-let vectorStoreId = dryRun ? "" : teamSettings.openaiVectorStoreId || process.env.OPENAI_VECTOR_STORE_ID;
+let vectorStoreId = dryRun || freshStore ? "" : teamSettings.openaiVectorStoreId || process.env.OPENAI_VECTOR_STORE_ID;
 
 if (dryRun) {
   console.log("Dry run: skipping OpenAI vector store creation and upload.");
@@ -73,7 +77,7 @@ if (dryRun) {
   const vectorStore = await createVectorStore(apiKey, vectorStoreName);
   vectorStoreId = vectorStore.id;
   console.log(`Created vector store: ${vectorStoreId}`);
-  if (teamAccountId) {
+  if (teamAccountId && !freshStore) {
     await adminAccounts.updateTeamSettings(teamAccountId, { openaiVectorStoreId: vectorStoreId });
     console.log(`Saved vector store ID to team settings for ${teamAccountId}.`);
   } else {
@@ -98,6 +102,8 @@ try {
   }
 
   const filePaths = await listKnowledgeFiles(knowledgeDir);
+  const manifest=await readJson(path.join(knowledgeDir,KNOWLEDGE_MANIFEST));
+  for(const file of filePaths)validateKnowledgeAttributes(manifest[path.relative(knowledgeDir,file).replaceAll(path.sep,"/")],knowledgeAccountId);
   if (filePaths.length === 0) {
     throw new Error(`No supported knowledge files found in ${knowledgeDir}`);
   }
@@ -111,12 +117,12 @@ try {
     process.exit(0);
   }
 
-  if (!manualKnowledgeDir && !appendMode) {
+  if (!manualKnowledgeDir && !appendMode && !freshStore) {
     await clearVectorStore(apiKey, vectorStoreId);
   }
 
   const attachedFiles = await Promise.all(filePaths.map((filePath) =>
-    uploadAndAttachKnowledgeFile(apiKey, vectorStoreId, filePath)
+    uploadAndAttachKnowledgeFile(apiKey, vectorStoreId, filePath,manifest[path.relative(knowledgeDir,filePath).replaceAll(path.sep,"/")])
   ));
   await Promise.all(attachedFiles.map(({ filePath, file, attached }) =>
     waitForVectorStoreFile(apiKey, vectorStoreId, file.id, attached.status)
@@ -124,6 +130,10 @@ try {
   ));
 
   console.log("Knowledge ingestion complete.");
+  if(freshStore) {
+    await adminAccounts.updateTeamSettings(teamAccountId,{openaiVectorStoreId:vectorStoreId});
+    console.log(`Activated indexed vector store for ${teamAccountId}: ${vectorStoreId}`);
+  }
 } finally {
   if (generatedDir && !dryRun) {
     await rm(generatedDir, { recursive: true, force: true });
@@ -158,38 +168,25 @@ function hasCliFlag(name) {
 
 async function generateVectorKnowledgeFiles(outputDir, accountId = "") {
   const content = await loadVectorKnowledgeContent(accountId);
-  await writeFile(
-    path.join(outputDir, "general-faq.md"),
-    renderGeneralFaqKnowledge(content.faqLibrary),
-    "utf8"
-  );
-  await writeFile(
-    path.join(outputDir, "product-faq.md"),
-    renderProductFaqKnowledge(content.catalog),
-    "utf8"
-  );
-  await writeFile(
-    path.join(outputDir, "product-order-options.md"),
-    renderProductOrderOptionKnowledge(content.catalog),
-    "utf8"
-  );
-  await writeFile(
-    path.join(outputDir, "product-opening-flow-knowledge.md"),
-    renderProductOpeningFlowKnowledge(content.catalog),
-    "utf8"
-  );
-  await writeFile(
-    path.join(outputDir, "product-image-knowledge.md"),
-    renderProductImageKnowledge(content.catalog),
-    "utf8"
-  );
+  const manifest={};
+  async function save(name,text,productId,type){await writeFile(path.join(outputDir,name),text,"utf8");manifest[name]=knowledgeFileAttributes(knowledgeAccountId,productId,type);}
+  await save("general-faq.md",renderGeneralFaqKnowledge(content.faqLibrary),"","general_faq");
+  for(const product of content.catalog.products||[]) {
+    const prefix=`product-${Buffer.from(product.id).toString("base64url")}`;
+    const one={...content.catalog,products:[product]};
+    await save(`${prefix}-faq.md`,renderProductFaqKnowledge(one),product.id,"product_faq");
+    await save(`${prefix}-order-options.md`,renderProductOrderOptionKnowledge(one),product.id,"product_order_options");
+    await save(`${prefix}-opening-flow.md`,renderProductOpeningFlowKnowledge(one),product.id,"product_opening_flow");
+    await save(`${prefix}-image-knowledge.md`,renderProductImageKnowledge(one),product.id,"product_image_knowledge");
+  }
+  await writeFile(path.join(outputDir,KNOWLEDGE_MANIFEST),JSON.stringify(manifest,null,2));
 }
 
 async function loadVectorKnowledgeContent(accountId = "") {
   const defaults = {
-    catalog: await readJson(path.join(dataDir, "product_catalog.json")),
-    faqLibrary: await readJson(path.join(dataDir, "general_faqs.json")),
-    salesReplyLibrary: await readJson(path.join(dataDir, "sales_replies.json")),
+    catalog: await readSeedJson("product_catalog.json"),
+    faqLibrary: await readSeedJson("general_faqs.json"),
+    salesReplyLibrary: await readSeedJson("sales_replies.json"),
   };
   if (!accountId) return defaults;
   const store = new TeamContentStore(dataDir, {
@@ -211,6 +208,7 @@ async function exportGeneratedKnowledgeFiles(sourceDir, accountId = "") {
   for (const filePath of filePaths) {
     await writeFile(path.join(exportDir, path.basename(filePath)), await readFile(filePath));
   }
+  await writeFile(path.join(exportDir,KNOWLEDGE_MANIFEST),await readFile(path.join(sourceDir,KNOWLEDGE_MANIFEST)));
   console.log(`Exported generated knowledge files to: ${exportDir}`);
 }
 
@@ -220,6 +218,11 @@ function safeExportSegment(value) {
 
 async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+async function readSeedJson(filename) {
+  try{return await readJson(path.join(dataDir,filename));}
+  catch(error){if(error.code!=="ENOENT")throw error;return readJson(path.join(__dirname,"data",filename));}
 }
 
 function renderGeneralFaqKnowledge(faqLibrary = {}) {
@@ -513,7 +516,7 @@ async function listKnowledgeFiles(dir) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       files.push(...(await listKnowledgeFiles(fullPath)));
-    } else if (supportedExtensions.has(path.extname(entry.name).toLowerCase())) {
+    } else if (entry.name !== KNOWLEDGE_MANIFEST && supportedExtensions.has(path.extname(entry.name).toLowerCase())) {
       files.push(fullPath);
     }
   }
@@ -568,11 +571,11 @@ async function detachVectorStoreFile(apiKey, vectorStoreId, file) {
   throw lastError || new Error(`Unable to detach vector store file ${file.id}`);
 }
 
-async function uploadAndAttachKnowledgeFile(apiKey, vectorStoreId, filePath) {
+async function uploadAndAttachKnowledgeFile(apiKey, vectorStoreId, filePath, attributes) {
   console.log(`Uploading ${path.relative(process.cwd(), filePath)}`);
   const file = await withOpenAiRetries(() => uploadFile(apiKey, filePath), `upload ${path.basename(filePath)}`);
   const attached = await withOpenAiRetries(
-    () => attachFileToVectorStore(apiKey, vectorStoreId, file.id),
+    () => attachFileToVectorStore(apiKey, vectorStoreId, file.id, attributes),
     `attach ${path.basename(filePath)}`
   );
   return { filePath, file, attached };

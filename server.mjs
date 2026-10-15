@@ -42,8 +42,6 @@ import {
   detectOrderStatusIntent,
   extractProductKnowledgeFromImage,
   interpretCustomerImage,
-  rerankKnowledgeRecords,
-  searchVectorStore,
   selectKnowledgeSalesFollowup,
   selectSalesReply,
   suggestTemplateImprovement,
@@ -77,7 +75,7 @@ import {
   complaintCategoryDisplay,
   detectObviousComplaint,
 } from "./lib/complaints.mjs";
-import { filterKnowledgeRecordsForRoute } from "./lib/retrieval.mjs";
+import { retrieveScopedKnowledge } from "./lib/scoped_rag.mjs";
 import { validateProductionConfig } from "./lib/config_security.mjs";
 import {
   customerDisplayForAlert,
@@ -2278,6 +2276,8 @@ if (req.method === "GET" && url.pathname === "/admin/customer/export") {
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         ok: true,
+        sourceCommit: getEnv("APP_SOURCE_COMMIT", getEnv("RAILWAY_GIT_COMMIT_SHA", "")),
+        ragPolicy: {maxCandidates:3,minimumScore:0.5,reranker:"ai",answerSources:1},
         demoMode: config.demoMode,
         transportMode: config.transportMode,
         webTransport: await webTransportHealthData(),
@@ -5249,7 +5249,7 @@ async function maybeCreateProductKnowledgeSalesReply({
       salesIntent,
       productName: product?.name || "",
       productId: product?.id || "",
-      rerankedKnowledgeContext: formatRerankedKnowledgeContext(topKnowledgeRecords.slice(0, 3)),
+      rerankedKnowledgeContext: formatRerankedKnowledgeContext(topKnowledgeRecords.slice(0, 1)),
       instruction,
     });
     const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
@@ -5474,7 +5474,7 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
       customerMessage,
       normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
       retrievalQuery,
-      rerankedKnowledgeContext: formatRerankedKnowledgeContext(topKnowledgeRecords.slice(0, 3)),
+      rerankedKnowledgeContext: formatRerankedKnowledgeContext(topKnowledgeRecords.slice(0, 1)),
       productName: product?.name || "",
       productId: product?.id || "",
       maxResults: 0,
@@ -5518,46 +5518,20 @@ async function retrieveAndRerankVectorStoreKnowledge({
   product,
   businessAccountId,
 }) {
-  const candidates = boostKnowledgeCandidates(
-    filterKnowledgeRecordsForRoute(await searchVectorStore({
-      apiKey,
-      vectorStoreId,
-      query: retrievalQuery,
-      maxResults: 20,
-    }), routeClassification, product),
-    routeClassification
-  );
-  if (!candidates.length) return [];
   try {
-    const reranked = await rerankKnowledgeRecords({
-      apiKey,
-      model,
-      customerMessage,
+    return await retrieveScopedKnowledge({
+      apiKey, model, vectorStoreId, customerMessage, retrievalQuery, routeClassification, product, businessAccountId,
       normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
-      route: routeClassification,
-      records: candidates,
-      topK: 3,
+      onTrace: trace => store.appendAuditLog({actor:"ai_agent",action:"approved_knowledge_rag_selection",businessAccountId,result:JSON.stringify(trace)}),
     });
-    return reranked.length ? reranked : candidates.slice(0, 3);
   } catch (error) {
     await recordSystemError("approved_knowledge_rerank", error, `Product: ${product?.id || ""}`, businessAccountId);
-    return candidates.slice(0, 3);
+    return [];
   }
 }
 
-function boostKnowledgeCandidates(records, routeClassification) {
-  const primaryIntent = String(routeClassification?.primaryIntent || "");
-  return records.map((record) => {
-    let score = Number(record.retrieval_score || 0);
-    if (primaryIntent && (record.id === primaryIntent || stableFaqTopicId(record) === primaryIntent)) score += 0.2;
-    if (routeClassification?.messageType === "general_faq" && record.knowledge_type === "general_faq") score += 0.1;
-    if (routeClassification?.messageType === "product_question" && record.knowledge_type !== "general_faq") score += 0.1;
-    return { ...record, retrieval_score: score };
-  });
-}
-
 function formatRerankedKnowledgeContext(records = []) {
-  return records.slice(0, 3).map((record, index) => [
+  return records.slice(0, 1).map((record, index) => [
     `Candidate #${index + 1}`,
     `ID: ${record.id || ""}`,
     `Type: ${record.knowledge_type || record.scope || record.kind || ""}`,
@@ -5566,7 +5540,7 @@ function formatRerankedKnowledgeContext(records = []) {
     `Examples: ${(record.example_questions || []).join(" | ")}`,
     `Brunei-Malay examples: ${(record.brunei_malay_example_questions || []).join(" | ")}`,
     `Summary: ${record.summary || record.brunei_malay_summary || ""}`,
-    `Vector-store chunk: ${String(record.text || "").slice(0, 1800)}`,
+    `Vector-store chunk: ${String(record.text || "").slice(0, 12000)}`,
     `Extracted/search text: ${[record.extracted_text, record.embedding_text, record.brunei_malay_search_text].filter(Boolean).join(" | ").slice(0, 1000)}`,
   ].filter((line) => !/:\s*$/.test(line)).join("\n")).join("\n\n");
 }
