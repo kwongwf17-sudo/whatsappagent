@@ -49,7 +49,7 @@ import {
   suggestTemplateImprovement,
   transcribeAudio,
 } from "./lib/openai.mjs";
-import { JsonStore } from "./lib/store.mjs";
+import { JsonStore, customerLabelDisplay } from "./lib/store.mjs";
 import {
   customerImportStages, customerImportStageDay,
   createImportJourney, importedFollowupHistory, importedFollowupDueAt, importedJourneyAgeDays,
@@ -6622,6 +6622,7 @@ async function runDueFollowups(
   now = new Date(),
   { respectOperationalControl = true, dispatchQueued = true, queueOnly = false } = {}
 ) {
+  await store.captureCustomerStageHistory(now);
   const deletedCustomers = queueOnly ? [] : await store.deleteStaleUnresponsiveCustomers(now);
   const shouldDispatchQueued = dispatchQueued && !queueOnly;
   const dispatched = shouldDispatchQueued
@@ -8603,6 +8604,7 @@ async function saveBroadcastRuntimeSettings(businessAccountId = config.accountId
 }
 
 async function buildDashboardData(now = new Date(), analyticsDate = now, businessAccountId = config.accountId, analyticsEndDate = analyticsDate) {
+  await store.captureCustomerStageHistory(now, businessAccountId);
   const content = await getTeamContent(businessAccountId);
   const teamSettings = await adminAccounts.getTeamSettings(businessAccountId);
   const teamCatalog = content.catalog;
@@ -8616,7 +8618,7 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
     orderStatusReplies,
     allComplaintCases,
   ] = await Promise.all([
-    store.listCustomers(analyticsDate, businessAccountId),
+    store.listCustomers(now, businessAccountId),
     store.listDeletedCustomers(businessAccountId),
     store.listOrders(businessAccountId),
     store.listOutbox(businessAccountId, { limit: DASHBOARD_OUTBOX_MESSAGE_LIMIT }),
@@ -8819,6 +8821,8 @@ async function buildDashboardData(now = new Date(), analyticsDate = now, busines
       })),
     })),
     customers: customerRows,
+    customerStageHistory: formatCustomerStageHistory(await store.getCustomerStageHistory(analyticsDate, businessAccountId)),
+    customerListAsOf: now.toISOString(),
     anotherDatePurchaseCustomers,
     handoffQueue,
     recoveryQueue,
@@ -9473,6 +9477,15 @@ function parseSelectedDate(value) {
   const [year, month, day] = value.split("-").map((part) => Number(part));
   const date = followupZonedLocalToDate({ year, month, day, hour: 12, minute: 0, second: 0, millisecond: 0 });
   return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function formatCustomerStageHistory(report) {
+  if (!report) return null;
+  return {
+    ...report,
+    stages: report.stages.map(row => ({...row,label:customerLabelDisplay(row.stage)})),
+    movements: report.movements.map(row => ({...row,fromLabel:row.fromStage ? customerLabelDisplay(row.fromStage) : "Outside active list",toLabel:row.toStage ? customerLabelDisplay(row.toStage) : "Outside active list"})),
+  };
 }
 
 function normalizeDashboardProfile(profile = {}) {
@@ -16543,9 +16556,11 @@ function adminDashboardHtml() {
       <button class="tab" type="button" data-tab="orders">Orders</button>
       <button class="tab" type="button" data-tab="followups">Follow-ups</button>
       <button class="tab" type="button" data-tab="deleted">Deleted</button>
+      <button class="tab" type="button" data-tab="stage-history">Stage History</button>
     </div>
     <section id="customers" class="panel active">
       <h2>Customer List</h2>
+      <p class="note">Current customers and stages. Dashboard Date applies to dated reports and Stage History.</p>
       <div class="filterbar">
         <label for="customer-sku-filter">SKU <select id="customer-sku-filter"></select></label>
         <label for="customer-phone-search">Phone <input id="customer-phone-search" type="search" placeholder="Search phone number" /></label>
@@ -16603,6 +16618,7 @@ function adminDashboardHtml() {
       <div class="table-wrap"></div>
     </section>
     <section id="deleted" class="panel"><h2>Deleted / Expired Customers</h2><div class="table-wrap"></div></section>
+    <section id="stage-history" class="panel"><h2>Customer Stage History</h2><div id="stage-history-content"></div></section>
     <section id="profile" class="panel">
       <h2>Profile</h2>
       <form class="profile-form" id="profile-form">
@@ -16803,9 +16819,6 @@ function adminDashboardHtml() {
 
     function customerMatchesLabel(customer, label) {
       if (label === "ALL") return true;
-      if (label === "DONE") {
-        return customer.labelDisplay === "DONE" && matchesDate(customer.latestOrderCreatedAt, dashboardDate());
-      }
       return customer.labelDisplay === label;
     }
 
@@ -17025,6 +17038,7 @@ function adminDashboardHtml() {
       renderCustomerLabelTabs(customerFilterBase());
       renderCustomers();
       renderHandoff();
+      renderStageHistory();
       renderRecovery();
       renderOrderCustomerSkuFilter();
       renderOrderCustomers();
@@ -17718,12 +17732,34 @@ function adminDashboardHtml() {
       setTabLabel("deleted", "Deleted", [{ value: stats.deleted }]);
     }
 
+    function renderStageHistory() {
+      const target = document.querySelector("#stage-history-content");
+      const report = dashboardData && dashboardData.customerStageHistory;
+      if (!report) {
+        target.innerHTML = '<div class="empty">No saved stage history for this date. Tracking begins when this update is deployed; earlier totals are not reconstructed.</div>';
+        return;
+      }
+      const note = report.partial
+        ? 'Partial day: opening counts are the baseline recorded at ' + fmtTime(report.baselineAt) + '.'
+        : 'Opening + entered − exited = closing. Calendar progression is recorded as a movement.';
+      target.innerHTML = '<p class="note">' + esc(report.date + ': ' + note) + '</p>' +
+        '<p class="note">' + esc(report.closedAt ? 'Saved historical report.' : 'Live report, updated as customers change stages.') + '</p>' +
+        table(report.stages, [
+          {label:'Stage',key:'label'}, {label:'Opening / baseline',key:'opening'},
+          {label:'Entered',key:'entered'}, {label:'Exited',key:'exited'}, {label:'Closing',key:'closing'},
+          {label:'Reconciliation',render:r=>esc(r.reconciled ? 'Matches' : 'Mismatch')}
+        ]) + '<h3>Customer movements</h3>' + table(report.movements, [
+          {label:'Customer',key:'customerId'}, {label:'From',key:'fromLabel'}, {label:'To',key:'toLabel'},
+          {label:'Time',render:r=>esc(fmtTime(r.occurredAt))}, {label:'Reason',key:'reason'}
+        ]);
+    }
+
     function renderCustomerLabelTabs(customers) {
       const labels = ["ALL", "NEW"];
       for (let day = 1; day <= 10; day += 1) labels.push("DAY " + day);
+      labels.push("DAY 11+");
       labels.push("DONE");
       labels.push("OPTED OUT");
-      labels.push("DELETE");
       const counts = new Map(labels.map(label => [label, 0]));
       counts.set("ALL", customers.length);
       for (const customer of customers) {
@@ -17825,8 +17861,8 @@ function adminDashboardHtml() {
     function renderFollowupLabelTabs(followups) {
       const labels = ["ALL", "NEW"];
       for (let day = 1; day <= 10; day += 1) labels.push("DAY " + day);
+      labels.push("DAY 11+");
       labels.push("OPTED OUT");
-      labels.push("DELETE");
       const counts = new Map(labels.map(label => [label, 0]));
       counts.set("ALL", followups.length);
       for (const row of followups) {
