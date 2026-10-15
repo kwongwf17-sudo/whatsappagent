@@ -3912,7 +3912,10 @@ async function processInboundMessageCore({
     if (upsellResult) return upsellResult;
   }
 
-  if (!faqSalesResponse && !initialAdOpening && isDeliveryRescheduleRequest(text)) {
+  if (!faqSalesResponse && !initialAdOpening && isDeliveryRescheduleRequest(text, {
+    conversationContext,
+    hasOrder: Boolean(customer.orderIds?.length),
+  })) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
     const suppressCustomerReply = live && await isFlowsOnlyAutoReplyMode(businessAccountId);
     const outbound = suppressCustomerReply ? [] : [textMessage(deliveryRescheduleReply())];
@@ -5398,6 +5401,7 @@ function faqTopicOptionsForClassifier(activeCatalog, product, activeFaqLibrary) 
         .filter(Boolean)
         .slice(0, 8),
       scope: faq.scope || "",
+      approvedAnswer: String(faq.approved_reply || faq.answer || faq.brunei_malay_approved_reply || "").slice(0, 240),
     }));
 }
 

@@ -18,3 +18,11 @@ Use `node ingest_knowledge.mjs --account-id demo --new-store` to build an isolat
 The staging demo copy of SHAWN PY1 includes the original opening blocks, product FAQs, order options, approved image knowledge and six referenced persisted images. Other demo products remain available to test product isolation. Demo conversations use the logged-in demo account's content and knowledge settings while storing test customers under the existing `__demo__` namespace.
 
 Diagnostics: `/health` reports the source commit and retrieval policy; `approved_knowledge_rag_selection` audit entries show scope, qualifying candidate IDs/scores and the winner without storing the retrieved document text.
+
+## Routing corrections
+
+The existing classifier now receives each active FAQ's scope and an approved-answer excerpt capped at 240 characters. Its output schema is unchanged. Instructions distinguish product packaging/guarantee information from business delivery policies and actual after-sales action requests. The separate complaint classifier uses the same distinction.
+
+The immediate refund guard requires a clear action request instead of the refund/return noun alone. Other messages continue through the existing classifier and complaint fallback. The delivery guard requires delivery evidence and a change/availability request; recent team delivery context can resolve short replies, and a known order can support a home-availability message. A pending purchase alone does not establish delivery context. Time words plus generic negation are insufficient.
+
+These corrections do not add model calls, alter conversation-planner inputs, change the RAG candidate/threshold/source limits, change storage schemas, or modify customer journeys and follow-up scheduling. The extra FAQ excerpts modestly increase the existing classifier's input tokens. Language consistency and silent empty-result handoffs are separate remaining issues.
