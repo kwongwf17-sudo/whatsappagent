@@ -31,6 +31,7 @@ import {
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import { personalizeClarificationPlan } from "./lib/closing_handler.mjs";
+import { customerConversationContext } from "./lib/conversation_context.mjs";
 import {
   classifyCustomerMessageRoute,
   classifyUpsellDecision,
@@ -2539,21 +2540,7 @@ async function handleWebhookPayload(rawBody) {
 
 async function recentConversationContext(customerId, businessAccountId, limit = 10) {
   const messages = await store.listOutbox(businessAccountId);
-  return messages
-    .filter((message) =>
-      message.channel === "customer" &&
-      String(message.businessAccountId || config.accountId) === String(businessAccountId || config.accountId) &&
-      (message.from === customerId || message.to === customerId)
-    )
-    .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
-    .slice(-limit)
-    .map((message) => ({
-      role: message.direction === "inbound" ? "customer" : "agent",
-      text: message.body || message.caption || "",
-      type: message.type || "text",
-      at: message.createdAt || "",
-    }))
-    .filter((message) => String(message.text || "").trim());
+  return customerConversationContext(messages, customerId, businessAccountId || config.accountId, limit);
 }
 
 async function recentProductContextMatch(customerId, businessAccountId, catalog, source = {}, limit = 12) {
@@ -3822,6 +3809,7 @@ async function processInboundMessageCore({
     faqLibrary: teamFaqLibrary,
     salesReplyLibrary: teamSalesReplyLibrary,
     activeState,
+    currentSalesIntent: customer.lastSalesReplyIntent || "",
     conversationContext,
     businessAccountId: knowledgeAccountId,
   });
@@ -4004,12 +3992,14 @@ async function processInboundMessageCore({
   const exactSalesReply = faqSalesResponse
     ? null
     : (allowSalesReplyRoute ? findSalesReplyExactMatch(teamCatalog, product, text, { salesReplyLibrary: teamSalesReplyLibrary }) : null);
-  const vectorSalesReply = faqSalesResponse || exactSalesReply || !allowSalesReplyRoute
+  const vectorSalesReply = faqSalesResponse || exactSalesReply || !allowSalesReplyRoute ||
+    (routeClassification?.messageType === "purchase_intent" && routeClassification.confidence !== "low")
     ? null
     : await maybeSelectApprovedSalesReply({
         customerMessage: text,
         conversationContext,
         activeState,
+        currentSalesIntent: customer.lastSalesReplyIntent || "",
         routeClassification,
         product,
         catalog: teamCatalog,
@@ -4020,6 +4010,7 @@ async function processInboundMessageCore({
     salesReply: exactSalesReply || vectorSalesReply,
     customerMessage: text,
     conversationContext,
+    customer,
     routeClassification,
     product,
     salesReplyMode: teamSettings.salesReplyMode,
@@ -4149,6 +4140,7 @@ async function processInboundMessageCore({
       salesIntent: plan.repeatedSalesReply.salesIntent,
       approvedReply: plan.repeatedSalesReply.approvedReply,
       instruction: plan.repeatedSalesReply.instruction,
+      conversationContext,
       repeatAction,
       productName: product.name,
       businessAccountId: knowledgeAccountId,
@@ -4349,6 +4341,7 @@ async function processInboundMessageCore({
       const outboundMeta = {
         businessAccountId,
         correlationId,
+        channel: "customer",
         ...(!order &&
           openingFlowDecision.shouldSend &&
           !openingFlowGate.queued &&
@@ -4887,6 +4880,7 @@ async function maybeSelectApprovedSalesReply({
   customerMessage,
   conversationContext = [],
   activeState = "",
+  currentSalesIntent = "",
   routeClassification = null,
   product,
   catalog: activeCatalog,
@@ -4916,6 +4910,7 @@ async function maybeSelectApprovedSalesReply({
       salesReplyRecords: records,
       conversationContext,
       activeState,
+      currentSalesIntent,
       routePrimaryIntent: routeClassification?.primaryIntent || "",
       routeReason: routeClassification?.reason || "",
     });
@@ -5211,6 +5206,7 @@ async function maybeCreateSalesIntentRepeatReply({
   instruction = "",
   repeatAction = "openai_acknowledge",
   productName = "",
+  conversationContext = [],
   businessAccountId = config.accountId,
 }) {
   const apiKey = await openAiApiKeyForAccount(businessAccountId);
@@ -5226,6 +5222,7 @@ async function maybeCreateSalesIntentRepeatReply({
       instruction,
       repeatAction,
       productName,
+      conversationContext,
     });
   } catch (error) {
     await recordSystemError("sales_intent_repeat_reply", error, "Unable to create repeated-sales-intent reply.", businessAccountId);
@@ -5290,6 +5287,7 @@ async function resolveSalesReplyForSending({
   salesReply,
   customerMessage,
   conversationContext = [],
+  customer = {},
   routeClassification = null,
   product,
   salesReplyMode = "approved",
@@ -5319,6 +5317,10 @@ async function resolveSalesReplyForSending({
     if (normalizedMode === "education") return null;
   }
 
+  // Same-intent repeat actions are applied by the planner and repeat handler.
+  // Do not first rewrite their source reply with generic similarity instructions.
+  if (customer.lastSalesReplyId &&
+      normalizeSalesIntent(customer.lastSalesReplyIntent) === normalizeSalesIntent(salesIntent)) return salesReply;
   const alreadySentSimilar = hasSimilarSalesReplyInRecentContext(salesReply.approved_reply, conversationContext);
   if (!String(salesReply.approved_reply || "").trim()) return null;
   if (!alreadySentSimilar) return salesReply;
@@ -5360,6 +5362,7 @@ async function maybeClassifyCustomerMessageRoute({
   faqLibrary: activeFaqLibrary,
   salesReplyLibrary: activeSalesReplyLibrary,
   activeState = "",
+  currentSalesIntent = "",
   conversationContext = [],
   businessAccountId = config.accountId,
 }) {
@@ -5376,6 +5379,7 @@ async function maybeClassifyCustomerMessageRoute({
       normalizedCustomerMessage: normalizeCustomerMessage(customerMessage),
       productName: product?.name || "",
       activeState,
+      currentSalesIntent,
       conversationContext,
       faqTopics,
       salesIntents,
