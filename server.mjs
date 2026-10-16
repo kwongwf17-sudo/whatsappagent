@@ -30,11 +30,13 @@ import {
   textMessage,
 } from "./lib/conversation.mjs";
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
+import { personalizeClarificationPlan } from "./lib/closing_handler.mjs";
 import {
   classifyCustomerMessageRoute,
   classifyUpsellDecision,
   createCustomerServiceResponse,
   createComplaintHandoffReply,
+  createClarificationReply,
   createEducationalSalesReply,
   createSalesIntentRepeatReply,
   classifySalesReplyExpectedAction,
@@ -4101,7 +4103,7 @@ async function processInboundMessageCore({
   const planningCustomer = !activeState && shouldStartNewProductJourney(customer, product)
     ? { ...customer, productId: product.id, followupsSent: {}, pendingOrder: null, awaitingPackageBInterest: false }
     : customer;
-  const plan = await buildConversationPlan({
+  const basePlan = await buildConversationPlan({
     catalog: teamCatalog,
     customer: planningCustomer,
     customerMessage: text,
@@ -4117,6 +4119,23 @@ async function processInboundMessageCore({
     productResolution: { ...productResolution, product },
     openingFlowDecision,
     isFirstEligibleInbound: firstEligibleInbound,
+  });
+  const plan = await personalizeClarificationPlan(basePlan, {
+    generateReply: async () => {
+      const apiKey = await openAiApiKeyForAccount(knowledgeAccountId);
+      if (!apiKey) return "";
+      return createClarificationReply({
+        apiKey,
+        model: await openAiModelForAccount(knowledgeAccountId),
+        customerMessage: text,
+        conversationContext,
+        productName: product.name,
+        pendingOrder: planningCustomer.pendingOrder,
+        hasOrder: Boolean(planningCustomer.orderIds?.length),
+        routeClassification,
+      });
+    },
+    onError: (error) => recordSystemError("clarification_reply", error, "Using existing clarification fallback.", businessAccountId),
   });
 
   let repeatPatch = {};
