@@ -34,6 +34,7 @@ import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import { personalizeClarificationPlan } from "./lib/closing_handler.mjs";
 import { customerConversationContext } from "./lib/conversation_context.mjs";
 import { flushCustomerBufferBatch } from "./lib/customer_buffer_batch.mjs";
+import { sanitizeProductKnowledgeReply, knowledgeHandoffAnswer, resolveKnowledgeReply } from "./lib/knowledge_reply.mjs";
 import {
   classifyCustomerMessageRoute,
   classifyUpsellDecision,
@@ -5546,11 +5547,17 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
         }),
         businessAccountId
       );
-      return null;
+      return knowledgeHandoffAnswer(customerMessage);
     }
     const account = await adminAccounts.getAccount(businessAccountId).catch(() => null);
     const businessName = String(account?.name || config.businessName || "this business").trim() || "this business";
-    const answer = await createCustomerServiceResponse({
+    const answer = await resolveKnowledgeReply({
+      fallback: knowledgeHandoffAnswer(customerMessage),
+      onDiagnostic: diagnostic => store.appendAuditLog({
+        actor: "ai_agent", action: "knowledge_reply_cleanup", customerId,
+        businessAccountId, result: JSON.stringify({ productId: product?.id || "", ...diagnostic }),
+      }),
+      generate: ({ repair }) => createCustomerServiceResponse({
       apiKey,
       model,
       vectorStoreId,
@@ -5565,32 +5572,17 @@ async function maybeCreateApprovedKnowledgeRagAnswer({
       productId: product?.id || "",
       maxResults: 0,
       useFileSearch: false,
+      repairAnswer: repair,
+      }),
     });
-    const safeReply = sanitizeProductKnowledgeReply(answer?.reply || "");
-    if (!answer || !safeReply) {
-      await recordSystemError(
-        "approved_knowledge_rag",
-        new Error("Approved knowledge RAG no answer"),
-        JSON.stringify({
-          productId: product?.id || "",
-          productName: product?.name || "",
-          customerMessage: String(customerMessage || "").slice(0, 500),
-          handoffReason: answer?.handoffReason || "",
-          replyType: answer?.replyType || "",
-        }),
-        businessAccountId
-      );
-      return null;
-    }
     return {
       ...answer,
-      reply: safeReply,
       allowProductSpecific: true,
       rerankedKnowledgeIds: topKnowledgeRecords.map((record) => record.id).filter(Boolean),
     };
   } catch (error) {
     await recordSystemError("approved_knowledge_rag", error, `Product: ${product?.id || ""}`, businessAccountId);
-    return null;
+    return knowledgeHandoffAnswer(customerMessage);
   }
 }
 
@@ -5629,17 +5621,6 @@ function formatRerankedKnowledgeContext(records = []) {
     `Vector-store chunk: ${String(record.text || "").slice(0, 12000)}`,
     `Extracted/search text: ${[record.extracted_text, record.embedding_text, record.brunei_malay_search_text].filter(Boolean).join(" | ").slice(0, 1000)}`,
   ].filter((line) => !/:\s*$/.test(line)).join("\n")).join("\n\n");
-}
-
-function sanitizeProductKnowledgeReply(reply) {
-  return String(reply || "")
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((sentence) => sentence.trim())
-    .filter(Boolean)
-    .filter((sentence) => !/\b(claim\s*produk|claimed?|visible text|promotional image|poster|chunk|extracted)\b/i.test(sentence))
-    .filter((sentence) => !/\bblackheads?\s*out\s*in\s*5\s*minutes?\b/i.test(sentence))
-    .join(" ")
-    .trim();
 }
 
 function hasSimilarSalesReplyInRecentContext(reply, conversationContext = []) {
