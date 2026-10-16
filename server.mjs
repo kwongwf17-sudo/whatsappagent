@@ -21,6 +21,7 @@ import {
   findSalesReplyExactMatch,
   findSalesReplyPrimaryIntentMatch,
   normalizeCustomerMessage,
+  isClosingAcknowledgement,
   productIntro,
   salesReplyRecordsForProduct,
   formatStockArrivalMessage,
@@ -32,6 +33,7 @@ import {
 import { getEnv, loadEnvFile, requireEnv } from "./lib/env.mjs";
 import { personalizeClarificationPlan } from "./lib/closing_handler.mjs";
 import { customerConversationContext } from "./lib/conversation_context.mjs";
+import { flushCustomerBufferBatch } from "./lib/customer_buffer_batch.mjs";
 import {
   classifyCustomerMessageRoute,
   classifyUpsellDecision,
@@ -363,6 +365,7 @@ await operations.ensureState({ version: config.appVersion });
 let catalogWriteQueue = Promise.resolve();
 const pendingOrderDetailBuffers = new Map();
 const pendingMessageMergeBuffers = new Map();
+const pendingCustomerBufferFlushes = new Map();
 const pendingOpeningFlowInboundBuffers = new Map();
 const PENDING_BUFFER_TYPE = {
   MESSAGE_MERGE: "message_merge",
@@ -3952,6 +3955,50 @@ async function processInboundMessageCore({
     };
   }
 
+  if (!faqSalesResponse && !initialAdOpening &&
+      isClosingAcknowledgement(text) &&
+      !["pendingOrder", "awaitingPackageInterest", "pendingUpsell", "handoff", "complaint", "optedOut"].includes(activeState)) {
+    await store.appendAuditLog({
+      actor: "ai_agent", action: "customer_closing_acknowledgement",
+      customerId: from, businessAccountId, correlationId,
+      result: "No reply required; customer thanked the business.",
+    });
+    return { customer, order: null, messages: [], handoffRequired: false, handoffReason: "" };
+  }
+
+  if (!faqSalesResponse && !initialAdOpening &&
+      routeClassification?.conversationAction === "confirm_order_price" &&
+      routeClassification.confidence !== "low" && customer.orderIds?.length) {
+    const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
+    const savedPrice = latestOrder?.orderOptionPrice || latestOrder?.packagePrice;
+    if (!latestOrder || !String(savedPrice || "").trim()) {
+      return handleOrderPriceCheckHandoff({ from, customer, businessAccountId, correlationId });
+    }
+    let answer;
+    try {
+      answer = await createCustomerServiceResponse({
+        apiKey: await openAiApiKeyForAccount(knowledgeAccountId),
+        model: await openAiModelForAccount(knowledgeAccountId),
+        businessName: "the business", customerId: from, customerMessage: text,
+        productName: latestOrder.productName || latestOrder.productId,
+        productId: latestOrder.productId,
+        rerankedKnowledgeContext: `Saved linked order facts (not a current promotion): ${JSON.stringify({
+          selectedOptionPrice: savedPrice, option: latestOrder.orderOptionName || latestOrder.packageName || "",
+          quantity: latestOrder.quantity || "", addOnChoice: latestOrder.addOnChoice || "",
+        })}\nConfirm or correct the customer's quoted amount against these saved facts only. If their quoted amount differs, clearly correct it; never begin with Yes or agreement to an incorrect amount. Keep the reply brief. Do not multiply prices or infer a total when the stored price basis is unspecified. Do not add promotions, shipping status or sales questions.`,
+      });
+      if (!answer.reply || answer.handoffRequired) throw new Error("Saved order price needs review.");
+    } catch (error) {
+      await recordSystemError("order_price_confirmation", error, "Saved order price could not be confirmed.", businessAccountId);
+      return handleOrderPriceCheckHandoff({ from, customer, businessAccountId, correlationId });
+    }
+    const outbound = [textMessage(answer.reply)];
+    await sendOutbound(from, outbound, { businessAccountId, correlationId, purpose: "order_price_confirmation" });
+    await store.appendAuditLog({ actor: "ai_agent", action: "customer_order_price_confirmation", customerId: from,
+      businessAccountId, correlationId, result: latestOrder.id });
+    return { customer, order: null, messages: outbound, handoffRequired: false, handoffReason: "" };
+  }
+
   if (!faqSalesResponse && !initialAdOpening && isActiveOrderLookupHandoff(customer)) {
     const latestOrder = await store.findLatestOrderForCustomer(from, businessAccountId);
     const statusReplies = await store.getOrderStatusReplies(businessAccountId);
@@ -5016,6 +5063,18 @@ async function maybeDetectOrderStatusIntent(customerMessage, businessAccountId =
 }
 
 const ORDER_LOOKUP_HANDOFF_REASON = "Order lookup needs admin check.";
+
+async function handleOrderPriceCheckHandoff({ from, customer, businessAccountId, correlationId }) {
+  const reason = "Saved order price needs admin check.";
+  const updatedCustomer = await store.updateCustomer(from, () => ({
+    handoffStatus: "human_required", handoffReason: reason,
+  }), businessAccountId);
+  const outbound = [textMessage("Team kami akan semak harga order kita ya.")];
+  await sendOutbound(from, outbound, { businessAccountId, correlationId, purpose: "order_price_handoff" });
+  await maybeSendHandoffAdminAlert({ customer: updatedCustomer, customerId: from, businessAccountId,
+    reason, correlationId, lastCustomerMessage: customer.lastMessage || "" });
+  return { customer: updatedCustomer, order: null, messages: outbound, handoffRequired: true, handoffReason: reason };
+}
 
 function isActiveOrderLookupHandoff(customer = {}) {
   return customer?.pendingOrderLookup?.status === "human_required" ||
@@ -10806,8 +10865,16 @@ async function recoverPendingCustomerBuffers() {
 }
 
 async function flushPendingCustomerBuffer(key) {
-  const record = await store.getPendingBuffer(key);
-  if (!record) return;
+  return flushCustomerBufferBatch({
+    key, store, inFlight: pendingCustomerBufferFlushes,
+    schedule: schedulePendingCustomerBuffer,
+    retryMs: Math.max(1000, config.messageMergeBufferMs || 10000),
+    processBatch: processPendingCustomerBufferBatch,
+  });
+}
+
+async function processPendingCustomerBufferBatch(record) {
+  const key = record.key;
   const map = pendingCustomerBufferMap(record.type);
   if (map) {
     const existing = map.get(key);
@@ -10818,7 +10885,6 @@ async function flushPendingCustomerBuffer(key) {
   const messages = Array.isArray(record.messages) ? record.messages.filter(Boolean) : [];
   const combinedText = messages.join("\n").trim();
   if (!combinedText) {
-    await store.deletePendingBuffer(key);
     return;
   }
 
@@ -10832,11 +10898,16 @@ async function flushPendingCustomerBuffer(key) {
       businessAccountId: record.businessAccountId || config.accountId,
       correlationId: record.correlationId || correlationIdForInbound("", record.customerId),
     });
-    await store.deletePendingBuffer(key);
     return;
   }
 
   const args = record.args || {};
+  await store.appendAuditLog({
+    actor: "ai_agent", action: "customer_buffer_batch_processing",
+    customerId: record.customerId, businessAccountId: record.businessAccountId,
+    correlationId: record.correlationId, result: record.batchId,
+    reason: JSON.stringify({ type: record.type, fragmentCount: messages.length, inboundMessageIds: record.messageIds || [] }),
+  });
   await processInboundMessage({
     ...args,
     id: "",
@@ -10849,7 +10920,6 @@ async function flushPendingCustomerBuffer(key) {
     skipInboundRecord: true,
     correlationId: record.correlationId || args.correlationId || correlationIdForInbound("", record.customerId),
   });
-  await store.deletePendingBuffer(key);
 }
 
 function shouldBufferMergedCustomerMessage(text) {
@@ -10878,6 +10948,7 @@ async function bufferMergedCustomerMessage(args, customer) {
       : new Date(quietDueAt).toISOString();
     return {
       type: PENDING_BUFFER_TYPE.MESSAGE_MERGE,
+      messageIds: [...(stored?.messageIds || []), args.id].filter(Boolean),
       businessAccountId: args.businessAccountId || config.accountId,
       customerId: args.from,
       startedAt,
@@ -11045,6 +11116,7 @@ async function bufferIncompleteOrderDetails(args, customer, product) {
     const sources = [...(stored?.sources || []), args.source || {}];
     return {
       type: PENDING_BUFFER_TYPE.ORDER_DETAIL,
+      messageIds: [...(stored?.messageIds || []), args.id].filter(Boolean),
       businessAccountId: args.businessAccountId || config.accountId,
       customerId: args.from,
       productId: product?.id || stored?.productId || "",
